@@ -1,0 +1,33 @@
+{
+  "name": "xdoingbot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:studio": "prisma studio",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@fastify/helmet": "^13.0.1",
+    "@grammyjs/runner": "^2.0.3",
+    "@prisma/client": "^6.13.0",
+    "bullmq": "^5.56.7",
+    "dotenv": "^17.2.1",
+    "fastify": "^5.4.0",
+    "geo-tz": "^8.1.8",
+    "grammy": "^1.37.0",
+    "ioredis": "^5.6.1",
+    "zod": "^4.0.14"
+  },
+  "devDependencies": {
+    "@types/node": "^24.1.0",
+    "prisma": "^6.13.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3"
+  }
+}

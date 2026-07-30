@@ -1,0 +1,2 @@
+-- No-op migration.
+-- The group stats tables are created by 20260730053000_stats_and_invite_links.
