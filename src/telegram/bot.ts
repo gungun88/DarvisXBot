@@ -685,6 +685,16 @@ function publishCancelKeyboard(locale: Locale) {
   return new InlineKeyboard().text(locale === "zh-CN" ? "❌取消" : "❌ Cancel", "publish:cancel");
 }
 
+function publishSuccessText(locale: Locale) {
+  return locale === "zh-CN"
+    ? "✅ 设置成功，点击按钮返回。"
+    : "✅ Saved. Tap the button to return.";
+}
+
+function publishSuccessKeyboard(locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "publish:settings");
+}
+
 function publishNamePromptText(draft: PublishDraft, locale: Locale) {
   return locale === "zh-CN"
     ? [
@@ -1005,7 +1015,7 @@ async function handlePublishCallback(ctx: Context, config: AppConfig) {
   if (action === "clear_text") {
     draft.text = "";
     draft.waitingFor = undefined;
-    await renderPublishSettings(ctx, locale);
+    await editOrReply(ctx, publishSuccessText(locale), publishSuccessKeyboard(locale));
     return;
   }
 
@@ -1013,7 +1023,7 @@ async function handlePublishCallback(ctx: Context, config: AppConfig) {
     draft.mediaKind = undefined;
     draft.mediaFileId = undefined;
     draft.waitingFor = undefined;
-    await renderPublishSettings(ctx, locale);
+    await editOrReply(ctx, publishSuccessText(locale), publishSuccessKeyboard(locale));
     return;
   }
 
@@ -1021,7 +1031,7 @@ async function handlePublishCallback(ctx: Context, config: AppConfig) {
     draft.buttonText = "";
     draft.buttonUrl = "";
     draft.waitingFor = undefined;
-    await renderPublishSettings(ctx, locale);
+    await editOrReply(ctx, publishSuccessText(locale), publishSuccessKeyboard(locale));
     return;
   }
 
@@ -1118,9 +1128,9 @@ async function handlePublishInputMessage(ctx: Context, locale: Locale) {
     }
     draft.name = text.slice(0, 80);
     draft.waitingFor = undefined;
-    await ctx.reply(publishSettingsText(locale, draft), {
+    await ctx.reply(publishSuccessText(locale), {
       parse_mode: "HTML",
-      reply_markup: publishSettingsKeyboard(locale, ctx.from.id)
+      reply_markup: publishSuccessKeyboard(locale)
     });
     return true;
   }
@@ -1136,9 +1146,9 @@ async function handlePublishInputMessage(ctx: Context, locale: Locale) {
     }
     draft.text = text;
     draft.waitingFor = undefined;
-    await ctx.reply(publishSettingsText(locale, draft), {
+    await ctx.reply(publishSuccessText(locale), {
       parse_mode: "HTML",
-      reply_markup: publishSettingsKeyboard(locale, ctx.from.id)
+      reply_markup: publishSuccessKeyboard(locale)
     });
     return true;
   }
@@ -1158,9 +1168,9 @@ async function handlePublishInputMessage(ctx: Context, locale: Locale) {
     draft.buttonText = parsed.text;
     draft.buttonUrl = parsed.url;
     draft.waitingFor = undefined;
-    await ctx.reply(publishSettingsText(locale, draft), {
+    await ctx.reply(publishSuccessText(locale), {
       parse_mode: "HTML",
-      reply_markup: publishSettingsKeyboard(locale, ctx.from.id)
+      reply_markup: publishSuccessKeyboard(locale)
     });
     return true;
   }
@@ -1177,9 +1187,9 @@ async function handlePublishInputMessage(ctx: Context, locale: Locale) {
     draft.mediaKind = media.kind;
     draft.mediaFileId = media.fileId;
     draft.waitingFor = undefined;
-    await ctx.reply(publishSettingsText(locale, draft), {
+    await ctx.reply(publishSuccessText(locale), {
       parse_mode: "HTML",
-      reply_markup: publishSettingsKeyboard(locale, ctx.from.id)
+      reply_markup: publishSuccessKeyboard(locale)
     });
     return true;
   }
