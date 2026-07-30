@@ -566,7 +566,60 @@ function timezonePromptText(locale: Locale) {
       ].join("\n");
 }
 
-function publishPanelText(locale: Locale, draft: PublishDraft) {
+function publishHomeText(locale: Locale) {
+  return locale === "zh-CN"
+    ? ["✏️ <b>快捷发布</b>", "设置帖子文字、媒体、按钮等参数"].join("\n")
+    : ["✏️ <b>Quick Publish</b>", "Set post text, media, buttons and other parameters."].join("\n");
+}
+
+function publishHomeKeyboard(locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "➕ 添加" : "➕ Add", "publish:add")
+    .row()
+    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "menu:home");
+}
+
+function publishSummaryText(locale: Locale, draft: PublishDraft, botUsername: string, userId: number) {
+  const username = escapeHtml(botUsername.replace(/^@/, ""));
+  const inlineCode = `@${username} ${publishInlineQuery(userId)}`;
+  const hasMedia = Boolean(draft.mediaFileId);
+  const hasButton = Boolean(draft.buttonText && draft.buttonUrl);
+  const hasText = Boolean(draft.text.trim());
+  return locale === "zh-CN"
+    ? [
+        "✏️ <b>快捷发布</b>",
+        "设置帖子文字、媒体、按钮等参数",
+        `<b>消息</b>1 名称:${escapeHtml(draft.name || "-")}`,
+        `├<b>媒体图片</b>: ${hasMedia ? "✅" : "❌"}`,
+        `├<b>链接按钮</b>: ${hasButton ? "✅" : "❌"}`,
+        `├<b>文本内容</b>: ${hasText ? "✅" : "❌"}`,
+        `└<b>内联分享</b>: <code>${inlineCode}</code>`
+      ].join("\n")
+    : [
+        "✏️ <b>Quick Publish</b>",
+        "Set post text, media, buttons and other parameters.",
+        `<b>Message</b>1 name:${escapeHtml(draft.name || "-")}`,
+        `├<b>Media</b>: ${hasMedia ? "✅" : "❌"}`,
+        `├<b>Link button</b>: ${hasButton ? "✅" : "❌"}`,
+        `├<b>Text content</b>: ${hasText ? "✅" : "❌"}`,
+        `└<b>Inline share</b>: <code>${inlineCode}</code>`
+      ].join("\n");
+}
+
+function publishSummaryKeyboard(locale: Locale, userId: number) {
+  const inlineQuery = publishInlineQuery(userId);
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "💬 消息1" : "💬 Message1", "publish:message:1")
+    .text(locale === "zh-CN" ? "🔧 设置" : "🔧 Settings", "publish:settings")
+    .text(locale === "zh-CN" ? "删除🗑️" : "Delete🗑️", "publish:delete")
+    .switchInline(locale === "zh-CN" ? "分享" : "Share", inlineQuery)
+    .row()
+    .text(locale === "zh-CN" ? "➕ 添加" : "➕ Add", "publish:add")
+    .row()
+    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "menu:publish");
+}
+
+function publishSettingsText(locale: Locale, draft: PublishDraft) {
   const hasMedia = Boolean(draft.mediaFileId);
   const hasButton = Boolean(draft.buttonText && draft.buttonUrl);
   const hasText = Boolean(draft.text.trim());
@@ -595,7 +648,8 @@ function publishPanelText(locale: Locale, draft: PublishDraft) {
       ].join("\n");
 }
 
-function publishPanelKeyboard(locale: Locale) {
+function publishSettingsKeyboard(locale: Locale, userId: number) {
+  const inlineQuery = publishInlineQuery(userId);
   return new InlineKeyboard()
     .text(locale === "zh-CN" ? "✍️ 编辑消息名称" : "✍️ Edit name", "publish:edit_name")
     .row()
@@ -605,8 +659,8 @@ function publishPanelKeyboard(locale: Locale) {
     .text(locale === "zh-CN" ? "🔠 修改按钮" : "🔠 Edit button", "publish:edit_button")
     .text(locale === "zh-CN" ? "👀 预览消息" : "👀 Preview", "publish:preview")
     .row()
-    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "menu:home")
-    .switchInline(locale === "zh-CN" ? "分享" : "Share", "inlineTQ4MD198925");
+    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "publish:list")
+    .switchInline(locale === "zh-CN" ? "分享" : "Share", inlineQuery);
 }
 
 function publishTextInputKeyboard(locale: Locale) {
@@ -870,7 +924,7 @@ async function handleMenuCallback(ctx: Context, config: AppConfig) {
   }
 
   if (action === "publish") {
-    await renderPublishPanel(ctx, locale);
+    await renderPublishHome(ctx, locale);
     return;
   }
 
@@ -903,8 +957,26 @@ async function handlePublishCallback(ctx: Context, config: AppConfig) {
   await ctx.answerCallbackQuery().catch(() => undefined);
   if (!ctx.from) return;
   const locale = await getLocale(ctx);
-  const draft = getPublishDraft(ctx.from.id);
   const action = ctx.callbackQuery?.data?.replace("publish:", "") ?? "";
+
+  if (action === "add") {
+    getPublishDraft(ctx.from.id);
+    await renderPublishSummary(ctx, locale, config.botUsername);
+    return;
+  }
+
+  if (action === "list") {
+    await renderPublishSummary(ctx, locale, config.botUsername);
+    return;
+  }
+
+  if (action === "message:1" || action === "settings") {
+    getPublishDraft(ctx.from.id);
+    await renderPublishSettings(ctx, locale);
+    return;
+  }
+
+  const draft = getPublishDraft(ctx.from.id);
 
   if (action === "edit_name") {
     draft.waitingFor = "name";
@@ -933,7 +1005,7 @@ async function handlePublishCallback(ctx: Context, config: AppConfig) {
   if (action === "clear_text") {
     draft.text = "";
     draft.waitingFor = undefined;
-    await renderPublishPanel(ctx, locale);
+    await renderPublishSettings(ctx, locale);
     return;
   }
 
@@ -941,7 +1013,7 @@ async function handlePublishCallback(ctx: Context, config: AppConfig) {
     draft.mediaKind = undefined;
     draft.mediaFileId = undefined;
     draft.waitingFor = undefined;
-    await renderPublishPanel(ctx, locale);
+    await renderPublishSettings(ctx, locale);
     return;
   }
 
@@ -949,19 +1021,19 @@ async function handlePublishCallback(ctx: Context, config: AppConfig) {
     draft.buttonText = "";
     draft.buttonUrl = "";
     draft.waitingFor = undefined;
-    await renderPublishPanel(ctx, locale);
+    await renderPublishSettings(ctx, locale);
     return;
   }
 
   if (action === "delete") {
-    publishDrafts.set(ctx.from.id, createPublishDraft());
-    await renderPublishPanel(ctx, locale);
+    publishDrafts.delete(ctx.from.id);
+    await renderPublishHome(ctx, locale);
     return;
   }
 
   if (action === "cancel") {
     draft.waitingFor = undefined;
-    await renderPublishPanel(ctx, locale);
+    await renderPublishSettings(ctx, locale);
     return;
   }
 
@@ -971,7 +1043,7 @@ async function handlePublishCallback(ctx: Context, config: AppConfig) {
     return;
   }
 
-  await renderPublishPanel(ctx, locale);
+  await renderPublishHome(ctx, locale);
 }
 
 async function handleMembershipCallback(ctx: Context) {
@@ -1014,10 +1086,20 @@ function getPublishDraft(userId: number) {
   return nextDraft;
 }
 
-async function renderPublishPanel(ctx: Context, locale: Locale) {
+async function renderPublishHome(ctx: Context, locale: Locale) {
+  await editOrReply(ctx, publishHomeText(locale), publishHomeKeyboard(locale));
+}
+
+async function renderPublishSummary(ctx: Context, locale: Locale, botUsername: string) {
   if (!ctx.from) return;
   const draft = getPublishDraft(ctx.from.id);
-  await editOrReply(ctx, publishPanelText(locale, draft), publishPanelKeyboard(locale));
+  await editOrReply(ctx, publishSummaryText(locale, draft, botUsername, ctx.from.id), publishSummaryKeyboard(locale, ctx.from.id));
+}
+
+async function renderPublishSettings(ctx: Context, locale: Locale) {
+  if (!ctx.from) return;
+  const draft = getPublishDraft(ctx.from.id);
+  await editOrReply(ctx, publishSettingsText(locale, draft), publishSettingsKeyboard(locale, ctx.from.id));
 }
 
 async function handlePublishInputMessage(ctx: Context, locale: Locale) {
@@ -1036,9 +1118,9 @@ async function handlePublishInputMessage(ctx: Context, locale: Locale) {
     }
     draft.name = text.slice(0, 80);
     draft.waitingFor = undefined;
-    await ctx.reply(publishPanelText(locale, draft), {
+    await ctx.reply(publishSettingsText(locale, draft), {
       parse_mode: "HTML",
-      reply_markup: publishPanelKeyboard(locale)
+      reply_markup: publishSettingsKeyboard(locale, ctx.from.id)
     });
     return true;
   }
@@ -1054,9 +1136,9 @@ async function handlePublishInputMessage(ctx: Context, locale: Locale) {
     }
     draft.text = text;
     draft.waitingFor = undefined;
-    await ctx.reply(publishPanelText(locale, draft), {
+    await ctx.reply(publishSettingsText(locale, draft), {
       parse_mode: "HTML",
-      reply_markup: publishPanelKeyboard(locale)
+      reply_markup: publishSettingsKeyboard(locale, ctx.from.id)
     });
     return true;
   }
@@ -1076,9 +1158,9 @@ async function handlePublishInputMessage(ctx: Context, locale: Locale) {
     draft.buttonText = parsed.text;
     draft.buttonUrl = parsed.url;
     draft.waitingFor = undefined;
-    await ctx.reply(publishPanelText(locale, draft), {
+    await ctx.reply(publishSettingsText(locale, draft), {
       parse_mode: "HTML",
-      reply_markup: publishPanelKeyboard(locale)
+      reply_markup: publishSettingsKeyboard(locale, ctx.from.id)
     });
     return true;
   }
@@ -1095,9 +1177,9 @@ async function handlePublishInputMessage(ctx: Context, locale: Locale) {
     draft.mediaKind = media.kind;
     draft.mediaFileId = media.fileId;
     draft.waitingFor = undefined;
-    await ctx.reply(publishPanelText(locale, draft), {
+    await ctx.reply(publishSettingsText(locale, draft), {
       parse_mode: "HTML",
-      reply_markup: publishPanelKeyboard(locale)
+      reply_markup: publishSettingsKeyboard(locale, ctx.from.id)
     });
     return true;
   }
@@ -1141,10 +1223,14 @@ function publishDraftKeyboard(draft: PublishDraft) {
   return new InlineKeyboard().url(draft.buttonText, draft.buttonUrl);
 }
 
+function publishInlineQuery(userId: number) {
+  return `inlineTQ4MD${Math.abs(userId).toString().slice(-6).padStart(6, "0")}`;
+}
+
 async function sendPublishPreview(ctx: Context, draft: PublishDraft, locale: Locale) {
   if (!draft.text.trim() && !draft.mediaFileId) {
     await ctx.reply(locale === "zh-CN" ? "请先设置文本或媒体后再预览。" : "Set text or media before previewing.", {
-      reply_markup: publishPanelKeyboard(locale)
+      reply_markup: ctx.from ? publishSettingsKeyboard(locale, ctx.from.id) : publishCancelKeyboard(locale)
     });
     return;
   }
@@ -1462,7 +1548,7 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
   }
 
   if (feature === "publish") {
-    await renderPublishPanel(ctx, locale);
+    await renderPublishHome(ctx, locale);
     return;
   }
 
