@@ -1,6 +1,6 @@
 import { Bot, InlineKeyboard } from "grammy";
 import type { Context } from "grammy";
-import type { Chat, ChatInviteLink, ChatJoinRequest, Message, User } from "grammy/types";
+import type { Chat, ChatInviteLink, ChatJoinRequest, InlineKeyboardMarkup, InlineQueryResult, Message, User } from "grammy/types";
 import {
   ChatStatsEventType,
   ChatStatus,
@@ -101,6 +101,18 @@ type PendingVerification = {
   timeout: NodeJS.Timeout;
 };
 
+type PublishMediaKind = "photo" | "video" | "animation" | "sticker";
+
+type PublishDraft = {
+  name: string;
+  text: string;
+  buttonText: string;
+  buttonUrl: string;
+  mediaKind: PublishMediaKind | undefined;
+  mediaFileId: string | undefined;
+  waitingFor: "name" | "text" | "media" | "button" | undefined;
+};
+
 const botCommands = [
   { command: "start", description: "开始菜单" },
   { command: "help", description: "帮助" },
@@ -150,6 +162,7 @@ const pendingVerifications = new Map<string, PendingVerification>();
 const recentJoins = new Map<string, number>();
 const raidJoinEvents = new Map<string, number[]>();
 const timezoneInputUsers = new Set<number>();
+const publishDrafts = new Map<number, PublishDraft>();
 
 function rememberSelectedChatForModules(userId: number | undefined, chatId: string) {
   if (typeof userId !== "number") return;
@@ -296,12 +309,17 @@ export function createBot(config: AppConfig) {
     await handleGiveawayJoinCallback(ctx, config);
   });
 
+  bot.inlineQuery(/.*/, async (ctx) => {
+    await handlePublishInlineQuery(ctx);
+  });
+
   bot.on("chat_join_request", async (ctx) => {
     await handleChatJoinRequest(ctx, config);
   });
 
   bot.on("message", async (ctx) => {
     const locale = await getLocale(ctx);
+    if (await handlePublishInputMessage(ctx, locale)) return;
     if (await handleTimezoneInputMessage(ctx, config, locale)) return;
     if (await handleNewMemberLimitPrivateMessage(ctx, config, locale)) return;
     if (await handleOpenClosePrivateMessage(ctx, config, locale)) return;
@@ -548,40 +566,132 @@ function timezonePromptText(locale: Locale) {
       ].join("\n");
 }
 
-function publishPanelText(locale: Locale, botUsername: string) {
-  const username = escapeHtml(botUsername.replace(/^@/, ""));
-  const inlineCode = `@${username} inlineTQ4MD198925`;
+function publishPanelText(locale: Locale, draft: PublishDraft) {
+  const hasMedia = Boolean(draft.mediaFileId);
+  const hasButton = Boolean(draft.buttonText && draft.buttonUrl);
+  const hasText = Boolean(draft.text.trim());
   return locale === "zh-CN"
     ? [
         "✏️ <b>快捷发布</b>",
-        "设置帖子文字、媒体、按钮等参数",
-        "<b>消息</b>1 名称:-",
-        "├<b>媒体图片</b>: ❌",
-        "├<b>链接按钮</b>: ❌",
-        "├<b>文本内容</b>: ❌",
-        `└<b>内联分享</b>: <code>${inlineCode}</code>`
+        "",
+        "通过此菜单,你可以配置消息的发送参数",
+        "",
+        `<b>消息名称</b>:<b>${escapeHtml(draft.name || "-")}</b>`,
+        "",
+        `🖼 <b>媒体图片</b>: ${hasMedia ? "✅" : "❌"}`,
+        `🔗 <b>链接按钮</b>: ${hasButton ? "✅" : "❌"}`,
+        `📃 <b>文本内容</b>: ${hasText ? "✅" : "❌"}`
       ].join("\n")
     : [
         "✏️ <b>Quick Publish</b>",
-        "Set post text, media, buttons and other parameters.",
-        "<b>Message</b>1 name:-",
-        "├<b>Media image</b>: ❌",
-        "├<b>Link button</b>: ❌",
-        "├<b>Text content</b>: ❌",
-        `└<b>Inline share</b>: <code>${inlineCode}</code>`
+        "",
+        "Use this menu to configure message sending parameters.",
+        "",
+        `<b>Message name</b>:<b>${escapeHtml(draft.name || "-")}</b>`,
+        "",
+        `🖼 <b>Media</b>: ${hasMedia ? "✅" : "❌"}`,
+        `🔗 <b>Link button</b>: ${hasButton ? "✅" : "❌"}`,
+        `📃 <b>Text content</b>: ${hasText ? "✅" : "❌"}`
       ].join("\n");
 }
 
 function publishPanelKeyboard(locale: Locale) {
   return new InlineKeyboard()
-    .text(locale === "zh-CN" ? "💬 消息1" : "💬 Message1", "publish:message:1")
-    .text(locale === "zh-CN" ? "🔧 设置" : "🔧 Settings", "publish:settings")
-    .text(locale === "zh-CN" ? "删除🗑️" : "Delete🗑️", "publish:delete")
-    .switchInline(locale === "zh-CN" ? "分享" : "Share", "inlineTQ4MD198925")
+    .text(locale === "zh-CN" ? "✍️ 编辑消息名称" : "✍️ Edit name", "publish:edit_name")
     .row()
-    .text(locale === "zh-CN" ? "➕ 添加" : "➕ Add", "publish:add")
+    .text(locale === "zh-CN" ? "📃 修改文本" : "📃 Edit text", "publish:edit_text")
+    .text(locale === "zh-CN" ? "📷 修改媒体" : "📷 Edit media", "publish:edit_media")
     .row()
-    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "menu:home");
+    .text(locale === "zh-CN" ? "🔠 修改按钮" : "🔠 Edit button", "publish:edit_button")
+    .text(locale === "zh-CN" ? "👀 预览消息" : "👀 Preview", "publish:preview")
+    .row()
+    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "menu:home")
+    .switchInline(locale === "zh-CN" ? "分享" : "Share", "inlineTQ4MD198925");
+}
+
+function publishTextInputKeyboard(locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "🚫 清空消息文本" : "🚫 Clear text", "publish:clear_text")
+    .text(locale === "zh-CN" ? "❌取消" : "❌ Cancel", "publish:cancel");
+}
+
+function publishMediaInputKeyboard(locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "🚫 清空媒体" : "🚫 Clear media", "publish:clear_media")
+    .text(locale === "zh-CN" ? "❌取消" : "❌ Cancel", "publish:cancel");
+}
+
+function publishButtonInputKeyboard(locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "🚫 清空按钮" : "🚫 Clear button", "publish:clear_button")
+    .text(locale === "zh-CN" ? "❌取消" : "❌ Cancel", "publish:cancel");
+}
+
+function publishCancelKeyboard(locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "❌取消" : "❌ Cancel", "publish:cancel");
+}
+
+function publishNamePromptText(draft: PublishDraft, locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "当前已设置的消息名称（点击复制）:",
+        "",
+        escapeHtml(draft.name),
+        "",
+        "➡️ 现在输入文本设置你的消息名称"
+      ].join("\n")
+    : [
+        "Current message name:",
+        "",
+        escapeHtml(draft.name),
+        "",
+        "➡️ Send text to set the message name."
+      ].join("\n");
+}
+
+function publishTextPromptText(draft: PublishDraft, locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "当前已设置的备注内容（点击复制）:",
+        "",
+        escapeHtml(draft.text),
+        "",
+        "➡️ 现在输入文本设置你的备注内容"
+      ].join("\n")
+    : [
+        "Current text content:",
+        "",
+        escapeHtml(draft.text),
+        "",
+        "➡️ Send text to set the message content."
+      ].join("\n");
+}
+
+function publishButtonPromptText(draft: PublishDraft, locale: Locale) {
+  const current = draft.buttonText && draft.buttonUrl ? `${draft.buttonText} | ${draft.buttonUrl}` : "";
+  return locale === "zh-CN"
+    ? [
+        "当前已设置的按钮（点击复制）:",
+        "",
+        escapeHtml(current),
+        "",
+        "➡️ 现在输入按钮，格式：",
+        "<code>按钮文字 | https://example.com</code>"
+      ].join("\n")
+    : [
+        "Current button:",
+        "",
+        escapeHtml(current),
+        "",
+        "➡️ Send a button in this format:",
+        "<code>Button text | https://example.com</code>"
+      ].join("\n");
+}
+
+function publishMediaPromptText(locale: Locale) {
+  return locale === "zh-CN"
+    ? "请回复图片、视频、gif 、贴纸进行设置"
+    : "Reply with a photo, video, GIF, or sticker to set media.";
 }
 
 function membershipPanelText(locale: Locale) {
@@ -760,7 +870,7 @@ async function handleMenuCallback(ctx: Context, config: AppConfig) {
   }
 
   if (action === "publish") {
-    await editOrReply(ctx, publishPanelText(locale, config.botUsername), publishPanelKeyboard(locale));
+    await renderPublishPanel(ctx, locale);
     return;
   }
 
@@ -790,9 +900,78 @@ async function handleMenuCallback(ctx: Context, config: AppConfig) {
 }
 
 async function handlePublishCallback(ctx: Context, config: AppConfig) {
-  await ctx.answerCallbackQuery({ text: "OK" }).catch(() => undefined);
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  if (!ctx.from) return;
   const locale = await getLocale(ctx);
-  await editOrReply(ctx, publishPanelText(locale, config.botUsername), publishPanelKeyboard(locale));
+  const draft = getPublishDraft(ctx.from.id);
+  const action = ctx.callbackQuery?.data?.replace("publish:", "") ?? "";
+
+  if (action === "edit_name") {
+    draft.waitingFor = "name";
+    await editOrReply(ctx, publishNamePromptText(draft, locale), publishCancelKeyboard(locale));
+    return;
+  }
+
+  if (action === "edit_text") {
+    draft.waitingFor = "text";
+    await editOrReply(ctx, publishTextPromptText(draft, locale), publishTextInputKeyboard(locale));
+    return;
+  }
+
+  if (action === "edit_media") {
+    draft.waitingFor = "media";
+    await editOrReply(ctx, publishMediaPromptText(locale), publishMediaInputKeyboard(locale));
+    return;
+  }
+
+  if (action === "edit_button") {
+    draft.waitingFor = "button";
+    await editOrReply(ctx, publishButtonPromptText(draft, locale), publishButtonInputKeyboard(locale));
+    return;
+  }
+
+  if (action === "clear_text") {
+    draft.text = "";
+    draft.waitingFor = undefined;
+    await renderPublishPanel(ctx, locale);
+    return;
+  }
+
+  if (action === "clear_media") {
+    draft.mediaKind = undefined;
+    draft.mediaFileId = undefined;
+    draft.waitingFor = undefined;
+    await renderPublishPanel(ctx, locale);
+    return;
+  }
+
+  if (action === "clear_button") {
+    draft.buttonText = "";
+    draft.buttonUrl = "";
+    draft.waitingFor = undefined;
+    await renderPublishPanel(ctx, locale);
+    return;
+  }
+
+  if (action === "delete") {
+    publishDrafts.set(ctx.from.id, createPublishDraft());
+    await renderPublishPanel(ctx, locale);
+    return;
+  }
+
+  if (action === "cancel") {
+    draft.waitingFor = undefined;
+    await renderPublishPanel(ctx, locale);
+    return;
+  }
+
+  if (action === "preview") {
+    draft.waitingFor = undefined;
+    await sendPublishPreview(ctx, draft, locale);
+    return;
+  }
+
+  await renderPublishPanel(ctx, locale);
 }
 
 async function handleMembershipCallback(ctx: Context) {
@@ -813,6 +992,280 @@ async function handleMembershipCallback(ctx: Context) {
       : `💎 <b>${escapeHtml(label)}</b>\n\nThis plan button is wired. Payment and auto-activation can be configured next.`,
     membershipPanelKeyboard(locale)
   );
+}
+
+function createPublishDraft(): PublishDraft {
+  return {
+    name: "",
+    text: "",
+    buttonText: "",
+    buttonUrl: "",
+    mediaKind: undefined,
+    mediaFileId: undefined,
+    waitingFor: undefined
+  };
+}
+
+function getPublishDraft(userId: number) {
+  const draft = publishDrafts.get(userId);
+  if (draft) return draft;
+  const nextDraft = createPublishDraft();
+  publishDrafts.set(userId, nextDraft);
+  return nextDraft;
+}
+
+async function renderPublishPanel(ctx: Context, locale: Locale) {
+  if (!ctx.from) return;
+  const draft = getPublishDraft(ctx.from.id);
+  await editOrReply(ctx, publishPanelText(locale, draft), publishPanelKeyboard(locale));
+}
+
+async function handlePublishInputMessage(ctx: Context, locale: Locale) {
+  if (!ctx.from) return false;
+  const draft = publishDrafts.get(ctx.from.id);
+  if (!draft?.waitingFor) return false;
+
+  if (draft.waitingFor === "name") {
+    const text = getMessageText(ctx.message);
+    if (!text) {
+      await ctx.reply(locale === "zh-CN" ? "请发送文本作为消息名称。" : "Send text as the message name.", {
+        parse_mode: "HTML",
+        reply_markup: publishCancelKeyboard(locale)
+      });
+      return true;
+    }
+    draft.name = text.slice(0, 80);
+    draft.waitingFor = undefined;
+    await ctx.reply(publishPanelText(locale, draft), {
+      parse_mode: "HTML",
+      reply_markup: publishPanelKeyboard(locale)
+    });
+    return true;
+  }
+
+  if (draft.waitingFor === "text") {
+    const text = getMessageText(ctx.message);
+    if (!text) {
+      await ctx.reply(locale === "zh-CN" ? "请发送文本内容。" : "Send text content.", {
+        parse_mode: "HTML",
+        reply_markup: publishTextInputKeyboard(locale)
+      });
+      return true;
+    }
+    draft.text = text;
+    draft.waitingFor = undefined;
+    await ctx.reply(publishPanelText(locale, draft), {
+      parse_mode: "HTML",
+      reply_markup: publishPanelKeyboard(locale)
+    });
+    return true;
+  }
+
+  if (draft.waitingFor === "button") {
+    const text = getMessageText(ctx.message);
+    const parsed = text ? parsePublishButton(text) : null;
+    if (!parsed) {
+      await ctx.reply(
+        locale === "zh-CN"
+          ? "格式不正确，请按这个格式发送：\n\n<code>按钮文字 | https://example.com</code>"
+          : "Invalid format. Send:\n\n<code>Button text | https://example.com</code>",
+        { parse_mode: "HTML", reply_markup: publishButtonInputKeyboard(locale) }
+      );
+      return true;
+    }
+    draft.buttonText = parsed.text;
+    draft.buttonUrl = parsed.url;
+    draft.waitingFor = undefined;
+    await ctx.reply(publishPanelText(locale, draft), {
+      parse_mode: "HTML",
+      reply_markup: publishPanelKeyboard(locale)
+    });
+    return true;
+  }
+
+  if (draft.waitingFor === "media") {
+    const media = extractPublishMedia(ctx.message);
+    if (!media) {
+      await ctx.reply(publishMediaPromptText(locale), {
+        parse_mode: "HTML",
+        reply_markup: publishMediaInputKeyboard(locale)
+      });
+      return true;
+    }
+    draft.mediaKind = media.kind;
+    draft.mediaFileId = media.fileId;
+    draft.waitingFor = undefined;
+    await ctx.reply(publishPanelText(locale, draft), {
+      parse_mode: "HTML",
+      reply_markup: publishPanelKeyboard(locale)
+    });
+    return true;
+  }
+
+  return false;
+}
+
+function getMessageText(message: Message | undefined) {
+  if (!message) return null;
+  if ("text" in message && message.text) return message.text.trim();
+  if ("caption" in message && message.caption) return message.caption.trim();
+  return null;
+}
+
+function extractPublishMedia(message: Message | undefined): { kind: PublishMediaKind; fileId: string } | null {
+  if (!message) return null;
+  if ("photo" in message && message.photo?.length) {
+    const photo = message.photo[message.photo.length - 1];
+    return photo ? { kind: "photo", fileId: photo.file_id } : null;
+  }
+  if ("video" in message && message.video) return { kind: "video", fileId: message.video.file_id };
+  if ("animation" in message && message.animation) return { kind: "animation", fileId: message.animation.file_id };
+  if ("sticker" in message && message.sticker) return { kind: "sticker", fileId: message.sticker.file_id };
+  return null;
+}
+
+function parsePublishButton(input: string) {
+  const [rawText, rawUrl] = input.split("|").map((item) => item.trim());
+  if (!rawText || !rawUrl) return null;
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    return { text: rawText.slice(0, 64), url: url.toString() };
+  } catch {
+    return null;
+  }
+}
+
+function publishDraftKeyboard(draft: PublishDraft) {
+  if (!draft.buttonText || !draft.buttonUrl) return undefined;
+  return new InlineKeyboard().url(draft.buttonText, draft.buttonUrl);
+}
+
+async function sendPublishPreview(ctx: Context, draft: PublishDraft, locale: Locale) {
+  if (!draft.text.trim() && !draft.mediaFileId) {
+    await ctx.reply(locale === "zh-CN" ? "请先设置文本或媒体后再预览。" : "Set text or media before previewing.", {
+      reply_markup: publishPanelKeyboard(locale)
+    });
+    return;
+  }
+
+  const replyMarkup = publishDraftKeyboard(draft);
+  const caption = draft.text.trim() || undefined;
+
+  if (draft.mediaFileId && draft.mediaKind === "photo") {
+    await ctx.replyWithPhoto(draft.mediaFileId, {
+      ...(caption ? { caption } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    });
+    return;
+  }
+  if (draft.mediaFileId && draft.mediaKind === "video") {
+    await ctx.replyWithVideo(draft.mediaFileId, {
+      ...(caption ? { caption } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    });
+    return;
+  }
+  if (draft.mediaFileId && draft.mediaKind === "animation") {
+    await ctx.replyWithAnimation(draft.mediaFileId, {
+      ...(caption ? { caption } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    });
+    return;
+  }
+  if (draft.mediaFileId && draft.mediaKind === "sticker") {
+    await ctx.replyWithSticker(draft.mediaFileId, {
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    });
+    if (caption) await ctx.reply(caption);
+    return;
+  }
+
+  await ctx.reply(draft.text, {
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+  });
+}
+
+async function handlePublishInlineQuery(ctx: Context) {
+  const query = ctx.inlineQuery;
+  if (!query) return;
+  const draft = getPublishDraft(query.from.id);
+  const replyMarkup = publishDraftInlineMarkup(draft);
+  const title = draft.name || "快捷发布";
+  const description = draft.text || "点击发送快捷发布消息";
+  const text = draft.text || title;
+  const result = buildPublishInlineResult(draft, title, description, text, replyMarkup);
+  await ctx.answerInlineQuery([result], {
+    cache_time: 0,
+    is_personal: true
+  });
+}
+
+function buildPublishInlineResult(
+  draft: PublishDraft,
+  title: string,
+  description: string,
+  text: string,
+  replyMarkup: InlineKeyboardMarkup | undefined
+): InlineQueryResult {
+  const baseId = `publish-${Date.now()}`;
+  if (draft.mediaFileId && draft.mediaKind === "photo") {
+    return {
+      type: "photo",
+      id: baseId,
+      photo_file_id: draft.mediaFileId,
+      title,
+      description,
+      ...(draft.text ? { caption: draft.text } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    };
+  }
+  if (draft.mediaFileId && draft.mediaKind === "video") {
+    return {
+      type: "video",
+      id: baseId,
+      video_file_id: draft.mediaFileId,
+      title,
+      description,
+      ...(draft.text ? { caption: draft.text } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    };
+  }
+  if (draft.mediaFileId && draft.mediaKind === "animation") {
+    return {
+      type: "gif",
+      id: baseId,
+      gif_file_id: draft.mediaFileId,
+      title,
+      ...(draft.text ? { caption: draft.text } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    };
+  }
+  if (draft.mediaFileId && draft.mediaKind === "sticker") {
+    return {
+      type: "sticker",
+      id: baseId,
+      sticker_file_id: draft.mediaFileId,
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    };
+  }
+  return {
+    type: "article",
+    id: baseId,
+    title,
+    description,
+    input_message_content: {
+      message_text: text
+    },
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+  };
+}
+
+function publishDraftInlineMarkup(draft: PublishDraft): InlineKeyboardMarkup | undefined {
+  if (!draft.buttonText || !draft.buttonUrl) return undefined;
+  return {
+    inline_keyboard: [[{ text: draft.buttonText, url: draft.buttonUrl }]]
+  };
 }
 
 async function handleTimezoneInputMessage(ctx: Context, config: AppConfig, locale: Locale) {
@@ -1009,7 +1462,7 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
   }
 
   if (feature === "publish") {
-    await editOrReply(ctx, publishPanelText(locale, config.botUsername), publishPanelKeyboard(locale));
+    await renderPublishPanel(ctx, locale);
     return;
   }
 
