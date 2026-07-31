@@ -192,11 +192,7 @@ export function createBot(config: AppConfig) {
   });
 
   bot.command("start", async (ctx) => {
-    const locale = await getLocale(ctx);
-    await ctx.reply(mainMenuText(locale, ctx.from?.first_name, config.botUsername), {
-      parse_mode: "HTML",
-      reply_markup: mainMenuKeyboard(locale)
-    });
+    await handleStartCommand(ctx, config);
   });
 
   bot.command("help", async (ctx) => {
@@ -331,9 +327,17 @@ export function createBot(config: AppConfig) {
 
   bot.on("my_chat_member", async (ctx) => {
     const chatId = ctx.myChatMember.chat.id;
+    const oldStatus = ctx.myChatMember.old_chat_member.status;
     const status = ctx.myChatMember.new_chat_member.status;
     if (status === "left" || status === "kicked") {
       await deactivateTelegramChat(chatId).catch(() => undefined);
+      return;
+    }
+
+    const wasJustAdded = isInactiveChatMemberStatus(oldStatus) && isActiveChatMemberStatus(status);
+    const wasJustPromoted = status === "administrator" && oldStatus !== "administrator" && oldStatus !== "creator";
+    if (wasJustAdded || wasJustPromoted) {
+      await handleBotAddedToChat(ctx, config);
     }
   });
 
@@ -342,6 +346,183 @@ export function createBot(config: AppConfig) {
 
 export async function registerBotCommands(bot: Bot) {
   await bot.api.setMyCommands(botCommands.map(({ command, description }) => ({ command, description })));
+}
+
+async function handleStartCommand(ctx: Context, config: AppConfig) {
+  const locale = await getLocale(ctx);
+  const payload = extractStartPayload(ctx);
+  const targetTelegramChatId = payload ? parseStartChatPayload(payload) : null;
+
+  if (targetTelegramChatId && ctx.from) {
+    const opened = await openChatPanelFromStartPayload(ctx, config, locale, targetTelegramChatId);
+    if (opened) return;
+  }
+
+  await ctx.reply(mainMenuText(locale, ctx.from?.first_name, config.botUsername), {
+    parse_mode: "HTML",
+    reply_markup: mainMenuKeyboard(locale)
+  });
+}
+
+async function openChatPanelFromStartPayload(
+  ctx: Context,
+  config: AppConfig,
+  locale: Locale,
+  telegramChatId: bigint
+) {
+  if (!ctx.from) return false;
+
+  const chat = await prisma.chat.findFirst({
+    where: {
+      telegramChatId,
+      status: ChatStatus.ACTIVE
+    }
+  });
+
+  if (!chat) {
+    await ctx.reply(locale === "zh-CN" ? "未找到这个群组/频道，请先重新添加机器人或在群里发送 /bind。" : "Managed chat not found. Add the bot again or send /bind in the chat.");
+    return true;
+  }
+
+  const isAdmin = await isUserChatAdmin(ctx, Number(chat.telegramChatId), ctx.from.id).catch(() => false);
+  if (!isAdmin) {
+    await ctx.reply(locale === "zh-CN" ? "只有该群组/频道管理员可以进入管理菜单。" : "Only admins of this chat can open the management menu.");
+    return true;
+  }
+
+  const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
+  await prisma.chatAdmin.upsert({
+    where: {
+      chatId_userId: {
+        chatId: chat.id,
+        userId: user.id
+      }
+    },
+    create: {
+      chatId: chat.id,
+      userId: user.id,
+      role: "administrator",
+      permissions: {}
+    },
+    update: {
+      role: "administrator"
+    }
+  });
+
+  const scope = chat.type === "CHANNEL" ? "channel" : "group";
+  rememberSelectedChatForModules(ctx.from.id, chat.id);
+  await ctx.reply(chatPanelText(chat, locale), {
+    parse_mode: "HTML",
+    reply_markup: chatPanelKeyboard(chat.id, scope, locale)
+  });
+  return true;
+}
+
+function extractStartPayload(ctx: Context) {
+  const match = "match" in ctx ? ctx.match : undefined;
+  if (typeof match === "string") return match.trim();
+
+  const message = ctx.message;
+  if (!message || !("text" in message) || !message.text) return "";
+  const [, payload = ""] = message.text.trim().split(/\s+/, 2);
+  return payload.trim();
+}
+
+function parseStartChatPayload(payload: string) {
+  const decoded = decodeURIComponent(payload.trim());
+  const match = decoded.match(/^(-?\d+)_home$/);
+  return match?.[1] ? BigInt(match[1]) : null;
+}
+
+async function handleBotAddedToChat(ctx: Context, config: AppConfig) {
+  if (!ctx.from || !ctx.myChatMember?.chat) return;
+
+  const chat = ctx.myChatMember.chat;
+  const locale = await getLocale(ctx);
+  const ownerUser = await upsertTelegramUser(ctx.from, config.defaultTimezone).catch(() => null);
+  const isInstallerAdmin = await isUserChatAdmin(ctx, chat.id, ctx.from.id).catch(() => false);
+  const botUsername = config.botUsername.replace(/^@/, "");
+
+  await bindTelegramChat(chat, isInstallerAdmin && ownerUser ? ownerUser.id : undefined, config.defaultTimezone).catch((error) => {
+    console.error("Failed to bind chat after bot was added", error);
+  });
+
+  const permissionReport = await getBotPermissionReport(ctx, chat.id).catch((error) => ({
+    canManageBaseFeatures: false,
+    missingPermissions: [error instanceof Error ? error.message : String(error)]
+  }));
+
+  const addMenuUrl = `https://t.me/${encodeURIComponent(botUsername)}?start=${encodeURIComponent(`${chat.id}_home`)}`;
+  const keyboard = new InlineKeyboard().url(locale === "zh-CN" ? "进入管理菜单" : "Open menu", addMenuUrl);
+  const lines = buildBotAddedMessage(locale, botUsername, chat, permissionReport.missingPermissions);
+
+  await ctx.api.sendMessage(Number(chat.id), lines, {
+    parse_mode: "HTML",
+    reply_markup: keyboard
+  }).catch((error) => {
+    console.error("Failed to send bot-added welcome message", error);
+  });
+}
+
+function buildBotAddedMessage(
+  locale: Locale,
+  botUsername: string,
+  chat: Chat,
+  missingPermissions: string[]
+) {
+  const title = escapeHtml(chat.title ?? chat.username ?? String(chat.id));
+  const username = escapeHtml(botUsername.replace(/^@/, ""));
+  const permissionLines = [
+    locale === "zh-CN" ? "请至少赋予以下权限:" : "Please grant at least these permissions:",
+    locale === "zh-CN" ? "- 删除消息" : "- Delete messages",
+    locale === "zh-CN" ? "- 发送消息" : "- Send messages",
+    locale === "zh-CN" ? "- 封禁成员" : "- Ban members",
+    locale === "zh-CN" ? "- 置顶消息" : "- Pin messages"
+  ];
+
+  const missingLines = missingPermissions.length
+    ? [
+        "",
+        locale === "zh-CN" ? "当前缺少权限:" : "Missing permissions:",
+        ...missingPermissions.map((item) => `- ${escapeHtml(item)}`)
+      ]
+    : [];
+
+  return locale === "zh-CN"
+    ? [
+        `🎉 欢迎使用: ${username}`,
+        "",
+        "1. 请将我设置为管理员，否则无法正常工作",
+        "",
+        ...permissionLines,
+        ...missingLines,
+        "",
+        "1) 点击下面按钮选择设置(仅限管理员)",
+        "2) 然后点击机器人对话框底部[开始]按钮",
+        "",
+        `群组: <b>${title}</b>`
+      ].join("\n")
+    : [
+        `🎉 Welcome: ${username}`,
+        "",
+        "1. Please make me an administrator, otherwise I cannot work properly",
+        "",
+        ...permissionLines,
+        ...missingLines,
+        "",
+        "1) Click the button below to open settings (admins only)",
+        "2) Then tap the [Start] button in the bot chat",
+        "",
+        `Chat: <b>${title}</b>`
+      ].join("\n");
+}
+
+function isActiveChatMemberStatus(status: string): boolean {
+  return status === "member" || status === "administrator" || status === "creator";
+}
+
+function isInactiveChatMemberStatus(status: string): boolean {
+  return status === "left" || status === "kicked";
 }
 
 function resolveLocaleCode(languageCode: string | null | undefined): Locale {
@@ -826,19 +1007,29 @@ function chatPanelKeyboard(chatId: string, scope: "group" | "channel", locale: L
   } else {
     keyboard
       .text(locale === "zh-CN" ? "⏰ 定时消息" : "⏰ Scheduled", `chat_feature:scheduled:${chatId}`)
-      .text(locale === "zh-CN" ? "📝 快捷发布" : "📝 Publish", `chat_feature:publish:${chatId}`)
+      .text(locale === "zh-CN" ? "🔊 频道同步" : "🔊 Channel sync", `chat_feature:sync:${chatId}`)
       .row()
-      .text(locale === "zh-CN" ? "💬 自动回复" : "💬 Auto reply", `chat_feature:auto_reply:${chatId}`)
-      .text(locale === "zh-CN" ? "🔄 同步" : "🔄 Sync", `chat_feature:sync:${chatId}`)
+      .text(locale === "zh-CN" ? "➕ 自动按钮" : "➕ Auto button", `chat_feature:auto_button:${chatId}`)
+      .text(locale === "zh-CN" ? "🔠 修改按钮" : "🔠 Edit buttons", `chat_feature:edit_button:${chatId}`)
       .row()
+      .text(locale === "zh-CN" ? "🧹 自动删除" : "🧹 Auto delete", `chat_feature:auto_delete:${chatId}`)
       .text(locale === "zh-CN" ? "⚙️ 控制权限" : "⚙️ Permissions", `chat_feature:permissions:${chatId}`)
-      .text(locale === "zh-CN" ? "🔗 邀请链接" : "🔗 Invite links", `chat_feature:invite:${chatId}`)
+      .row()
+      .text(locale === "zh-CN" ? "🚫 屏蔽" : "🚫 Block", `chat_feature:block:${chatId}`)
+      .text(locale === "zh-CN" ? "📋 导入配置" : "📋 Import config", `chat_feature:import:${chatId}`)
+      .row()
+      .text(locale === "zh-CN" ? "📈 人数统计" : "📈 Member stats", `chat_feature:member_stats:${chatId}`)
+      .text(locale === "zh-CN" ? "🛋️ 评论沙发" : "🛋️ Comment sofa", `chat_feature:comment_sofa:${chatId}`)
       .row();
   }
 
+  const switchLabel = scope === "channel"
+    ? (locale === "zh-CN" ? "🔄 切换频道" : "🔄 Switch channel")
+    : (locale === "zh-CN" ? "🔄 切换群" : "🔄 Switch group");
+
   return keyboard
-    .text(locale === "zh-CN" ? "🔄 切换群" : "🔄 Switch chat", `menu:${scope}s`)
-    .text(locale === "zh-CN" ? "🇨🇳 Languages" : "🇨🇳 Languages", "menu:languages");
+    .text(switchLabel, `menu:${scope}s`)
+    .text("🇨🇳 Languages", "menu:languages");
 }
 
 function blocklistKeyboard(chatId: string, settings: BlocklistSettings, locale: Locale) {
@@ -2474,8 +2665,8 @@ function statsText(stats: Awaited<ReturnType<typeof getStats>>, days: number, lo
 function chatPanelText(chat: PrismaChat, locale: Locale) {
   const title = escapeHtml(chat.title ?? chat.username ?? String(chat.telegramChatId));
   return locale === "zh-CN"
-    ? `⏳ 正在设置 <b>${title}</b>\n选择要更改的项目\n\n<b>ID</b>: <code>${chat.telegramChatId.toString()}</code>`
-    : `⏳ Configuring <b>${title}</b>\nChoose what to change.\n\n<b>ID</b>: <code>${chat.telegramChatId.toString()}</code>`;
+    ? `⏳ 正在设置 <b>${title}</b>，选择要更改的项目\n\n<b>ID</b>: <code>${chat.telegramChatId.toString()}</code>`
+    : `⏳ Configuring <b>${title}</b>, choose what to change.\n\n<b>ID</b>: <code>${chat.telegramChatId.toString()}</code>`;
 }
 
 function blocklistText(settings: BlocklistSettings, locale: Locale) {

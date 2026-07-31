@@ -7,7 +7,7 @@ DarvisXBot is a Telegram group and channel management bot backend based on the M
 - Node.js + TypeScript
 - grammY for Telegram Bot API
 - Fastify for webhook HTTP service
-- PostgreSQL + Prisma. Local Docker maps PostgreSQL to `localhost:55432` to avoid conflicts with an existing local PostgreSQL on `5432`.
+- PostgreSQL + Prisma. Local Docker maps PostgreSQL to `localhost:15433` to avoid conflicts with existing local PostgreSQL instances.
 - Redis + BullMQ
 - Docker Compose for local infrastructure
 
