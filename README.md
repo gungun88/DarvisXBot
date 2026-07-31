@@ -1,6 +1,6 @@
-# XDoingBot
+# DarvisXBot
 
-XDoingBot is a Telegram group and channel management bot backend based on the MVP PRD in `XDoingBot开发PRD.md`.
+DarvisXBot is a Telegram group and channel management bot backend based on the MVP PRD in `DarvisXBot开发PRD.md`.
 
 ## Stack
 

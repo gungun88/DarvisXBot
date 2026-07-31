@@ -21,7 +21,7 @@ export async function createServer(config: AppConfig) {
   app.get("/health", async () => {
     await prisma.$queryRaw`SELECT 1`;
     await redis.ping();
-    return { ok: true, service: "xdoingbot" };
+    return { ok: true, service: "darvisxbot" };
   });
 
   app.post(

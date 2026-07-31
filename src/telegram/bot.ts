@@ -382,7 +382,7 @@ const languageOptions = [
   { label: "🇹🇭 ภาษาไทย", code: "th" }
 ] as const;
 
-function mainMenuText(locale: Locale, firstName?: string, botUsername = "xdoingbot") {
+function mainMenuText(locale: Locale, firstName?: string, botUsername = "DarvisXBot") {
   const name = escapeHtml(firstName?.trim() || (locale === "zh-CN" ? "管理员" : "admin"));
   const username = escapeHtml(botUsername.replace(/^@/, ""));
   const botLink = `https://t.me/${encodeURIComponent(username)}`;

@@ -1,24 +1,24 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: xdoingbot-postgres
+    container_name: darvisxbot-postgres
     environment:
-      POSTGRES_DB: xdoingbot
-      POSTGRES_USER: xdoingbot
-      POSTGRES_PASSWORD: xdoingbot
+      POSTGRES_DB: darvisxbot
+      POSTGRES_USER: darvisxbot
+      POSTGRES_PASSWORD: darvisxbot
     ports:
       - "55432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U xdoingbot -d xdoingbot"]
+      test: ["CMD-SHELL", "pg_isready -U darvisxbot -d darvisxbot"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   redis:
     image: redis:7-alpine
-    container_name: xdoingbot-redis
+    container_name: darvisxbot-redis
     ports:
       - "6379:6379"
     volumes:
@@ -31,7 +31,7 @@ services:
 
   app:
     build: .
-    container_name: xdoingbot-app
+    container_name: darvisxbot-app
     depends_on:
       postgres:
         condition: service_healthy
@@ -41,7 +41,7 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgresql://xdoingbot:xdoingbot@postgres:5432/xdoingbot?schema=public
+      DATABASE_URL: postgresql://darvisxbot:darvisxbot@postgres:5432/darvisxbot?schema=public
       REDIS_URL: redis://redis:6379
     ports:
       - "3000:3000"

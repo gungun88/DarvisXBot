@@ -7,7 +7,7 @@ const envSchema = z.object({
   HOST: z.string().default("0.0.0.0"),
   PORT: z.coerce.number().int().positive().default(3000),
   BOT_TOKEN: z.string().min(1),
-  BOT_USERNAME: z.string().min(1).default("xdoingbot"),
+  BOT_USERNAME: z.string().min(1).default("DarvisXBot"),
   WEBHOOK_PATH: z.string().startsWith("/").default("/telegram/webhook"),
   WEBHOOK_SECRET: z.string().min(16).optional(),
   DROP_PENDING_UPDATES: z.coerce.boolean().default(true),

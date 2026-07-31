@@ -27,12 +27,12 @@ if (config.botMode === "polling") {
   await bot.start({
     drop_pending_updates: config.dropPendingUpdates,
     onStart: (botInfo) => {
-      console.info(`XDoingBot polling started as @${botInfo.username}`);
+      console.info(`DarvisXBot polling started as @${botInfo.username}`);
     }
   });
 } else {
   const { createServer } = await import("./server.js");
   const server = await createServer(config);
   const address = await server.listen({ host: config.host, port: config.port });
-  server.log.info({ address }, "XDoingBot webhook service started");
+  server.log.info({ address }, "DarvisXBot webhook service started");
 }
