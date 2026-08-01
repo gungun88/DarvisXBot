@@ -2217,8 +2217,6 @@ function scheduledInputPromptText(
         "",
         "Example: <code>2026-08-01 08:59:41</code>",
         "",
-        "This date is interpreted in the current chat timezone.",
-        "",
         `Current start time: ${escapeHtml(currentStart)}`
       ].join("\n"),
       end: [
@@ -2229,8 +2227,6 @@ function scheduledInputPromptText(
         "Format: year-month-day hour:minute:second",
         "",
         "Example: <code>2026-08-01 09:58:09</code>",
-        "",
-        "This date is interpreted in the current chat timezone.",
         "",
         `Current end time: ${escapeHtml(currentEnd)}`
       ].join("\n")
@@ -2265,8 +2261,6 @@ function scheduledInputPromptText(
       "",
       "例如:<code>2026-08-01 08:59:41</code>",
       "",
-      "此日期按当前群/频道默认时区计算。",
-      "",
       `当前设置的开始时间: ${escapeHtml(currentStart)}`
     ].join("\n"),
     end: [
@@ -2277,8 +2271,6 @@ function scheduledInputPromptText(
       "格式:年-月-日 时:分:秒",
       "",
       "例如:<code>2026-08-01 09:58:09</code>",
-      "",
-      "此日期按当前群/频道默认时区计算。",
       "",
       `当前设置的终止时间: ${escapeHtml(currentEnd)}`
     ].join("\n")
