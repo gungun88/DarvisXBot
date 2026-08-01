@@ -126,6 +126,14 @@ type ScheduledInputDraft = {
   field: ScheduledInputField;
 };
 
+type ScheduledMessageListItem = {
+  id: string;
+  content: Prisma.JsonValue;
+  buttons: Prisma.JsonValue | null;
+  repeatRule: Prisma.JsonValue | null;
+  status: ScheduledMessageStatus;
+};
+
 const botCommands = [
   { command: "start", description: "开始菜单" },
   { command: "help", description: "帮助" },
@@ -1391,6 +1399,38 @@ async function handleScheduledCallback(ctx: Context) {
 
   if (action === "noop") return;
 
+  if (action === "list_toggle") {
+    if (value === "on") {
+      const content = parseScheduledContent(scheduled.content);
+      if (!hasScheduledMessageContent(content)) {
+        await openScheduledMessagePanel(ctx, locale, scheduled.chat);
+        return;
+      }
+      const repeatRule = parseScheduledRepeatRule(scheduled.repeatRule);
+      const sendAt = nextScheduledRun(repeatRule, new Date()) ?? new Date(Date.now() + repeatRule.intervalMinutes * 60_000);
+      await prisma.scheduledMessage.update({
+        where: { id: scheduled.id },
+        data: { status: ScheduledMessageStatus.PENDING, sendAt }
+      });
+      await enqueueScheduledMessage(scheduled.id, sendAt);
+    } else {
+      await cancelScheduledMessageJob(scheduled.id);
+      await prisma.scheduledMessage.update({
+        where: { id: scheduled.id },
+        data: { status: ScheduledMessageStatus.DRAFT }
+      });
+    }
+    await openScheduledMessagePanel(ctx, locale, scheduled.chat);
+    return;
+  }
+
+  if (action === "delete") {
+    await cancelScheduledMessageJob(scheduled.id);
+    await prisma.scheduledMessage.delete({ where: { id: scheduled.id } });
+    await openScheduledMessagePanel(ctx, locale, scheduled.chat);
+    return;
+  }
+
   if (action === "toggle") {
     if (value === "on") {
       const content = parseScheduledContent(scheduled.content);
@@ -1457,22 +1497,84 @@ async function handleScheduledCallback(ctx: Context) {
 async function openScheduledMessagePanel(ctx: Context, locale: Locale, chat: PrismaChat) {
   const messages = await prisma.scheduledMessage.findMany({
     where: { chatId: chat.id },
-    orderBy: { updatedAt: "desc" },
+    orderBy: { createdAt: "asc" },
     take: 10
   });
 
   await editOrReply(
     ctx,
-    scheduledMessageListText(chat, locale),
+    scheduledMessageListText(chat, messages, locale),
     scheduledMessageListKeyboard(chat.id, messages, chat.type === "CHANNEL" ? "channel" : "group", locale)
   );
 }
 
-function scheduledMessageListText(chat: PrismaChat, locale: Locale) {
+function scheduledMessageListText(chat: PrismaChat, messages: ScheduledMessageListItem[], locale: Locale) {
   const title = escapeHtml(chat.title ?? chat.username ?? String(chat.telegramChatId));
-  return locale === "zh-CN"
-    ? `⏰ <b>定时消息</b>\n\n设置 <b>${title}</b> 每隔几分钟/小时重复发送的消息`
-    : `⏰ <b>Scheduled messages</b>\n\nConfigure messages repeated every few minutes or hours for <b>${title}</b>.`;
+  const header = locale === "zh-CN"
+    ? [`⏰ <b>定时消息</b>`, "", `设置 <b>${title}</b> 每隔几分钟/小时重复发送的消息`]
+    : [`⏰ <b>Scheduled messages</b>`, "", `Configure messages repeated every few minutes or hours for <b>${title}</b>.`];
+
+  if (!messages.length) return header.join("\n");
+
+  const details = messages.map((message, index) => scheduledMessageListItemText(message, index + 1, locale));
+  return [...header, "", "", ...details].join("\n");
+}
+
+function scheduledMessageListItemText(message: ScheduledMessageListItem, index: number, locale: Locale) {
+  const content = parseScheduledContent(message.content);
+  const repeatRule = parseScheduledRepeatRule(message.repeatRule);
+  const enabled = message.status === ScheduledMessageStatus.PENDING;
+  const hasMedia = Boolean(content.mediaFileId || content.photoFileId);
+  const hasButtons = scheduledButtonsEnabled(message.buttons);
+  const hasText = Boolean(content.text?.trim());
+  const name = escapeHtml(content.name || "-");
+  const interval = repeatRule.cron ? `Cron ${escapeHtml(repeatRule.cron)}` : formatDurationZh(repeatRule.intervalMinutes);
+
+  if (locale !== "zh-CN") {
+    return [
+      `<b>Message</b>${index} name:${name}`,
+      `  ├Status: <b>${enabled ? "✅On" : "❌Off"}</b>`,
+      `  ├ <code>${interval}</code> once`,
+      `  ├Media photo: ${hasMedia ? "✅" : "❌"}`,
+      `  ├Link button: ${hasButtons ? "✅" : "❌"}`,
+      `  └Text content: ${hasText ? "✅" : "❌"}`
+    ].join("\n");
+  }
+
+  return [
+    `<b>消息</b>${index} 名称:${name}`,
+    `  ├状态: <b>${enabled ? "✅开启" : "❌关闭"}</b>`,
+    `  ├ <code>${interval}</code> 发送一次`,
+    `  ├媒体图片: ${hasMedia ? "✅" : "❌"}`,
+    `  ├链接按钮: ${hasButtons ? "✅" : "❌"}`,
+    `  └文本内容: ${hasText ? "✅" : "❌"}`
+  ].join("\n");
+}
+
+function scheduledMessageListKeyboard(
+  chatId: string,
+  messages: ScheduledMessageListItem[],
+  scope: "group" | "channel",
+  locale: Locale
+) {
+  const keyboard = new InlineKeyboard();
+  messages.forEach((message, index) => {
+    const enabled = message.status === ScheduledMessageStatus.PENDING;
+    keyboard
+      .text(locale === "zh-CN" ? `💬消息${index + 1}` : `💬Message${index + 1}`, `scheduled:open:${message.id}`)
+      .text(
+        locale === "zh-CN" ? (enabled ? "✅开启" : "❌关闭") : (enabled ? "✅On" : "❌Off"),
+        `scheduled:list_toggle:${message.id}:${enabled ? "off" : "on"}`
+      )
+      .text(locale === "zh-CN" ? "🔧设置" : "🔧Settings", `scheduled:open:${message.id}`)
+      .text(locale === "zh-CN" ? "删除🗑" : "Delete🗑", `scheduled:delete:${message.id}`)
+      .row();
+  });
+
+  return keyboard
+    .text(locale === "zh-CN" ? "➕添加" : "➕Add", `scheduled:add:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙Back", `menu:chat:${scope}:${chatId}`);
 }
 
 async function openScheduledIntervalPanel(ctx: Context, locale: Locale, id: string) {
@@ -1566,24 +1668,6 @@ function scheduledCronPromptText(rule: ScheduledRepeatRule, locale: Locale) {
         "",
         "✏️ <b>Send the Cron expression directly to validate and save it.</b>"
       ].join("\n");
-}
-
-function scheduledMessageListKeyboard(
-  chatId: string,
-  messages: Array<{ id: string; content: Prisma.JsonValue; status: ScheduledMessageStatus }>,
-  scope: "group" | "channel",
-  locale: Locale
-) {
-  const keyboard = new InlineKeyboard();
-  for (const message of messages) {
-    const content = parseScheduledContent(message.content);
-    const status = message.status === ScheduledMessageStatus.PENDING ? "✅" : "❌";
-    keyboard.text(`${status} ${(content.name || content.text || message.id).slice(0, 40)}`, `scheduled:open:${message.id}`).row();
-  }
-  return keyboard
-    .text(locale === "zh-CN" ? "➕ 添加" : "➕ Add", `scheduled:add:${chatId}`)
-    .row()
-    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `menu:chat:${scope}:${chatId}`);
 }
 
 async function renderScheduledMessageSettings(ctx: Context, locale: Locale, scheduledMessageId: string) {
