@@ -1295,6 +1295,16 @@ async function handleScheduledCallback(ctx: Context) {
   const [, action, id, value] = data.split(":");
   if (!action || !id) return;
 
+  if (action === "list_message") {
+    const scheduled = await prisma.scheduledMessage.findUnique({
+      where: { id },
+      include: { chat: true }
+    });
+    if (!scheduled) return;
+    await openScheduledMessagePanel(ctx, locale, scheduled.chat);
+    return;
+  }
+
   if (action === "list" || action === "back") {
     const chat = await prisma.chat.findUnique({ where: { id } });
     if (!chat) return;
@@ -1689,7 +1699,7 @@ function scheduledMessageSettingsKeyboard(
     .text(locale === "zh-CN" ? "📅 开始日期" : "📅 Start date", `scheduled:edit:${id}:start`)
     .text(locale === "zh-CN" ? "📅 结束日期" : "📅 End date", `scheduled:edit:${id}:end`)
     .row()
-    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `scheduled:back:${chatId}`)
+    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `scheduled:list_message:${id}`)
     .text(locale === "zh-CN" ? "批量操作" : "Bulk actions", `scheduled:bulk:${chatId}`);
 }
 
