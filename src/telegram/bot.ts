@@ -1522,6 +1522,12 @@ async function handleScheduledCallback(ctx: Context) {
 
   if (action === "clear") {
     await clearScheduledField(scheduled.id, value);
+    if (ctx.from) scheduledInputDrafts.delete(ctx.from.id);
+    const refreshed = await prisma.scheduledMessage.findUnique({ where: { id: scheduled.id } });
+    if (refreshed && value && isScheduledInputField(value)) {
+      await editOrReply(ctx, scheduledInputPromptText(value, locale, refreshed), scheduledInputKeyboard(value, scheduled.id, locale));
+      return;
+    }
     await renderScheduledMessageSettings(ctx, locale, scheduled.id);
     return;
   }
