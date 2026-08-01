@@ -2209,6 +2209,8 @@ function scheduledInputPromptText(
         "",
         "Example: <code>2026-08-01 08:59:41</code>",
         "",
+        "This date is interpreted in the current chat timezone.",
+        "",
         `Current start time: ${escapeHtml(currentStart)}`
       ].join("\n"),
       end: [
@@ -2219,6 +2221,8 @@ function scheduledInputPromptText(
         "Format: year-month-day hour:minute",
         "",
         "Example: <code>2026-08-01 09:58:09</code>",
+        "",
+        "This date is interpreted in the current chat timezone.",
         "",
         `Current end time: ${escapeHtml(currentEnd)}`
       ].join("\n")
@@ -2253,6 +2257,8 @@ function scheduledInputPromptText(
       "",
       "例如:<code>2026-08-01 08:59:41</code>",
       "",
+      "此日期按当前群/频道默认时区计算。",
+      "",
       `当前设置的开始时间: ${escapeHtml(currentStart)}`
     ].join("\n"),
     end: [
@@ -2263,6 +2269,8 @@ function scheduledInputPromptText(
       "格式:年-月-日 时:分",
       "",
       "例如:<code>2026-08-01 09:58:09</code>",
+      "",
+      "此日期按当前群/频道默认时区计算。",
       "",
       `当前设置的终止时间: ${escapeHtml(currentEnd)}`
     ].join("\n")
@@ -2331,16 +2339,12 @@ function scheduledInputKeyboard(field: ScheduledInputField, id: string, locale: 
     return new InlineKeyboard()
       .text(locale === "zh-CN" ? "🚫 移除已设置的开始时间" : "🚫 Remove start time", `scheduled:clear:${id}:start`)
       .row()
-      .text(locale === "zh-CN" ? "🌍 设置时区" : "🌍 Timezone", "menu:timezone")
-      .row()
       .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `scheduled:open:${id}`);
   }
 
   if (field === "end") {
     return new InlineKeyboard()
       .text(locale === "zh-CN" ? "🚫 移除已设置的终止时间" : "🚫 Remove end time", `scheduled:clear:${id}:end`)
-      .row()
-      .text(locale === "zh-CN" ? "🌍 设置时区" : "🌍 Timezone", "menu:timezone")
       .row()
       .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `scheduled:open:${id}`);
   }
