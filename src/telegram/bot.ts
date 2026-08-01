@@ -1171,7 +1171,6 @@ function autoReplyKeyboard(chatId: string, settings: AutoReplySettings, locale: 
     .row()
     .text(locale === "zh-CN" ? "✍ 添加" : "✍ Add", `auto_reply:add:${chatId}`)
     .text(locale === "zh-CN" ? "🗑 删除" : "🗑 Delete", `auto_reply:delete:${chatId}`)
-    .row()
     .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `menu:chat:group:${chatId}`);
 }
 
