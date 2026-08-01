@@ -747,6 +747,13 @@ function timezonePromptKeyboard(locale: Locale) {
   return new InlineKeyboard().text(locale === "zh-CN" ? "❌ 取消" : "❌ Cancel", "menu:timezone:cancel");
 }
 
+function timezoneSavedKeyboard(locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙Back", "menu:timezone");
+}
+
+function timezoneSavedText(locale: Locale) {
+  return locale === "zh-CN" ? "✅ 设置成功，点击按钮返回。" : "✅ Saved. Tap the button to return.";
+}
 function timezoneSummaryText(timezone: string, locale: Locale) {
   return locale === "zh-CN"
     ? `<b>您的默认时区</b>: ${escapeHtml(timezone)}\n<b>当前时间</b>: ${formatTimezoneNow(timezone)}`
@@ -2877,9 +2884,9 @@ async function handleTimezoneInputMessage(ctx: Context, config: AppConfig, local
 
   await updateUserTimezone(ctx.from.id, timezone);
   timezoneInputUsers.delete(ctx.from.id);
-  await ctx.reply(timezoneSummaryText(timezone, locale), {
+  await ctx.reply(timezoneSavedText(locale), {
     parse_mode: "HTML",
-    reply_markup: timezoneSummaryKeyboard(locale)
+    reply_markup: timezoneSavedKeyboard(locale)
   });
   return true;
 }
@@ -2909,9 +2916,17 @@ async function timezoneFromMessage(ctx: Context) {
 function normalizeTimezoneInput(input: string) {
   const value = input.trim();
   if (!value) return null;
-  const known = cityTimezoneMap.get(value.toLowerCase());
+  const known = cityTimezoneMap.get(normalizeCityTimezoneKey(value));
   if (known) return known;
   return isValidTimeZone(value) ? value : null;
+}
+
+function normalizeCityTimezoneKey(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/(?:城市|市)$/u, "")
+    .trim();
 }
 
 const cityTimezoneMap = new Map<string, string>([
