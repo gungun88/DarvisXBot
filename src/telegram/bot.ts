@@ -100,6 +100,19 @@ type AutoDeleteSettings = {
   seconds: number;
 };
 
+type AutoReplyRule = {
+  id: string;
+  keyword: string;
+  matchType: "exact" | "contains";
+  response: string;
+};
+
+type AutoReplySettings = {
+  enabled: boolean;
+  deleteAfterMinutes: number;
+  rules: AutoReplyRule[];
+};
+
 type PendingVerification = {
   chatId: number;
   userId: number;
@@ -124,6 +137,10 @@ type ScheduledInputField = "name" | "text" | "media" | "button" | "interval" | "
 type ScheduledInputDraft = {
   scheduledMessageId: string;
   field: ScheduledInputField;
+};
+
+type AutoReplyInputDraft = {
+  chatId: string;
 };
 
 type ScheduledMessageListItem = {
@@ -184,12 +201,19 @@ const defaultAutoDeleteSettings: AutoDeleteSettings = {
   seconds: 0
 };
 
+const defaultAutoReplySettings: AutoReplySettings = {
+  enabled: true,
+  deleteAfterMinutes: 0,
+  rules: []
+};
+
 const pendingVerifications = new Map<string, PendingVerification>();
 const recentJoins = new Map<string, number>();
 const raidJoinEvents = new Map<string, number[]>();
 const timezoneInputUsers = new Set<number>();
 const publishDrafts = new Map<number, PublishDraft>();
 const scheduledInputDrafts = new Map<number, ScheduledInputDraft>();
+const autoReplyInputDrafts = new Map<number, AutoReplyInputDraft>();
 
 function rememberSelectedChatForModules(userId: number | undefined, chatId: string) {
   if (typeof userId !== "number") return;
@@ -320,6 +344,10 @@ export function createBot(config: AppConfig) {
     await handleAutoDeleteCallback(ctx);
   });
 
+  bot.callbackQuery(/^auto_reply:/, async (ctx) => {
+    await handleAutoReplyCallback(ctx);
+  });
+
   bot.callbackQuery(/^new_member_limit:/, async (ctx) => {
     await handleNewMemberLimitCallback(ctx, config);
   });
@@ -350,6 +378,7 @@ export function createBot(config: AppConfig) {
 
   bot.on("message", async (ctx) => {
     const locale = await getLocale(ctx);
+    if (await handleAutoReplyInputMessage(ctx, locale)) return;
     if (await handleTimezoneInputMessage(ctx, config, locale)) return;
     if (await handleScheduledInputMessage(ctx, locale)) return;
     if (await handlePublishInputMessage(ctx, locale)) return;
@@ -460,6 +489,7 @@ async function openChatPanelFromStartPayload(
 function clearUserInputState(userId: number) {
   timezoneInputUsers.delete(userId);
   scheduledInputDrafts.delete(userId);
+  autoReplyInputDrafts.delete(userId);
   const publishDraft = publishDrafts.get(userId);
   if (publishDraft) publishDraft.waitingFor = undefined;
 }
@@ -1123,6 +1153,39 @@ function autoDeleteKeyboard(chatId: string, settings: AutoDeleteSettings, locale
     .text("300s", `auto_delete:seconds:300:${chatId}`)
     .row()
     .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `menu:chat:group:${chatId}`);
+}
+
+function autoReplyKeyboard(chatId: string, settings: AutoReplySettings, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "状态:" : "Status:", `auto_reply:noop:${chatId}`)
+    .text(settings.enabled ? "✅启用" : "启用", `auto_reply:toggle:${chatId}:on`)
+    .text(!settings.enabled ? "✅关闭" : "关闭", `auto_reply:toggle:${chatId}:off`)
+    .row()
+    .text(locale === "zh-CN" ? "删除消息(分钟) ⤵︎" : "Delete reply (minutes) ⤵︎", `auto_reply:noop:${chatId}`)
+    .row()
+    .text(settings.deleteAfterMinutes === 0 ? "✅否" : "否", `auto_reply:delete_after:${chatId}:0`)
+    .text(settings.deleteAfterMinutes === 1 ? "✅1" : "1", `auto_reply:delete_after:${chatId}:1`)
+    .text(settings.deleteAfterMinutes === 5 ? "✅5" : "5", `auto_reply:delete_after:${chatId}:5`)
+    .text(settings.deleteAfterMinutes === 10 ? "✅10" : "10", `auto_reply:delete_after:${chatId}:10`)
+    .text(settings.deleteAfterMinutes === 30 ? "✅30" : "30", `auto_reply:delete_after:${chatId}:30`)
+    .row()
+    .text(locale === "zh-CN" ? "✍ 添加" : "✍ Add", `auto_reply:add:${chatId}`)
+    .text(locale === "zh-CN" ? "🗑 删除" : "🗑 Delete", `auto_reply:delete:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `menu:chat:group:${chatId}`);
+}
+
+function autoReplyDeleteKeyboard(chatId: string, settings: AutoReplySettings, locale: Locale) {
+  const keyboard = new InlineKeyboard();
+  settings.rules.forEach((rule, index) => {
+    const prefix = rule.matchType === "exact" ? "-" : "*";
+    keyboard.text(`${index + 1}. ${prefix}${rule.keyword}`.slice(0, 64), `auto_reply:delete_rule:${chatId}:${rule.id}`).row();
+  });
+  return keyboard.text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `chat_feature:auto_reply:${chatId}`);
+}
+
+function autoReplyCancelKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `chat_feature:auto_reply:${chatId}`);
 }
 
 async function handleMenuCallback(ctx: Context, config: AppConfig) {
@@ -2717,6 +2780,59 @@ async function handlePublishInputMessage(ctx: Context, locale: Locale) {
   return false;
 }
 
+async function handleAutoReplyInputMessage(ctx: Context, locale: Locale) {
+  if (!ctx.from) return false;
+  const draft = autoReplyInputDrafts.get(ctx.from.id);
+  if (!draft) return false;
+
+  const text = getMessageText(ctx.message);
+  const parsed = text ? parseAutoReplyInput(text) : null;
+  if (!parsed) {
+    await ctx.reply(
+      locale === "zh-CN"
+        ? "格式不正确。请按示例发送：\n\n<code>-关键词</code>\n<code>回复内容</code>\n\n<code>*关键词</code>\n<code>回复内容</code>"
+        : "Invalid format. Send:\n\n<code>-keyword</code>\n<code>reply content</code>\n\n<code>*keyword</code>\n<code>reply content</code>",
+      { parse_mode: "HTML", reply_markup: autoReplyCancelKeyboard(draft.chatId, locale) }
+    );
+    return true;
+  }
+
+  const settings = await getAutoReplySettings(draft.chatId);
+  settings.rules.push({
+    id: createAutoReplyRuleId(),
+    keyword: parsed.keyword,
+    matchType: parsed.matchType,
+    response: parsed.response
+  });
+  autoReplyInputDrafts.delete(ctx.from.id);
+  await saveAutoReplySettings(draft.chatId, settings);
+  await ctx.reply(locale === "zh-CN" ? "✅ 设置成功，点击按钮返回。" : "✅ Saved. Tap the button to return.", {
+    parse_mode: "HTML",
+    reply_markup: autoReplyCancelKeyboard(draft.chatId, locale)
+  });
+  return true;
+}
+
+function parseAutoReplyInput(input: string) {
+  const lines = input.split(/\r?\n/);
+  const firstLine = lines.shift()?.trim() ?? "";
+  const prefix = firstLine[0];
+  if (prefix !== "-" && prefix !== "*") return null;
+
+  const keyword = firstLine.slice(1).trim();
+  const response = lines.join("\n").trim();
+  if (!keyword || !response) return null;
+  return {
+    keyword: keyword.slice(0, 80),
+    response: response.slice(0, 4000),
+    matchType: prefix === "-" ? "exact" as const : "contains" as const
+  };
+}
+
+function createAutoReplyRuleId() {
+  return `ar${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function getMessageText(message: Message | undefined) {
   if (!message) return null;
   if ("text" in message && message.text) return message.text.trim();
@@ -3098,6 +3214,12 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
     return;
   }
 
+  if (feature === "auto_reply") {
+    const settings = await getAutoReplySettings(chatId);
+    await editOrReply(ctx, autoReplyText(settings, locale), autoReplyKeyboard(chatId, settings, locale));
+    return;
+  }
+
   if (feature === "new_member_limit") {
     await openNewMemberLimitMenu(ctx, config, locale);
     return;
@@ -3150,7 +3272,7 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
     return;
   }
 
-  if (feature === "member_stats" || feature === "schedule" || feature === "auto_reply" || feature === "night_mode" || feature === "commands" || feature === "speech_check" || feature === "banned_words" || feature === "anti_spam" || feature === "import" || feature === "members" || feature === "sync") {
+  if (feature === "member_stats" || feature === "schedule" || feature === "night_mode" || feature === "commands" || feature === "speech_check" || feature === "banned_words" || feature === "anti_spam" || feature === "import" || feature === "members" || feature === "sync") {
     await editOrReply(
       ctx,
       locale === "zh-CN"
@@ -3376,6 +3498,59 @@ async function handleAutoDeleteCallback(ctx: Context) {
   await editOrReply(ctx, autoDeleteText(settings, locale), autoDeleteKeyboard(chatId, settings, locale));
 }
 
+async function handleAutoReplyCallback(ctx: Context) {
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  const data = ctx.callbackQuery?.data;
+  if (!data) return;
+
+  const [, action, chatId, value] = data.split(":");
+  if (!action || !chatId) return;
+
+  const locale = await getLocale(ctx);
+  const settings = await getAutoReplySettings(chatId);
+
+  if (action === "noop") return;
+
+  if (action === "toggle") {
+    settings.enabled = value !== "off";
+    await saveAutoReplySettings(chatId, settings);
+    await editOrReply(ctx, autoReplyText(settings, locale), autoReplyKeyboard(chatId, settings, locale));
+    return;
+  }
+
+  if (action === "delete_after") {
+    settings.deleteAfterMinutes = clampNumber(Number(value ?? 0), 0, 1440);
+    await saveAutoReplySettings(chatId, settings);
+    await editOrReply(ctx, autoReplyText(settings, locale), autoReplyKeyboard(chatId, settings, locale));
+    return;
+  }
+
+  if (action === "add") {
+    if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    autoReplyInputDrafts.set(ctx.from.id, { chatId });
+    await editOrReply(ctx, autoReplyAddPromptText(locale), autoReplyCancelKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "delete") {
+    if (!settings.rules.length) {
+      await ctx.answerCallbackQuery({
+        text: locale === "zh-CN" ? "暂无可删除的关键词。" : "No keywords to delete."
+      }).catch(() => undefined);
+      return;
+    }
+    await editOrReply(ctx, autoReplyDeleteText(settings, locale), autoReplyDeleteKeyboard(chatId, settings, locale));
+    return;
+  }
+
+  if (action === "delete_rule" && value) {
+    settings.rules = settings.rules.filter((rule) => rule.id !== value);
+    await saveAutoReplySettings(chatId, settings);
+    await editOrReply(ctx, autoReplyText(settings, locale), autoReplyKeyboard(chatId, settings, locale));
+  }
+}
+
 async function handleIncomingMessage(ctx: Context, config: AppConfig) {
   const message = ctx.message;
   if (!message || !ctx.chat) return;
@@ -3396,7 +3571,10 @@ async function handleIncomingMessage(ctx: Context, config: AppConfig) {
     return;
   }
 
-  if (chat) await maybeAutoDelete(ctx, chat.id, message);
+  if (chat) {
+    await maybeSendAutoReply(ctx, chat.id, message);
+    await maybeAutoDelete(ctx, chat.id, message);
+  }
 }
 
 async function handleNewChatMembers(ctx: Context, config: AppConfig, members: User[]) {
@@ -3851,6 +4029,37 @@ async function getAutoDeleteSettings(chatId: string) {
   } as AutoDeleteSettings;
 }
 
+async function getAutoReplySettings(chatId: string) {
+  const raw = await getSettingRecord(chatId, "auto_reply");
+  const rules = Array.isArray(raw.rules)
+    ? raw.rules.map(parseAutoReplyRule).filter((rule): rule is AutoReplyRule => Boolean(rule))
+    : [];
+  return {
+    ...defaultAutoReplySettings,
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : defaultAutoReplySettings.enabled,
+    deleteAfterMinutes: clampNumber(Number(raw.deleteAfterMinutes ?? defaultAutoReplySettings.deleteAfterMinutes), 0, 1440),
+    rules
+  } as AutoReplySettings;
+}
+
+async function saveAutoReplySettings(chatId: string, settings: AutoReplySettings) {
+  await saveSetting(chatId, "auto_reply", settingsToJson({
+    enabled: settings.enabled,
+    deleteAfterMinutes: settings.deleteAfterMinutes,
+    rules: settings.rules
+  }));
+}
+
+function parseAutoReplyRule(value: unknown): AutoReplyRule | null {
+  if (!isRecord(value)) return null;
+  const id = typeof value.id === "string" ? value.id : "";
+  const keyword = typeof value.keyword === "string" ? value.keyword.trim() : "";
+  const response = typeof value.response === "string" ? value.response.trim() : "";
+  const matchType = value.matchType === "contains" ? "contains" : value.matchType === "exact" ? "exact" : null;
+  if (!id || !keyword || !response || !matchType) return null;
+  return { id, keyword, response, matchType };
+}
+
 async function getSettingRecord(chatId: string, key: string): Promise<SettingRecord> {
   const setting = await prisma.setting.findUnique({
     where: { chatId_key: { chatId, key } }
@@ -3952,6 +4161,32 @@ async function maybeAutoDelete(ctx: Context, chatId: string, message: Message) {
   setTimeout(() => {
     void ctx.api.deleteMessage(ctx.chat!.id, message.message_id).catch(() => undefined);
   }, settings.seconds * 1000);
+}
+
+async function maybeSendAutoReply(ctx: Context, chatId: string, message: Message) {
+  if (!ctx.chat || ctx.from?.is_bot) return;
+  const text = getMessageText(message);
+  if (!text) return;
+
+  const settings = await getAutoReplySettings(chatId);
+  if (!settings.enabled || !settings.rules.length) return;
+
+  const normalizedText = text.trim();
+  const rule = settings.rules.find((item) =>
+    item.matchType === "exact"
+      ? normalizedText === item.keyword
+      : normalizedText.includes(item.keyword)
+  );
+  if (!rule) return;
+
+  const sent = await ctx.reply(rule.response, {
+    reply_to_message_id: message.message_id
+  }).catch(() => null);
+  if (sent && settings.deleteAfterMinutes > 0) {
+    setTimeout(() => {
+      void ctx.api.deleteMessage(ctx.chat!.id, sent.message_id).catch(() => undefined);
+    }, settings.deleteAfterMinutes * 60 * 1000);
+  }
 }
 
 async function addPoints(
@@ -4082,6 +4317,65 @@ function autoDeleteText(settings: AutoDeleteSettings, locale: Locale) {
   return locale === "zh-CN"
     ? `<b>🧹 自动删除</b>\n状态：${onOffZh(settings.enabled)}\n延迟：${settings.seconds} 秒`
     : `<b>🧹 Auto delete</b>\nStatus: ${onOff(settings.enabled)}\nDelay: ${settings.seconds}s`;
+}
+
+function autoReplyText(settings: AutoReplySettings, locale: Locale) {
+  const rules = settings.rules.length
+    ? settings.rules.map((rule) => `${rule.matchType === "exact" ? "-" : "*"} ${escapeHtml(rule.keyword)}`)
+    : ["[空]"];
+
+  if (locale !== "zh-CN") {
+    return [
+      "💬 Keyword replies",
+      "",
+      "<b>Added keywords:</b>",
+      ...rules,
+      "- exact match",
+      "* contains match"
+    ].join("\n");
+  }
+
+  return [
+    "💬 关键词回复",
+    "",
+    "<b>已添加的关键词:</b>",
+    ...rules,
+    "- 表示精准触发",
+    " * 表示包含触发"
+  ].join("\n");
+}
+
+function autoReplyDeleteText(settings: AutoReplySettings, locale: Locale) {
+  const lines = settings.rules.map((rule, index) => `${index + 1}. ${rule.matchType === "exact" ? "-" : "*"} ${escapeHtml(rule.keyword)}`);
+  return locale === "zh-CN"
+    ? ["🗑 <b>删除关键词</b>", "", "选择要删除的关键词：", ...lines].join("\n")
+    : ["🗑 <b>Delete keyword</b>", "", "Choose a keyword to delete:", ...lines].join("\n");
+}
+
+function autoReplyAddPromptText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "✍ <b>添加关键词回复</b>",
+        "",
+        "请发送关键词和回复内容：",
+        "",
+        "<code>-关键词</code>",
+        "<code>回复内容</code>",
+        "",
+        "<code>*关键词</code>",
+        "<code>回复内容</code>"
+      ].join("\n")
+    : [
+        "✍ <b>Add keyword reply</b>",
+        "",
+        "Send a keyword and reply content:",
+        "",
+        "<code>-keyword</code>",
+        "<code>reply content</code>",
+        "",
+        "<code>*keyword</code>",
+        "<code>reply content</code>"
+      ].join("\n");
 }
 
 function isRaidJoin(chatId: string, now: number, settings: BlocklistSettings) {
