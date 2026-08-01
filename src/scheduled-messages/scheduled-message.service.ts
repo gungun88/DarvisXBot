@@ -149,6 +149,7 @@ export function isValidCronExpression(value: string) {
 }
 
 export async function enqueueScheduledMessage(id: string, sendAt: Date) {
+  await removeLegacyScheduledMessageJobs();
   const jobId = scheduledMessageJobId(id);
   await scheduledMessagesQueue.remove(jobId).catch(() => undefined);
   await scheduledMessagesQueue.add(
@@ -164,11 +165,21 @@ export async function enqueueScheduledMessage(id: string, sendAt: Date) {
 }
 
 export async function cancelScheduledMessageJob(id: string) {
+  await removeLegacyScheduledMessageJobs();
   await scheduledMessagesQueue.remove(scheduledMessageJobId(id)).catch(() => undefined);
 }
 
 export function scheduledMessageJobId(id: string) {
-  return `scheduled-message:${id}`;
+  return `scheduled-message-${id}`;
+}
+
+async function removeLegacyScheduledMessageJobs() {
+  const jobs = await scheduledMessagesQueue.getJobs(["waiting", "delayed", "paused", "active"]);
+  await Promise.all(
+    jobs
+      .filter((job) => typeof job.id === "string" && job.id.startsWith("scheduled-message:"))
+      .map((job) => job.remove().catch(() => undefined))
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
