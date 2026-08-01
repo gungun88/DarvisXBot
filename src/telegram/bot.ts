@@ -34,6 +34,7 @@ import {
   defaultScheduledRepeatRule,
   enqueueScheduledMessage,
   hasScheduledMessageContent,
+  isValidCronExpression,
   nextScheduledRun,
   parseScheduledContent,
   parseScheduledRepeatRule,
@@ -118,7 +119,7 @@ type PublishDraft = {
   waitingFor: "name" | "text" | "media" | "button" | undefined;
 };
 
-type ScheduledInputField = "name" | "text" | "media" | "button" | "interval" | "time_window" | "start" | "end";
+type ScheduledInputField = "name" | "text" | "media" | "button" | "interval" | "cron" | "time_window" | "start" | "end";
 
 type ScheduledInputDraft = {
   scheduledMessageId: string;
@@ -1326,6 +1327,31 @@ async function handleScheduledCallback(ctx: Context) {
     return;
   }
 
+  if (action === "interval") {
+    await openScheduledIntervalPanel(ctx, locale, id);
+    return;
+  }
+
+  if (action === "set_interval") {
+    const minutes = Number(value);
+    if (!Number.isSafeInteger(minutes) || minutes <= 0) return;
+    const scheduled = await prisma.scheduledMessage.findUnique({ where: { id } });
+    if (!scheduled) return;
+    const repeatRule = parseScheduledRepeatRule(scheduled.repeatRule);
+    delete repeatRule.cron;
+    await saveScheduledRepeatRule(id, { ...repeatRule, intervalMinutes: minutes });
+    await renderScheduledMessageSettings(ctx, locale, id);
+    return;
+  }
+
+  if (action === "cron") {
+    const scheduled = await prisma.scheduledMessage.findUnique({ where: { id } });
+    if (!scheduled || !ctx.from) return;
+    scheduledInputDrafts.set(ctx.from.id, { scheduledMessageId: id, field: "cron" });
+    await editOrReply(ctx, scheduledCronPromptText(parseScheduledRepeatRule(scheduled.repeatRule), locale), scheduledInputCancelKeyboard(id, locale));
+    return;
+  }
+
   if (action === "bulk") {
     const chat = await prisma.chat.findUnique({ where: { id } });
     if (!chat) return;
@@ -1439,6 +1465,99 @@ function scheduledMessageListText(chat: PrismaChat, locale: Locale) {
     : `⏰ <b>Scheduled messages</b>\n\nConfigure messages repeated every few minutes or hours for <b>${title}</b>.`;
 }
 
+async function openScheduledIntervalPanel(ctx: Context, locale: Locale, id: string) {
+  const scheduled = await prisma.scheduledMessage.findUnique({ where: { id } });
+  if (!scheduled) return;
+  const repeatRule = parseScheduledRepeatRule(scheduled.repeatRule);
+  await editOrReply(ctx, scheduledIntervalText(locale), scheduledIntervalKeyboard(id, repeatRule, locale));
+}
+
+function scheduledIntervalText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "⏰ <b>定时消息</b>",
+        "",
+        "勾选数字是间隔多久发送一次，不保证准时发送，如果想准时准点发，请勾选 <b>自定义Cron表达式</b>",
+        "",
+        "➡️ 选择该消息间隔多久发送一次:"
+      ].join("\n")
+    : [
+        "⏰ <b>Scheduled messages</b>",
+        "",
+        "The selected number controls the repeat interval. Exact delivery time is not guaranteed. For exact timing, use <b>Custom Cron expression</b>.",
+        "",
+        "➡️ Choose the repeat interval:"
+      ].join("\n");
+}
+
+function scheduledIntervalKeyboard(id: string, rule: ScheduledRepeatRule, locale: Locale) {
+  const keyboard = new InlineKeyboard()
+    .text(locale === "zh-CN" ? "·按小时·" : "·Hours·", `scheduled:noop:${id}`)
+    .row();
+
+  for (let hour = 1; hour <= 24; hour += 1) {
+    keyboard.text(rule.cron ? String(hour) : rule.intervalMinutes === hour * 60 ? `✅${hour}` : String(hour), `scheduled:set_interval:${id}:${hour * 60}`);
+    if (hour % 8 === 0) keyboard.row();
+  }
+
+  keyboard.text(locale === "zh-CN" ? "·按分钟·" : "·Minutes·", `scheduled:noop:${id}`).row();
+  for (let minute = 10; minute <= 59; minute += 1) {
+    keyboard.text(!rule.cron && rule.intervalMinutes === minute ? `✅${minute}` : String(minute), `scheduled:set_interval:${id}:${minute}`);
+    if ((minute - 9) % 8 === 0) keyboard.row();
+  }
+
+  return keyboard
+    .row()
+    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `scheduled:open:${id}`)
+    .text(locale === "zh-CN" ? "自定义Cron表达式" : "Custom Cron expression", `scheduled:cron:${id}`);
+}
+
+function scheduledCronPromptText(rule: ScheduledRepeatRule, locale: Locale) {
+  const current = rule.cron ? escapeHtml(rule.cron) : "None";
+  return locale === "zh-CN"
+    ? [
+        "🕒 请输入 Cron 表达式，用于设置定时发送时间。",
+        "",
+        `现有设置: <code>${current}</code>`,
+        "",
+        "📌 Cron 表达式格式为：",
+        "",
+        "<code>分钟 小时 日 月 星期</code>",
+        "",
+        "🧭 示例：",
+        "",
+        "<code>0 8 * * *</code> → 每天 8 点",
+        "<code>0 */2 * * *</code> → 每 2 小时执行一次",
+        "<code>*/10 * * * *</code> → 每 10 分钟执行一次",
+        "<code>30 21 * * 1-5</code> → 周一至周五 21:30",
+        "",
+        "🛠 可用范围：",
+        "- 分钟：<code>0-59</code>",
+        "- 小时：<code>0-23</code>",
+        "- 日：<code>1-31</code>",
+        "- 月：<code>1-12</code>",
+        "- 星期：<code>0-6</code>（0 = 星期日）",
+        "",
+        "✏️ <b>请直接发送 Cron 表达式，我将为你验证并保存设置</b>"
+      ].join("\n")
+    : [
+        "🕒 Send a Cron expression to set the schedule.",
+        "",
+        `Current setting: <code>${current}</code>`,
+        "",
+        "📌 Format:",
+        "<code>minute hour day month weekday</code>",
+        "",
+        "Examples:",
+        "<code>0 8 * * *</code> → Every day at 08:00",
+        "<code>0 */2 * * *</code> → Every 2 hours",
+        "<code>*/10 * * * *</code> → Every 10 minutes",
+        "<code>30 21 * * 1-5</code> → Weekdays at 21:30",
+        "",
+        "✏️ <b>Send the Cron expression directly to validate and save it.</b>"
+      ].join("\n");
+}
+
 function scheduledMessageListKeyboard(
   chatId: string,
   messages: Array<{ id: string; content: Prisma.JsonValue; status: ScheduledMessageStatus }>,
@@ -1500,7 +1619,7 @@ function scheduledMessageSettingsText(
       "",
       `<b>Name</b>: <code>${escapeHtml(content.name || "-")}</code>`,
       `<b>Status</b>: ${enabled ? "✅ On" : "❌ Off"}`,
-      `<b>Repeat interval</b>: <code>${formatDurationZh(repeatRule.intervalMinutes)}</code>`,
+      `<b>Repeat interval</b>: <code>${repeatRule.cron ? `Cron ${escapeHtml(repeatRule.cron)}` : formatDurationZh(repeatRule.intervalMinutes)}</code>`,
       `<b>Time window</b>: ${timeWindow}`,
       `<b>Next run</b>: ${nextRun}`,
       `<b>Start date</b>: ${startAt}`,
@@ -1519,7 +1638,7 @@ function scheduledMessageSettingsText(
     "",
     `<b>消息名称</b>: <code>${escapeHtml(content.name || "-")}</code>`,
     `<b>状态</b>: ${enabled ? "✅开启" : "❌关闭"}`,
-    `<b>重复间隔</b>: <code>${formatDurationZh(repeatRule.intervalMinutes)}</code>`,
+    `<b>重复间隔</b>: <code>${repeatRule.cron ? `Cron ${escapeHtml(repeatRule.cron)}` : formatDurationZh(repeatRule.intervalMinutes)}</code>`,
     `<b>时段</b>: ${timeWindow}`,
     `<b>下次运行</b>: ${nextRun}`,
     `<b>开始日期</b>: ${startAt}`,
@@ -1564,7 +1683,7 @@ function scheduledMessageSettingsKeyboard(
     .text(locale === "zh-CN" ? "🔠 修改按钮" : "🔠 Edit button", `scheduled:edit:${id}:button`)
     .text(locale === "zh-CN" ? "👀 预览消息" : "👀 Preview", `scheduled:preview:${id}`)
     .row()
-    .text(locale === "zh-CN" ? "🔁 间隔时间" : "🔁 Interval", `scheduled:edit:${id}:interval`)
+    .text(locale === "zh-CN" ? "🔁 间隔时间" : "🔁 Interval", `scheduled:interval:${id}`)
     .text(locale === "zh-CN" ? "⏰ 设置时段" : "⏰ Time window", `scheduled:edit:${id}:time_window`)
     .row()
     .text(locale === "zh-CN" ? "📅 开始日期" : "📅 Start date", `scheduled:edit:${id}:start`)
@@ -1620,7 +1739,10 @@ async function handleScheduledInputMessage(ctx: Context, locale: Locale) {
   const repeatRule = parseScheduledRepeatRule(scheduled.repeatRule);
   const patch = await applyScheduledInput(scheduled.id, draft.field, text, content, repeatRule, locale);
   if (!patch.ok) {
-    await ctx.reply(patch.message, { parse_mode: "HTML", reply_markup: scheduledInputKeyboard(draft.field, scheduled.id, locale) });
+    const retryText = draft.field === "cron"
+      ? `${patch.message}\n\n${scheduledCronPromptText(repeatRule, locale)}`
+      : patch.message;
+    await ctx.reply(retryText, { parse_mode: "HTML", reply_markup: scheduledInputKeyboard(draft.field, scheduled.id, locale) });
     return true;
   }
 
@@ -1676,7 +1798,22 @@ async function applyScheduledInput(
         message: locale === "zh-CN" ? "间隔格式不正确，请发送 10分钟、2小时、1d 或 30m。" : "Invalid interval. Send 10m, 2h, 1d, or 30 minutes."
       };
     }
-    await saveScheduledRepeatRule(id, { ...repeatRule, intervalMinutes });
+    const nextRule = { ...repeatRule, intervalMinutes };
+    delete nextRule.cron;
+    await saveScheduledRepeatRule(id, nextRule);
+    return { ok: true as const };
+  }
+
+  if (field === "cron") {
+    if (!isValidCronExpression(text)) {
+      return {
+        ok: false as const,
+        message: locale === "zh-CN"
+          ? "Cron 表达式格式不正确，请发送 5 段格式，例如：<code>*/10 * * * *</code>"
+          : "Invalid Cron expression. Use five fields, for example: <code>*/10 * * * *</code>"
+      };
+    }
+    await saveScheduledRepeatRule(id, { ...repeatRule, cron: text.trim() });
     return { ok: true as const };
   }
 
@@ -1716,6 +1853,7 @@ function isScheduledInputField(value: string): value is ScheduledInputField {
     || value === "media"
     || value === "button"
     || value === "interval"
+    || value === "cron"
     || value === "time_window"
     || value === "start"
     || value === "end";
@@ -1733,6 +1871,7 @@ function scheduledInputPrompt(field: ScheduledInputField, locale: Locale) {
       media: "Reply with a photo, video, sticker, or animation to set the media.",
       button: scheduledButtonPromptText("en"),
       interval: "Send the repeat interval, for example: <code>10m</code>, <code>2h</code>, or <code>1d</code>.",
+      cron: "Send a five-field Cron expression, for example: <code>*/10 * * * *</code>.",
       time_window: "Send the active time window, for example: <code>09:00-18:00</code>.",
       start: "Send the start date, for example: <code>2026-08-01 10:00</code>.",
       end: "Send the end date, for example: <code>2026-08-31 23:59</code>."
@@ -1750,6 +1889,7 @@ function scheduledInputPrompt(field: ScheduledInputField, locale: Locale) {
     media: "请回复图片、视频、贴图、动画表情进行设置",
     button: scheduledButtonPromptText("zh-CN"),
     interval: "请发送重复间隔，例如：<code>10分钟</code>、<code>2小时</code>、<code>30m</code>、<code>1d</code>。",
+    cron: "请发送 5 段 Cron 表达式，例如：<code>*/10 * * * *</code>。",
     time_window: "请发送发送时段，例如：<code>09:00-18:00</code>。",
     start: "请发送开始日期，例如：<code>2026-08-01 10:00</code>。",
     end: "请发送结束日期，例如：<code>2026-08-31 23:59</code>。"

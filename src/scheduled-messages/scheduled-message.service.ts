@@ -17,6 +17,7 @@ export type ScheduledMediaKind = "photo" | "video" | "animation" | "sticker";
 
 export type ScheduledRepeatRule = {
   intervalMinutes: number;
+  cron?: string;
   startAt?: string;
   endAt?: string;
   timeStart?: string;
@@ -79,6 +80,7 @@ export function parseScheduledRepeatRule(value: Prisma.JsonValue | null): Schedu
   if (typeof value.endAt === "string") rule.endAt = value.endAt;
   if (typeof value.timeStart === "string") rule.timeStart = value.timeStart;
   if (typeof value.timeEnd === "string") rule.timeEnd = value.timeEnd;
+  if (typeof value.cron === "string" && parseCronExpression(value.cron)) rule.cron = value.cron;
 
   return rule;
 }
@@ -100,6 +102,7 @@ export function scheduledContentToJson(content: ScheduledMessageContent): Prisma
 export function scheduledRepeatRuleToJson(rule: ScheduledRepeatRule): Prisma.InputJsonObject {
   return cleanJsonObject({
     intervalMinutes: clampIntervalMinutes(rule.intervalMinutes),
+    cron: rule.cron,
     startAt: rule.startAt,
     endAt: rule.endAt,
     timeStart: rule.timeStart,
@@ -117,12 +120,17 @@ export function hasScheduledMessageContent(content: ScheduledMessageContent) {
 }
 
 export function nextScheduledRun(rule: ScheduledRepeatRule, from = new Date()) {
-  const intervalMs = clampIntervalMinutes(rule.intervalMinutes) * 60 * 1000;
-  let candidate = new Date(from.getTime() + intervalMs);
+  let candidate = rule.cron
+    ? nextCronRun(rule.cron, from)
+    : new Date(from.getTime() + clampIntervalMinutes(rule.intervalMinutes) * 60 * 1000);
+  if (!candidate) return null;
 
   if (rule.startAt) {
     const startAt = parseDateTime(rule.startAt);
-    if (startAt && candidate < startAt) candidate = startAt;
+    if (startAt && candidate < startAt) {
+      candidate = rule.cron ? nextCronRun(rule.cron, new Date(startAt.getTime() - 60 * 1000)) : startAt;
+      if (!candidate) return null;
+    }
   }
 
   const endAt = rule.endAt ? parseDateTime(rule.endAt) : null;
@@ -134,6 +142,10 @@ export function nextScheduledRun(rule: ScheduledRepeatRule, from = new Date()) {
   }
 
   return candidate;
+}
+
+export function isValidCronExpression(value: string) {
+  return Boolean(parseCronExpression(value));
 }
 
 export async function enqueueScheduledMessage(id: string, sendAt: Date) {
@@ -209,6 +221,97 @@ function parseClockMinutes(value: string) {
   const minutes = Number(match[2]);
   if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
   return hours * 60 + minutes;
+}
+
+type CronRule = {
+  minutes: Set<number>;
+  hours: Set<number>;
+  days: Set<number>;
+  months: Set<number>;
+  weekdays: Set<number>;
+};
+
+function nextCronRun(expression: string, from: Date) {
+  const cron = parseCronExpression(expression);
+  if (!cron) return null;
+
+  const candidate = new Date(from);
+  candidate.setSeconds(0, 0);
+  candidate.setMinutes(candidate.getMinutes() + 1);
+
+  const maxChecks = 366 * 24 * 60;
+  for (let index = 0; index < maxChecks; index += 1) {
+    if (
+      cron.minutes.has(candidate.getMinutes())
+      && cron.hours.has(candidate.getHours())
+      && cron.days.has(candidate.getDate())
+      && cron.months.has(candidate.getMonth() + 1)
+      && cron.weekdays.has(candidate.getDay())
+    ) {
+      return candidate;
+    }
+    candidate.setMinutes(candidate.getMinutes() + 1);
+  }
+
+  return null;
+}
+
+function parseCronExpression(expression: string): CronRule | null {
+  const parts = expression.trim().split(/\s+/);
+  if (parts.length !== 5) return null;
+
+  const [minutePart, hourPart, dayPart, monthPart, weekdayPart] = parts;
+  if (!minutePart || !hourPart || !dayPart || !monthPart || !weekdayPart) return null;
+
+  const minutes = parseCronPart(minutePart, 0, 59);
+  const hours = parseCronPart(hourPart, 0, 23);
+  const days = parseCronPart(dayPart, 1, 31);
+  const months = parseCronPart(monthPart, 1, 12);
+  const weekdays = parseCronPart(weekdayPart, 0, 6);
+
+  if (!minutes || !hours || !days || !months || !weekdays) return null;
+  return { minutes, hours, days, months, weekdays };
+}
+
+function parseCronPart(part: string, min: number, max: number) {
+  const values = new Set<number>();
+  for (const segment of part.split(",")) {
+    const parsed = parseCronSegment(segment.trim(), min, max);
+    if (!parsed) return null;
+    parsed.forEach((value) => values.add(value));
+  }
+  return values.size ? values : null;
+}
+
+function parseCronSegment(segment: string, min: number, max: number) {
+  if (!segment) return null;
+  const [rangeText, stepText] = segment.split("/");
+  const step = stepText ? Number(stepText) : 1;
+  if (!Number.isSafeInteger(step) || step <= 0) return null;
+
+  let start = min;
+  let end = max;
+
+  if (rangeText && rangeText !== "*") {
+    const range = rangeText.split("-");
+    if (range.length === 1) {
+      start = Number(range[0]);
+      end = Number(range[0]);
+    } else if (range.length === 2) {
+      start = Number(range[0]);
+      end = Number(range[1]);
+    } else {
+      return null;
+    }
+  }
+
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < min || end > max || start > end) {
+    return null;
+  }
+
+  const values = [];
+  for (let value = start; value <= end; value += step) values.push(value);
+  return values;
 }
 
 export { ScheduledMessageStatus };
