@@ -1337,6 +1337,16 @@ async function handleScheduledCallback(ctx: Context) {
     return;
   }
 
+  if (action === "example") {
+    await ctx.answerCallbackQuery({
+      text: value === "2"
+        ? "链接名称1-https://t.me/xxx && 链接名称2-https://t.me/xxx"
+        : "链接名称-https://t.me/xxx",
+      show_alert: true
+    }).catch(() => undefined);
+    return;
+  }
+
   const scheduled = await prisma.scheduledMessage.findUnique({ where: { id }, include: { chat: true } });
   if (!scheduled) {
     await editOrReply(ctx, locale === "zh-CN" ? "找不到这条定时消息。" : "Scheduled message not found.", homeKeyboard(locale));
@@ -1391,7 +1401,7 @@ async function handleScheduledCallback(ctx: Context) {
   if (action === "edit" && value && isScheduledInputField(value)) {
     if (!ctx.from) return;
     scheduledInputDrafts.set(ctx.from.id, { scheduledMessageId: scheduled.id, field: value });
-    await editOrReply(ctx, scheduledInputPrompt(value, locale), scheduledInputCancelKeyboard(scheduled.id, locale));
+    await editOrReply(ctx, scheduledInputPrompt(value, locale), scheduledInputKeyboard(value, scheduled.id, locale));
     return;
   }
 
@@ -1476,7 +1486,7 @@ function scheduledMessageSettingsText(
   const enabled = scheduled.status === ScheduledMessageStatus.PENDING;
   const buttonEnabled = scheduledButtonsEnabled(scheduled.buttons);
   const hasText = Boolean(content.text?.trim());
-  const hasMedia = Boolean(content.photoFileId);
+  const hasMedia = Boolean(content.mediaFileId || content.photoFileId);
   const timeWindow = repeatRule.timeStart && repeatRule.timeEnd ? `${repeatRule.timeStart}-${repeatRule.timeEnd}` : "-";
   const nextRun = enabled ? formatDateTimeForDisplay(scheduled.sendAt) : "-";
   const startAt = repeatRule.startAt ? formatDateTimeForDisplay(new Date(repeatRule.startAt)) : "-";
@@ -1577,17 +1587,20 @@ async function handleScheduledInputMessage(ctx: Context, locale: Locale) {
 
   if (draft.field === "media") {
     const media = extractPublishMedia(ctx.message);
-    if (!media || media.kind !== "photo") {
-      await ctx.reply(locale === "zh-CN" ? "请发送图片作为定时消息媒体。" : "Send a photo as scheduled message media.", {
+    if (!media) {
+      await ctx.reply(scheduledInputPrompt("media", locale), {
         parse_mode: "HTML",
-        reply_markup: scheduledInputCancelKeyboard(scheduled.id, locale)
+        reply_markup: scheduledInputKeyboard("media", scheduled.id, locale)
       });
       return true;
     }
     const content = parseScheduledContent(scheduled.content);
+    const nextContent = { ...content, mediaKind: media.kind, mediaFileId: media.fileId };
+    if (media.kind !== "photo") delete nextContent.photoFileId;
+    if (media.kind === "photo") nextContent.photoFileId = media.fileId;
     await prisma.scheduledMessage.update({
       where: { id: scheduled.id },
-      data: { content: scheduledContentToJson({ ...content, photoFileId: media.fileId }) }
+      data: { content: scheduledContentToJson(nextContent) }
     });
     scheduledInputDrafts.delete(ctx.from.id);
     await ctx.reply(scheduledInputSavedText(locale), { parse_mode: "HTML", reply_markup: scheduledSavedKeyboard(scheduled.id, locale) });
@@ -1598,7 +1611,7 @@ async function handleScheduledInputMessage(ctx: Context, locale: Locale) {
   if (!text) {
     await ctx.reply(scheduledInputPrompt(draft.field, locale), {
       parse_mode: "HTML",
-      reply_markup: scheduledInputCancelKeyboard(scheduled.id, locale)
+      reply_markup: scheduledInputKeyboard(draft.field, scheduled.id, locale)
     });
     return true;
   }
@@ -1607,7 +1620,7 @@ async function handleScheduledInputMessage(ctx: Context, locale: Locale) {
   const repeatRule = parseScheduledRepeatRule(scheduled.repeatRule);
   const patch = await applyScheduledInput(scheduled.id, draft.field, text, content, repeatRule, locale);
   if (!patch.ok) {
-    await ctx.reply(patch.message, { parse_mode: "HTML", reply_markup: scheduledInputCancelKeyboard(scheduled.id, locale) });
+    await ctx.reply(patch.message, { parse_mode: "HTML", reply_markup: scheduledInputKeyboard(draft.field, scheduled.id, locale) });
     return true;
   }
 
@@ -1641,16 +1654,16 @@ async function applyScheduledInput(
   }
 
   if (field === "button") {
-    const parsed = parsePublishButton(text);
-    if (!parsed) {
+    const parsed = parseScheduledButtonLayout(text);
+    if (!parsed.length) {
       return {
         ok: false as const,
-        message: locale === "zh-CN" ? "格式不正确，请发送：<code>按钮文字 | https://example.com</code>" : "Invalid format. Send: <code>Button text | https://example.com</code>"
+        message: locale === "zh-CN" ? "格式不正确，请发送：<code>按钮文字-https://example.com</code>" : "Invalid format. Send: <code>Button text-https://example.com</code>"
       };
     }
     await prisma.scheduledMessage.update({
       where: { id },
-      data: { buttons: [{ text: parsed.text, url: parsed.url }] }
+      data: { buttons: parsed }
     });
     return { ok: true as const };
   }
@@ -1712,9 +1725,13 @@ function scheduledInputPrompt(field: ScheduledInputField, locale: Locale) {
   if (locale !== "zh-CN") {
     const prompts: Record<ScheduledInputField, string> = {
       name: "Send the scheduled message name.",
-      text: "Send the scheduled message text.",
-      media: "Send a photo as the scheduled message media.",
-      button: "Send a button in this format:\n\n<code>Button text | https://example.com</code>",
+      text: [
+        "Now send the text to set your message content.",
+        "",
+        "HTML (/html) and Telegram text formatting are supported."
+      ].join("\n"),
+      media: "Reply with a photo, video, sticker, or animation to set the media.",
+      button: scheduledButtonPromptText("en"),
       interval: "Send the repeat interval, for example: <code>10m</code>, <code>2h</code>, or <code>1d</code>.",
       time_window: "Send the active time window, for example: <code>09:00-18:00</code>.",
       start: "Send the start date, for example: <code>2026-08-01 10:00</code>.",
@@ -1725,9 +1742,13 @@ function scheduledInputPrompt(field: ScheduledInputField, locale: Locale) {
 
   const prompts: Record<ScheduledInputField, string> = {
     name: "请发送定时消息名称。",
-    text: "请发送定时消息文本。",
-    media: "请发送图片作为定时消息媒体。",
-    button: "请发送按钮，格式如下：\n\n<code>按钮文字 | https://example.com</code>",
+    text: [
+      "现在输入文本设置你的消息内容",
+      "",
+      '支持 HTML ( <a href="tg://bot_command?command=html">/html</a> ) 和文字字体格式(加粗、链接、剧透、引用等字体):'
+    ].join("\n"),
+    media: "请回复图片、视频、贴图、动画表情进行设置",
+    button: scheduledButtonPromptText("zh-CN"),
     interval: "请发送重复间隔，例如：<code>10分钟</code>、<code>2小时</code>、<code>30m</code>、<code>1d</code>。",
     time_window: "请发送发送时段，例如：<code>09:00-18:00</code>。",
     start: "请发送开始日期，例如：<code>2026-08-01 10:00</code>。",
@@ -1736,8 +1757,62 @@ function scheduledInputPrompt(field: ScheduledInputField, locale: Locale) {
   return prompts[field];
 }
 
+function scheduledButtonPromptText(locale: Locale) {
+  if (locale !== "zh-CN") {
+    return [
+      "<b>Set buttons</b>",
+      "",
+      "<b>Tips</b>:",
+      "<blockquote>1. Text is on the left of the dash, URL is on the right\n2. && splits multiple buttons in one row\n3. New lines create new rows</blockquote>",
+      "",
+      "<b>Examples</b>:",
+      "",
+      "<b>One button per row:</b>",
+      "<pre>Link name-https://t.me/xxx</pre>",
+      "<b>Two buttons in one row:</b>",
+      "<pre>Link 1-https://t.me/xxx && Link 2-https://t.me/xxx</pre>",
+      "<b>Two rows:</b>",
+      "<pre>#p Row 1 link 1-https://t.me/xxx && #r Row 1 link 2-https://t.me/xxx\n#g Row 2 link 1-https://t.me/xxx && Row 2 link 2-https://t.me/xxx</pre>",
+      "",
+      "⚠️ #p/#r/#g color prefixes are accepted and ignored by Telegram inline buttons."
+    ].join("\n");
+  }
+
+  return [
+    "<b>设置按钮</b>",
+    "",
+    "<b>提示</b>：",
+    "<blockquote>1. - 减号左边是按钮名称，右边是链接\n2. && 用来分割一行的多个按钮\n3. 换行可以让按钮另起一行</blockquote>",
+    "",
+    "<b>示例</b>：",
+    "",
+    "<b>一、消息按钮：</b>",
+    "• 插入<b>一行一个按钮</b>：",
+    "<pre>链接名称-https://t.me/xxx</pre>",
+    "• 在<b>一行两个按钮</b>：",
+    "<pre>链接名称1-https://t.me/xxx && 链接名称2-https://t.me/xxx</pre>",
+    "• 插入<b>两行四个按钮</b>：",
+    "<pre>#p第1行链接名称1-https://t.me/xxx && #r第1行链接名称2-https://t.me/xxx\n#g第2行链接名称1-https://t.me/xxx && 第2行链接名称2-https://t.me/xxx</pre>",
+    "",
+    "⚠️ #p-蓝色背景 #r-红色背景 #g-绿色背景，Telegram 消息按钮会忽略颜色前缀。"
+  ].join("\n");
+}
+
+function scheduledInputKeyboard(field: ScheduledInputField, id: string, locale: Locale) {
+  if (field === "button") {
+    return new InlineKeyboard()
+      .text("Copy1", `scheduled:example:${id}:1`)
+      .text("Copy2", `scheduled:example:${id}:2`)
+      .row()
+      .text(locale === "zh-CN" ? "🚫 清空消息按钮" : "🚫 Clear buttons", `scheduled:clear:${id}:button`)
+      .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `scheduled:open:${id}`);
+  }
+
+  return scheduledInputCancelKeyboard(id, locale);
+}
+
 function scheduledInputCancelKeyboard(id: string, locale: Locale) {
-  return new InlineKeyboard().text(locale === "zh-CN" ? "取消" : "Cancel", `scheduled:open:${id}`);
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `scheduled:open:${id}`);
 }
 
 function scheduledSavedKeyboard(id: string, locale: Locale) {
@@ -1757,6 +1832,10 @@ async function clearScheduledField(id: string, field: string | undefined) {
   if (field === "media") {
     const nextContent = { ...content };
     delete nextContent.photoFileId;
+    delete nextContent.mediaKind;
+    delete nextContent.mediaFileId;
+    delete nextContent.lastMessageId;
+    delete nextContent.lastMessageIds;
     await prisma.scheduledMessage.update({
       where: { id },
       data: { content: scheduledContentToJson(nextContent) }
@@ -1805,11 +1884,42 @@ async function sendScheduledPreview(ctx: Context, id: string, locale: Locale) {
   }
 
   const replyMarkup = scheduledInlineKeyboard(scheduled.buttons);
-  if (content.photoFileId) {
-    await ctx.replyWithPhoto(content.photoFileId, {
+  const mediaKind = content.mediaKind ?? (content.photoFileId ? "photo" : undefined);
+  const mediaFileId = content.mediaFileId ?? content.photoFileId;
+
+  if (mediaKind === "photo" && mediaFileId) {
+    await ctx.replyWithPhoto(mediaFileId, {
       ...(content.text ? { caption: content.text } : {}),
       ...(replyMarkup ? { reply_markup: replyMarkup } : {})
     });
+    return;
+  }
+
+  if (mediaKind === "video" && mediaFileId) {
+    await ctx.replyWithVideo(mediaFileId, {
+      ...(content.text ? { caption: content.text } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    });
+    return;
+  }
+
+  if (mediaKind === "animation" && mediaFileId) {
+    await ctx.replyWithAnimation(mediaFileId, {
+      ...(content.text ? { caption: content.text } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    });
+    return;
+  }
+
+  if (mediaKind === "sticker" && mediaFileId) {
+    await ctx.replyWithSticker(mediaFileId, {
+      ...(!content.text && replyMarkup ? { reply_markup: replyMarkup } : {})
+    });
+    if (content.text) {
+      await ctx.reply(content.text, {
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+      });
+    }
     return;
   }
 
@@ -1821,13 +1931,16 @@ async function sendScheduledPreview(ctx: Context, id: string, locale: Locale) {
 function scheduledInlineKeyboard(value: Prisma.JsonValue | null) {
   if (!Array.isArray(value) || value.length === 0) return undefined;
   const keyboard = new InlineKeyboard();
-  value.forEach((button, index) => {
-    if (!isRecord(button)) return;
-    const text = typeof button.text === "string" ? button.text : "";
-    const url = typeof button.url === "string" ? button.url : "";
-    if (!text || !url) return;
-    if (index > 0) keyboard.row();
-    keyboard.url(text, url);
+  value.forEach((row, rowIndex) => {
+    if (rowIndex > 0) keyboard.row();
+    const buttons = Array.isArray(row) ? row : [row];
+    buttons.forEach((button) => {
+      if (!isRecord(button)) return;
+      const text = typeof button.text === "string" ? button.text : "";
+      const url = typeof button.url === "string" ? button.url : "";
+      if (!text || !url) return;
+      keyboard.url(text, url);
+    });
   });
   return keyboard.inline_keyboard.length ? keyboard : undefined;
 }
@@ -2057,6 +2170,41 @@ function parsePublishButton(input: string) {
     const url = new URL(rawUrl);
     if (url.protocol !== "http:" && url.protocol !== "https:") return null;
     return { text: rawText.slice(0, 64), url: url.toString() };
+  } catch {
+    return null;
+  }
+}
+
+function parseScheduledButtonLayout(input: string) {
+  const rows = input
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) =>
+      line
+        .split("&&")
+        .map((item) => parseScheduledButton(item.trim()))
+        .filter((item): item is { text: string; url: string } => Boolean(item))
+    )
+    .filter((row) => row.length > 0);
+
+  return rows;
+}
+
+function parseScheduledButton(input: string) {
+  const cleaned = input.replace(/^#[prg]\s*/i, "").trim();
+  const separatorIndex = cleaned.indexOf(" - ");
+  const compactIndex = separatorIndex >= 0 ? separatorIndex : cleaned.indexOf("-");
+  if (compactIndex <= 0) return null;
+
+  const text = cleaned.slice(0, compactIndex).trim();
+  const rawUrl = cleaned.slice(compactIndex + (separatorIndex >= 0 ? 3 : 1)).trim();
+  if (!text || !rawUrl) return null;
+
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    return { text: text.slice(0, 64), url: url.toString() };
   } catch {
     return null;
   }

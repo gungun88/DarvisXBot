@@ -5,10 +5,15 @@ export type ScheduledMessageContent = {
   name?: string;
   text?: string;
   photoFileId?: string;
+  mediaKind?: ScheduledMediaKind;
+  mediaFileId?: string;
   deletePrevious?: boolean;
   pin?: boolean;
   lastMessageId?: number;
+  lastMessageIds?: number[];
 };
+
+export type ScheduledMediaKind = "photo" | "video" | "animation" | "sticker";
 
 export type ScheduledRepeatRule = {
   intervalMinutes: number;
@@ -44,7 +49,17 @@ export function parseScheduledContent(value: Prisma.JsonValue): ScheduledMessage
   if (typeof value.name === "string") content.name = value.name;
   if (typeof value.text === "string") content.text = value.text;
   if (typeof value.photoFileId === "string") content.photoFileId = value.photoFileId;
+  if (isScheduledMediaKind(value.mediaKind)) content.mediaKind = value.mediaKind;
+  if (typeof value.mediaFileId === "string") content.mediaFileId = value.mediaFileId;
+  if (!content.mediaFileId && content.photoFileId) {
+    content.mediaKind = "photo";
+    content.mediaFileId = content.photoFileId;
+  }
   if (typeof value.lastMessageId === "number") content.lastMessageId = value.lastMessageId;
+  if (Array.isArray(value.lastMessageIds)) {
+    const ids = value.lastMessageIds.filter((item): item is number => typeof item === "number");
+    if (ids.length) content.lastMessageIds = ids;
+  }
 
   return content;
 }
@@ -73,9 +88,12 @@ export function scheduledContentToJson(content: ScheduledMessageContent): Prisma
     name: content.name,
     text: content.text,
     photoFileId: content.photoFileId,
+    mediaKind: content.mediaKind,
+    mediaFileId: content.mediaFileId,
     deletePrevious: content.deletePrevious ?? true,
     pin: content.pin ?? false,
-    lastMessageId: content.lastMessageId
+    lastMessageId: content.lastMessageId,
+    lastMessageIds: content.lastMessageIds
   });
 }
 
@@ -95,7 +113,7 @@ export function clampIntervalMinutes(value: number) {
 }
 
 export function hasScheduledMessageContent(content: ScheduledMessageContent) {
-  return Boolean(content.text?.trim() || content.photoFileId);
+  return Boolean(content.text?.trim() || content.mediaFileId || content.photoFileId);
 }
 
 export function nextScheduledRun(rule: ScheduledRepeatRule, from = new Date()) {
@@ -143,6 +161,10 @@ export function scheduledMessageJobId(id: string) {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isScheduledMediaKind(value: unknown): value is ScheduledMediaKind {
+  return value === "photo" || value === "video" || value === "animation" || value === "sticker";
 }
 
 function cleanJsonObject(value: Record<string, unknown>) {

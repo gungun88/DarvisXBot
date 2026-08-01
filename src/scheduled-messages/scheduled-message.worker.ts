@@ -44,22 +44,23 @@ export function startScheduledMessageWorker(config: AppConfig) {
         return;
       }
 
-      if (content.deletePrevious && content.lastMessageId) {
-        await bot.api.deleteMessage(Number(scheduled.chat.telegramChatId), content.lastMessageId).catch(() => undefined);
+      const telegramChatId = Number(scheduled.chat.telegramChatId);
+      const previousMessageIds = content.lastMessageIds?.length
+        ? content.lastMessageIds
+        : content.lastMessageId
+          ? [content.lastMessageId]
+          : [];
+      if (content.deletePrevious && previousMessageIds.length) {
+        await Promise.all(previousMessageIds.map((messageId) => bot.api.deleteMessage(telegramChatId, messageId).catch(() => undefined)));
       }
 
       const replyMarkup = buildScheduledInlineKeyboard(scheduled.buttons);
-      const sent = content.photoFileId
-        ? await bot.api.sendPhoto(Number(scheduled.chat.telegramChatId), content.photoFileId, {
-            ...(content.text ? { caption: content.text } : {}),
-            ...(replyMarkup ? { reply_markup: replyMarkup } : {})
-          })
-        : await bot.api.sendMessage(Number(scheduled.chat.telegramChatId), content.text ?? "", {
-            ...(replyMarkup ? { reply_markup: replyMarkup } : {})
-          });
+      const sentMessages = await sendScheduledMessage(bot, telegramChatId, content, replyMarkup);
+      const sent = sentMessages[sentMessages.length - 1];
+      if (!sent) return;
 
       if (content.pin) {
-        await bot.api.pinChatMessage(Number(scheduled.chat.telegramChatId), sent.message_id, {
+        await bot.api.pinChatMessage(telegramChatId, sent.message_id, {
           disable_notification: true
         }).catch(() => undefined);
       }
@@ -70,7 +71,11 @@ export function startScheduledMessageWorker(config: AppConfig) {
           where: { id: scheduled.id },
           data: {
             status: ScheduledMessageStatus.SENT,
-            content: scheduledContentToJson({ ...content, lastMessageId: sent.message_id })
+            content: scheduledContentToJson({
+              ...content,
+              lastMessageId: sent.message_id,
+              lastMessageIds: sentMessages.map((message) => message.message_id)
+            })
           }
         });
         return;
@@ -80,7 +85,11 @@ export function startScheduledMessageWorker(config: AppConfig) {
         where: { id: scheduled.id },
         data: {
           sendAt: nextRun,
-          content: scheduledContentToJson({ ...content, lastMessageId: sent.message_id })
+          content: scheduledContentToJson({
+            ...content,
+            lastMessageId: sent.message_id,
+            lastMessageIds: sentMessages.map((message) => message.message_id)
+          })
         }
       });
       await enqueueScheduledMessage(scheduled.id, nextRun);
@@ -89,17 +98,72 @@ export function startScheduledMessageWorker(config: AppConfig) {
   );
 }
 
+async function sendScheduledMessage(
+  bot: Bot,
+  chatId: number,
+  content: ReturnType<typeof parseScheduledContent>,
+  replyMarkup: InlineKeyboard | undefined
+) {
+  const mediaKind = content.mediaKind ?? (content.photoFileId ? "photo" : undefined);
+  const mediaFileId = content.mediaFileId ?? content.photoFileId;
+  const sent = [];
+
+  if (mediaFileId && mediaKind === "photo") {
+    sent.push(await bot.api.sendPhoto(chatId, mediaFileId, {
+      ...(content.text ? { caption: content.text } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    }));
+    return sent;
+  }
+
+  if (mediaFileId && mediaKind === "video") {
+    sent.push(await bot.api.sendVideo(chatId, mediaFileId, {
+      ...(content.text ? { caption: content.text } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    }));
+    return sent;
+  }
+
+  if (mediaFileId && mediaKind === "animation") {
+    sent.push(await bot.api.sendAnimation(chatId, mediaFileId, {
+      ...(content.text ? { caption: content.text } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    }));
+    return sent;
+  }
+
+  if (mediaFileId && mediaKind === "sticker") {
+    sent.push(await bot.api.sendSticker(chatId, mediaFileId, {
+      ...(!content.text && replyMarkup ? { reply_markup: replyMarkup } : {})
+    }));
+    if (content.text) {
+      sent.push(await bot.api.sendMessage(chatId, content.text, {
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+      }));
+    }
+    return sent;
+  }
+
+  sent.push(await bot.api.sendMessage(chatId, content.text ?? "", {
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+  }));
+  return sent;
+}
+
 function buildScheduledInlineKeyboard(value: unknown) {
   if (!Array.isArray(value) || value.length === 0) return undefined;
 
   const keyboard = new InlineKeyboard();
-  value.forEach((button, index) => {
-    if (!isRecord(button)) return;
-    const text = typeof button.text === "string" ? button.text : "";
-    const url = typeof button.url === "string" ? button.url : "";
-    if (!text || !url) return;
-    if (index > 0) keyboard.row();
-    keyboard.url(text, url);
+  value.forEach((row, rowIndex) => {
+    if (rowIndex > 0) keyboard.row();
+    const buttons = Array.isArray(row) ? row : [row];
+    buttons.forEach((button) => {
+      if (!isRecord(button)) return;
+      const text = typeof button.text === "string" ? button.text : "";
+      const url = typeof button.url === "string" ? button.url : "";
+      if (!text || !url) return;
+      keyboard.url(text, url);
+    });
   });
 
   return keyboard.inline_keyboard.length ? keyboard : undefined;
