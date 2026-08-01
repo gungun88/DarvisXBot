@@ -29,13 +29,18 @@ import {
 import { getBotPermissionReport, isUserChatAdmin } from "./permissions.js";
 import {
   cancelScheduledMessageJob,
+  clampIntervalMinutes,
   defaultScheduledContent,
   defaultScheduledRepeatRule,
   enqueueScheduledMessage,
   hasScheduledMessageContent,
   nextScheduledRun,
+  parseScheduledContent,
+  parseScheduledRepeatRule,
   scheduledContentToJson,
-  scheduledRepeatRuleToJson
+  scheduledRepeatRuleToJson,
+  type ScheduledMessageContent,
+  type ScheduledRepeatRule
 } from "../scheduled-messages/scheduled-message.service.js";
 import {
   cancelGiveawayDrawJob,
@@ -113,6 +118,13 @@ type PublishDraft = {
   waitingFor: "name" | "text" | "media" | "button" | undefined;
 };
 
+type ScheduledInputField = "name" | "text" | "media" | "button" | "interval" | "time_window" | "start" | "end";
+
+type ScheduledInputDraft = {
+  scheduledMessageId: string;
+  field: ScheduledInputField;
+};
+
 const botCommands = [
   { command: "start", description: "开始菜单" },
   { command: "help", description: "帮助" },
@@ -163,6 +175,7 @@ const recentJoins = new Map<string, number>();
 const raidJoinEvents = new Map<string, number[]>();
 const timezoneInputUsers = new Set<number>();
 const publishDrafts = new Map<number, PublishDraft>();
+const scheduledInputDrafts = new Map<number, ScheduledInputDraft>();
 
 function rememberSelectedChatForModules(userId: number | undefined, chatId: string) {
   if (typeof userId !== "number") return;
@@ -261,6 +274,10 @@ export function createBot(config: AppConfig) {
     await handlePublishCallback(ctx, config);
   });
 
+  bot.callbackQuery(/^scheduled:/, async (ctx) => {
+    await handleScheduledCallback(ctx);
+  });
+
   bot.callbackQuery(/^membership:/, async (ctx) => {
     await handleMembershipCallback(ctx);
   });
@@ -315,6 +332,7 @@ export function createBot(config: AppConfig) {
 
   bot.on("message", async (ctx) => {
     const locale = await getLocale(ctx);
+    if (await handleScheduledInputMessage(ctx, locale)) return;
     if (await handlePublishInputMessage(ctx, locale)) return;
     if (await handleTimezoneInputMessage(ctx, config, locale)) return;
     if (await handleNewMemberLimitPrivateMessage(ctx, config, locale)) return;
@@ -1267,6 +1285,631 @@ async function handleMembershipCallback(ctx: Context) {
   );
 }
 
+async function handleScheduledCallback(ctx: Context) {
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  const locale = await getLocale(ctx);
+  const data = ctx.callbackQuery?.data;
+  if (!data) return;
+
+  const [, action, id, value] = data.split(":");
+  if (!action || !id) return;
+
+  if (action === "list" || action === "back") {
+    const chat = await prisma.chat.findUnique({ where: { id } });
+    if (!chat) return;
+    await openScheduledMessagePanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "add") {
+    const chat = await prisma.chat.findUnique({ where: { id } });
+    if (!chat) return;
+    const repeatRule = defaultScheduledRepeatRule();
+    const sendAt = nextScheduledRun(repeatRule, new Date()) ?? new Date(Date.now() + repeatRule.intervalMinutes * 60_000);
+    const scheduled = await prisma.scheduledMessage.create({
+      data: {
+        chatId: chat.id,
+        contentType: "text",
+        content: scheduledContentToJson(defaultScheduledContent()),
+        buttons: [],
+        repeatRule: scheduledRepeatRuleToJson(repeatRule),
+        sendAt,
+        status: ScheduledMessageStatus.DRAFT
+      }
+    });
+    await renderScheduledMessageSettings(ctx, locale, scheduled.id);
+    return;
+  }
+
+  if (action === "open") {
+    await renderScheduledMessageSettings(ctx, locale, id);
+    return;
+  }
+
+  if (action === "bulk") {
+    const chat = await prisma.chat.findUnique({ where: { id } });
+    if (!chat) return;
+    await editOrReply(
+      ctx,
+      locale === "zh-CN" ? "批量操作后续接入。" : "Bulk actions will be wired up next.",
+      scheduledMessageListKeyboard(chat.id, [], chat.type === "CHANNEL" ? "channel" : "group", locale)
+    );
+    return;
+  }
+
+  const scheduled = await prisma.scheduledMessage.findUnique({ where: { id }, include: { chat: true } });
+  if (!scheduled) {
+    await editOrReply(ctx, locale === "zh-CN" ? "找不到这条定时消息。" : "Scheduled message not found.", homeKeyboard(locale));
+    return;
+  }
+
+  if (action === "noop") return;
+
+  if (action === "toggle") {
+    if (value === "on") {
+      const content = parseScheduledContent(scheduled.content);
+      if (!hasScheduledMessageContent(content)) {
+        await editOrReply(
+          ctx,
+          locale === "zh-CN" ? "请先设置文本内容或媒体图片，再开启定时消息。" : "Set text or media before enabling this scheduled message.",
+          scheduledMessageSettingsKeyboard(scheduled.id, scheduled.chatId, content, parseScheduledRepeatRule(scheduled.repeatRule), scheduled.status, scheduled.buttons, locale)
+        );
+        return;
+      }
+      const repeatRule = parseScheduledRepeatRule(scheduled.repeatRule);
+      const sendAt = nextScheduledRun(repeatRule, new Date()) ?? new Date(Date.now() + repeatRule.intervalMinutes * 60_000);
+      await prisma.scheduledMessage.update({
+        where: { id: scheduled.id },
+        data: { status: ScheduledMessageStatus.PENDING, sendAt }
+      });
+      await enqueueScheduledMessage(scheduled.id, sendAt);
+    } else {
+      await cancelScheduledMessageJob(scheduled.id);
+      await prisma.scheduledMessage.update({
+        where: { id: scheduled.id },
+        data: { status: ScheduledMessageStatus.DRAFT }
+      });
+    }
+    await renderScheduledMessageSettings(ctx, locale, scheduled.id);
+    return;
+  }
+
+  if (action === "delete_previous" || action === "pin") {
+    const content = parseScheduledContent(scheduled.content);
+    const nextContent = {
+      ...content,
+      [action === "delete_previous" ? "deletePrevious" : "pin"]: value === "true"
+    };
+    await prisma.scheduledMessage.update({
+      where: { id: scheduled.id },
+      data: { content: scheduledContentToJson(nextContent) }
+    });
+    await renderScheduledMessageSettings(ctx, locale, scheduled.id);
+    return;
+  }
+
+  if (action === "edit" && value && isScheduledInputField(value)) {
+    if (!ctx.from) return;
+    scheduledInputDrafts.set(ctx.from.id, { scheduledMessageId: scheduled.id, field: value });
+    await editOrReply(ctx, scheduledInputPrompt(value, locale), scheduledInputCancelKeyboard(scheduled.id, locale));
+    return;
+  }
+
+  if (action === "clear") {
+    await clearScheduledField(scheduled.id, value);
+    await renderScheduledMessageSettings(ctx, locale, scheduled.id);
+    return;
+  }
+
+  if (action === "preview") {
+    await sendScheduledPreview(ctx, scheduled.id, locale);
+    return;
+  }
+
+}
+
+async function openScheduledMessagePanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  const messages = await prisma.scheduledMessage.findMany({
+    where: { chatId: chat.id },
+    orderBy: { updatedAt: "desc" },
+    take: 10
+  });
+
+  await editOrReply(
+    ctx,
+    scheduledMessageListText(chat, locale),
+    scheduledMessageListKeyboard(chat.id, messages, chat.type === "CHANNEL" ? "channel" : "group", locale)
+  );
+}
+
+function scheduledMessageListText(chat: PrismaChat, locale: Locale) {
+  const title = escapeHtml(chat.title ?? chat.username ?? String(chat.telegramChatId));
+  return locale === "zh-CN"
+    ? `⏰ <b>定时消息</b>\n\n设置 <b>${title}</b> 每隔几分钟/小时重复发送的消息`
+    : `⏰ <b>Scheduled messages</b>\n\nConfigure messages repeated every few minutes or hours for <b>${title}</b>.`;
+}
+
+function scheduledMessageListKeyboard(
+  chatId: string,
+  messages: Array<{ id: string; content: Prisma.JsonValue; status: ScheduledMessageStatus }>,
+  scope: "group" | "channel",
+  locale: Locale
+) {
+  const keyboard = new InlineKeyboard();
+  for (const message of messages) {
+    const content = parseScheduledContent(message.content);
+    const status = message.status === ScheduledMessageStatus.PENDING ? "✅" : "❌";
+    keyboard.text(`${status} ${(content.name || content.text || message.id).slice(0, 40)}`, `scheduled:open:${message.id}`).row();
+  }
+  return keyboard
+    .text(locale === "zh-CN" ? "➕ 添加" : "➕ Add", `scheduled:add:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `menu:chat:${scope}:${chatId}`);
+}
+
+async function renderScheduledMessageSettings(ctx: Context, locale: Locale, scheduledMessageId: string) {
+  const scheduled = await prisma.scheduledMessage.findUnique({
+    where: { id: scheduledMessageId },
+    include: { chat: true }
+  });
+  if (!scheduled) return;
+
+  const content = parseScheduledContent(scheduled.content);
+  const repeatRule = parseScheduledRepeatRule(scheduled.repeatRule);
+  await editOrReply(
+    ctx,
+    scheduledMessageSettingsText(scheduled, content, repeatRule, locale),
+    scheduledMessageSettingsKeyboard(scheduled.id, scheduled.chatId, content, repeatRule, scheduled.status, scheduled.buttons, locale)
+  );
+}
+
+function scheduledMessageSettingsText(
+  scheduled: {
+    status: ScheduledMessageStatus;
+    sendAt: Date;
+    buttons: Prisma.JsonValue | null;
+  },
+  content: ScheduledMessageContent,
+  repeatRule: ScheduledRepeatRule,
+  locale: Locale
+) {
+  const enabled = scheduled.status === ScheduledMessageStatus.PENDING;
+  const buttonEnabled = scheduledButtonsEnabled(scheduled.buttons);
+  const hasText = Boolean(content.text?.trim());
+  const hasMedia = Boolean(content.photoFileId);
+  const timeWindow = repeatRule.timeStart && repeatRule.timeEnd ? `${repeatRule.timeStart}-${repeatRule.timeEnd}` : "-";
+  const nextRun = enabled ? formatDateTimeForDisplay(scheduled.sendAt) : "-";
+  const startAt = repeatRule.startAt ? formatDateTimeForDisplay(new Date(repeatRule.startAt)) : "-";
+  const endAt = repeatRule.endAt ? formatDateTimeForDisplay(new Date(repeatRule.endAt)) : "-";
+
+  if (locale !== "zh-CN") {
+    return [
+      "⏰ <b>Scheduled messages</b>",
+      "",
+      "Use this menu to configure message sending parameters.",
+      "",
+      `<b>Name</b>: <code>${escapeHtml(content.name || "-")}</code>`,
+      `<b>Status</b>: ${enabled ? "✅ On" : "❌ Off"}`,
+      `<b>Repeat interval</b>: <code>${formatDurationZh(repeatRule.intervalMinutes)}</code>`,
+      `<b>Time window</b>: ${timeWindow}`,
+      `<b>Next run</b>: ${nextRun}`,
+      `<b>Start date</b>: ${startAt}`,
+      `<b>End date</b>: ${endAt}`,
+      "",
+      `<b>Media photo</b>: ${hasMedia ? "✅" : "❌"}`,
+      `<b>Link button</b>: ${buttonEnabled ? "✅" : "❌"}`,
+      `<b>Text content</b>: ${hasText ? "✅" : "❌"}`
+    ].join("\n");
+  }
+
+  return [
+    "⏰ <b>定时消息</b>",
+    "",
+    "通过此菜单,你可以配置消息的发送参数",
+    "",
+    `<b>消息名称</b>: <code>${escapeHtml(content.name || "-")}</code>`,
+    `<b>状态</b>: ${enabled ? "✅开启" : "❌关闭"}`,
+    `<b>重复间隔</b>: <code>${formatDurationZh(repeatRule.intervalMinutes)}</code>`,
+    `<b>时段</b>: ${timeWindow}`,
+    `<b>下次运行</b>: ${nextRun}`,
+    `<b>开始日期</b>: ${startAt}`,
+    `<b>结束日期</b>: ${endAt}`,
+    "",
+    `<b>媒体图片</b>: ${hasMedia ? "✅" : "❌"}`,
+    `<b>链接按钮</b>: ${buttonEnabled ? "✅" : "❌"}`,
+    `<b>文本内容</b>: ${hasText ? "✅" : "❌"}`
+  ].join("\n");
+}
+
+function scheduledMessageSettingsKeyboard(
+  id: string,
+  chatId: string,
+  content: ScheduledMessageContent,
+  repeatRule: ScheduledRepeatRule,
+  status: ScheduledMessageStatus,
+  buttons: Prisma.JsonValue | null,
+  locale: Locale
+) {
+  void repeatRule;
+  void buttons;
+  const enabled = status === ScheduledMessageStatus.PENDING;
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "✍️ 编辑消息名称" : "✍️ Edit name", `scheduled:edit:${id}:name`)
+    .row()
+    .text("状态:", `scheduled:noop:${id}`)
+    .text(enabled ? "✅开启" : "开启", `scheduled:toggle:${id}:on`)
+    .text(!enabled ? "✅关闭" : "关闭", `scheduled:toggle:${id}:off`)
+    .row()
+    .text("删除上一条", `scheduled:noop:${id}`)
+    .text(content.deletePrevious ? "✅是" : "是", `scheduled:delete_previous:${id}:true`)
+    .text(!content.deletePrevious ? "✅否" : "否", `scheduled:delete_previous:${id}:false`)
+    .row()
+    .text("📌 置顶:", `scheduled:noop:${id}`)
+    .text(content.pin ? "✅是" : "是", `scheduled:pin:${id}:true`)
+    .text(!content.pin ? "✅否" : "否", `scheduled:pin:${id}:false`)
+    .row()
+    .text(locale === "zh-CN" ? "📃 修改文本" : "📃 Edit text", `scheduled:edit:${id}:text`)
+    .text(locale === "zh-CN" ? "📷 修改媒体" : "📷 Edit media", `scheduled:edit:${id}:media`)
+    .row()
+    .text(locale === "zh-CN" ? "🔠 修改按钮" : "🔠 Edit button", `scheduled:edit:${id}:button`)
+    .text(locale === "zh-CN" ? "👀 预览消息" : "👀 Preview", `scheduled:preview:${id}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔁 间隔时间" : "🔁 Interval", `scheduled:edit:${id}:interval`)
+    .text(locale === "zh-CN" ? "⏰ 设置时段" : "⏰ Time window", `scheduled:edit:${id}:time_window`)
+    .row()
+    .text(locale === "zh-CN" ? "📅 开始日期" : "📅 Start date", `scheduled:edit:${id}:start`)
+    .text(locale === "zh-CN" ? "📅 结束日期" : "📅 End date", `scheduled:edit:${id}:end`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `scheduled:back:${chatId}`)
+    .text(locale === "zh-CN" ? "批量操作" : "Bulk actions", `scheduled:bulk:${chatId}`);
+}
+
+async function handleScheduledInputMessage(ctx: Context, locale: Locale) {
+  if (!ctx.from) return false;
+  const draft = scheduledInputDrafts.get(ctx.from.id);
+  if (!draft) return false;
+
+  const scheduled = await prisma.scheduledMessage.findUnique({ where: { id: draft.scheduledMessageId } });
+  if (!scheduled) {
+    scheduledInputDrafts.delete(ctx.from.id);
+    return false;
+  }
+
+  if (draft.field === "media") {
+    const media = extractPublishMedia(ctx.message);
+    if (!media || media.kind !== "photo") {
+      await ctx.reply(locale === "zh-CN" ? "请发送图片作为定时消息媒体。" : "Send a photo as scheduled message media.", {
+        parse_mode: "HTML",
+        reply_markup: scheduledInputCancelKeyboard(scheduled.id, locale)
+      });
+      return true;
+    }
+    const content = parseScheduledContent(scheduled.content);
+    await prisma.scheduledMessage.update({
+      where: { id: scheduled.id },
+      data: { content: scheduledContentToJson({ ...content, photoFileId: media.fileId }) }
+    });
+    scheduledInputDrafts.delete(ctx.from.id);
+    await ctx.reply(scheduledInputSavedText(locale), { parse_mode: "HTML", reply_markup: scheduledSavedKeyboard(scheduled.id, locale) });
+    return true;
+  }
+
+  const text = getMessageText(ctx.message);
+  if (!text) {
+    await ctx.reply(scheduledInputPrompt(draft.field, locale), {
+      parse_mode: "HTML",
+      reply_markup: scheduledInputCancelKeyboard(scheduled.id, locale)
+    });
+    return true;
+  }
+
+  const content = parseScheduledContent(scheduled.content);
+  const repeatRule = parseScheduledRepeatRule(scheduled.repeatRule);
+  const patch = await applyScheduledInput(scheduled.id, draft.field, text, content, repeatRule, locale);
+  if (!patch.ok) {
+    await ctx.reply(patch.message, { parse_mode: "HTML", reply_markup: scheduledInputCancelKeyboard(scheduled.id, locale) });
+    return true;
+  }
+
+  scheduledInputDrafts.delete(ctx.from.id);
+  await ctx.reply(scheduledInputSavedText(locale), { parse_mode: "HTML", reply_markup: scheduledSavedKeyboard(scheduled.id, locale) });
+  return true;
+}
+
+async function applyScheduledInput(
+  id: string,
+  field: ScheduledInputField,
+  text: string,
+  content: ScheduledMessageContent,
+  repeatRule: ScheduledRepeatRule,
+  locale: Locale
+) {
+  if (field === "name") {
+    await prisma.scheduledMessage.update({
+      where: { id },
+      data: { content: scheduledContentToJson({ ...content, name: text.slice(0, 80) }) }
+    });
+    return { ok: true as const };
+  }
+
+  if (field === "text") {
+    await prisma.scheduledMessage.update({
+      where: { id },
+      data: { content: scheduledContentToJson({ ...content, text }) }
+    });
+    return { ok: true as const };
+  }
+
+  if (field === "button") {
+    const parsed = parsePublishButton(text);
+    if (!parsed) {
+      return {
+        ok: false as const,
+        message: locale === "zh-CN" ? "格式不正确，请发送：<code>按钮文字 | https://example.com</code>" : "Invalid format. Send: <code>Button text | https://example.com</code>"
+      };
+    }
+    await prisma.scheduledMessage.update({
+      where: { id },
+      data: { buttons: [{ text: parsed.text, url: parsed.url }] }
+    });
+    return { ok: true as const };
+  }
+
+  if (field === "interval") {
+    const intervalMinutes = parseScheduleDurationMinutes(text);
+    if (!intervalMinutes) {
+      return {
+        ok: false as const,
+        message: locale === "zh-CN" ? "间隔格式不正确，请发送 10分钟、2小时、1d 或 30m。" : "Invalid interval. Send 10m, 2h, 1d, or 30 minutes."
+      };
+    }
+    await saveScheduledRepeatRule(id, { ...repeatRule, intervalMinutes });
+    return { ok: true as const };
+  }
+
+  if (field === "time_window") {
+    const window = parseScheduleTimeWindow(text);
+    if (!window) {
+      return {
+        ok: false as const,
+        message: locale === "zh-CN" ? "时段格式不正确，请发送：<code>09:00-18:00</code>" : "Invalid time window. Send: <code>09:00-18:00</code>"
+      };
+    }
+    await saveScheduledRepeatRule(id, { ...repeatRule, timeStart: window.timeStart, timeEnd: window.timeEnd });
+    return { ok: true as const };
+  }
+
+  if (field === "start" || field === "end") {
+    const date = parseScheduleDateTime(text);
+    if (!date) {
+      return {
+        ok: false as const,
+        message: locale === "zh-CN" ? "日期格式不正确，请发送：<code>2026-08-01 10:00</code>" : "Invalid date. Send: <code>2026-08-01 10:00</code>"
+      };
+    }
+    await saveScheduledRepeatRule(id, {
+      ...repeatRule,
+      [field === "start" ? "startAt" : "endAt"]: date.toISOString()
+    });
+    return { ok: true as const };
+  }
+
+  return { ok: false as const, message: "Unsupported field." };
+}
+
+function isScheduledInputField(value: string): value is ScheduledInputField {
+  return value === "name"
+    || value === "text"
+    || value === "media"
+    || value === "button"
+    || value === "interval"
+    || value === "time_window"
+    || value === "start"
+    || value === "end";
+}
+
+function scheduledInputPrompt(field: ScheduledInputField, locale: Locale) {
+  if (locale !== "zh-CN") {
+    const prompts: Record<ScheduledInputField, string> = {
+      name: "Send the scheduled message name.",
+      text: "Send the scheduled message text.",
+      media: "Send a photo as the scheduled message media.",
+      button: "Send a button in this format:\n\n<code>Button text | https://example.com</code>",
+      interval: "Send the repeat interval, for example: <code>10m</code>, <code>2h</code>, or <code>1d</code>.",
+      time_window: "Send the active time window, for example: <code>09:00-18:00</code>.",
+      start: "Send the start date, for example: <code>2026-08-01 10:00</code>.",
+      end: "Send the end date, for example: <code>2026-08-31 23:59</code>."
+    };
+    return prompts[field];
+  }
+
+  const prompts: Record<ScheduledInputField, string> = {
+    name: "请发送定时消息名称。",
+    text: "请发送定时消息文本。",
+    media: "请发送图片作为定时消息媒体。",
+    button: "请发送按钮，格式如下：\n\n<code>按钮文字 | https://example.com</code>",
+    interval: "请发送重复间隔，例如：<code>10分钟</code>、<code>2小时</code>、<code>30m</code>、<code>1d</code>。",
+    time_window: "请发送发送时段，例如：<code>09:00-18:00</code>。",
+    start: "请发送开始日期，例如：<code>2026-08-01 10:00</code>。",
+    end: "请发送结束日期，例如：<code>2026-08-31 23:59</code>。"
+  };
+  return prompts[field];
+}
+
+function scheduledInputCancelKeyboard(id: string, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "取消" : "Cancel", `scheduled:open:${id}`);
+}
+
+function scheduledSavedKeyboard(id: string, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "返回设置" : "Back to settings", `scheduled:open:${id}`);
+}
+
+function scheduledInputSavedText(locale: Locale) {
+  return locale === "zh-CN" ? "✅ 设置成功，点击按钮返回。" : "✅ Saved. Tap the button to return.";
+}
+
+async function clearScheduledField(id: string, field: string | undefined) {
+  const scheduled = await prisma.scheduledMessage.findUnique({ where: { id } });
+  if (!scheduled) return;
+  const content = parseScheduledContent(scheduled.content);
+  const repeatRule = parseScheduledRepeatRule(scheduled.repeatRule);
+
+  if (field === "media") {
+    const nextContent = { ...content };
+    delete nextContent.photoFileId;
+    await prisma.scheduledMessage.update({
+      where: { id },
+      data: { content: scheduledContentToJson(nextContent) }
+    });
+    return;
+  }
+
+  if (field === "button") {
+    await prisma.scheduledMessage.update({ where: { id }, data: { buttons: [] } });
+    return;
+  }
+
+  if (field === "time_window") {
+    const nextRule = { ...repeatRule };
+    delete nextRule.timeStart;
+    delete nextRule.timeEnd;
+    await saveScheduledRepeatRule(id, nextRule);
+    return;
+  }
+
+  if (field === "start") {
+    const nextRule = { ...repeatRule };
+    delete nextRule.startAt;
+    await saveScheduledRepeatRule(id, nextRule);
+    return;
+  }
+
+  if (field === "end") {
+    const nextRule = { ...repeatRule };
+    delete nextRule.endAt;
+    await saveScheduledRepeatRule(id, nextRule);
+  }
+}
+
+async function sendScheduledPreview(ctx: Context, id: string, locale: Locale) {
+  const scheduled = await prisma.scheduledMessage.findUnique({ where: { id } });
+  if (!scheduled) return;
+  const content = parseScheduledContent(scheduled.content);
+  if (!hasScheduledMessageContent(content)) {
+    await editOrReply(
+      ctx,
+      locale === "zh-CN" ? "请先设置文本内容或媒体图片，再预览。" : "Set text or media before previewing.",
+      scheduledMessageSettingsKeyboard(scheduled.id, scheduled.chatId, content, parseScheduledRepeatRule(scheduled.repeatRule), scheduled.status, scheduled.buttons, locale)
+    );
+    return;
+  }
+
+  const replyMarkup = scheduledInlineKeyboard(scheduled.buttons);
+  if (content.photoFileId) {
+    await ctx.replyWithPhoto(content.photoFileId, {
+      ...(content.text ? { caption: content.text } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    });
+    return;
+  }
+
+  await ctx.reply(content.text ?? "", {
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+  });
+}
+
+function scheduledInlineKeyboard(value: Prisma.JsonValue | null) {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const keyboard = new InlineKeyboard();
+  value.forEach((button, index) => {
+    if (!isRecord(button)) return;
+    const text = typeof button.text === "string" ? button.text : "";
+    const url = typeof button.url === "string" ? button.url : "";
+    if (!text || !url) return;
+    if (index > 0) keyboard.row();
+    keyboard.url(text, url);
+  });
+  return keyboard.inline_keyboard.length ? keyboard : undefined;
+}
+
+function scheduledButtonsEnabled(value: Prisma.JsonValue | null) {
+  return Boolean(scheduledInlineKeyboard(value));
+}
+
+async function saveScheduledRepeatRule(id: string, rule: ScheduledRepeatRule) {
+  const normalized = {
+    ...rule,
+    intervalMinutes: clampIntervalMinutes(rule.intervalMinutes)
+  };
+  const nextRun = nextScheduledRun(normalized, new Date());
+  const scheduled = await prisma.scheduledMessage.update({
+    where: { id },
+    data: {
+      repeatRule: scheduledRepeatRuleToJson(normalized),
+      ...(nextRun ? { sendAt: nextRun } : {})
+    }
+  });
+
+  if (scheduled.status === ScheduledMessageStatus.PENDING && nextRun) {
+    await enqueueScheduledMessage(id, nextRun);
+  }
+}
+
+function parseScheduleDurationMinutes(input: string) {
+  const text = input.trim().toLowerCase().replace(/\s+/g, "");
+  const match = text.match(/^(\d+)(分钟|分|m|min|minute|minutes|小时|时|h|hour|hours|天|日|d|day|days)$/);
+  if (!match?.[1] || !match[2]) return null;
+  const amount = Number(match[1]);
+  if (!Number.isSafeInteger(amount) || amount <= 0) return null;
+  const unit = match[2];
+  const multiplier = unit === "天" || unit === "日" || unit === "d" || unit === "day" || unit === "days"
+    ? 24 * 60
+    : unit === "小时" || unit === "时" || unit === "h" || unit === "hour" || unit === "hours"
+      ? 60
+      : 1;
+  return clampIntervalMinutes(amount * multiplier);
+}
+
+function parseScheduleTimeWindow(input: string) {
+  const match = input.trim().match(/^(\d{1,2}:\d{2})\s*(?:-|~|至|到)\s*(\d{1,2}:\d{2})$/);
+  if (!match?.[1] || !match[2]) return null;
+  const timeStart = normalizeClockTime(match[1]);
+  const timeEnd = normalizeClockTime(match[2]);
+  return timeStart && timeEnd ? { timeStart, timeEnd } : null;
+}
+
+function normalizeClockTime(input: string) {
+  const match = input.trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!match?.[1] || !match[2]) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+}
+
+function parseScheduleDateTime(input: string) {
+  const normalized = input.trim().replace("T", " ");
+  const match = normalized.match(/^(\d{4}-\d{2}-\d{2})(?:\s+(\d{1,2}):(\d{2}))?$/);
+  if (!match?.[1]) return null;
+  const hours = match[2] ? Number(match[2]) : 0;
+  const minutes = match[3] ? Number(match[3]) : 0;
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+  const date = new Date(`${match[1]}T${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:00`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function formatDateTimeForDisplay(date: Date) {
+  if (Number.isNaN(date.getTime())) return "-";
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatDurationZh(minutes: number) {
+  if (minutes % (24 * 60) === 0) return `${minutes / (24 * 60)} 天`;
+  if (minutes % 60 === 0) return `${minutes / 60} 小时`;
+  return `${minutes} 分钟`;
+}
+
 function createPublishDraft(): PublishDraft {
   return {
     name: "",
@@ -1741,6 +2384,11 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
     return;
   }
 
+  if (feature === "scheduled") {
+    await openScheduledMessagePanel(ctx, locale, chat);
+    return;
+  }
+
   if (feature === "stats") {
     const statDate = formatDate(new Date());
     const stats = await getStats(chat.id, statDate);
@@ -1773,7 +2421,7 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
     return;
   }
 
-  if (feature === "member_stats" || feature === "schedule" || feature === "scheduled" || feature === "auto_reply" || feature === "night_mode" || feature === "commands" || feature === "speech_check" || feature === "banned_words" || feature === "anti_spam" || feature === "import" || feature === "members" || feature === "sync") {
+  if (feature === "member_stats" || feature === "schedule" || feature === "auto_reply" || feature === "night_mode" || feature === "commands" || feature === "speech_check" || feature === "banned_words" || feature === "anti_spam" || feature === "import" || feature === "members" || feature === "sync") {
     await editOrReply(
       ctx,
       locale === "zh-CN"
