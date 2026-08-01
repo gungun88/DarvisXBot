@@ -1348,7 +1348,7 @@ async function handleScheduledCallback(ctx: Context) {
     const scheduled = await prisma.scheduledMessage.findUnique({ where: { id } });
     if (!scheduled || !ctx.from) return;
     scheduledInputDrafts.set(ctx.from.id, { scheduledMessageId: id, field: "cron" });
-    await editOrReply(ctx, scheduledCronPromptText(parseScheduledRepeatRule(scheduled.repeatRule), locale), scheduledInputCancelKeyboard(id, locale));
+    await editOrReply(ctx, scheduledCronPromptText(parseScheduledRepeatRule(scheduled.repeatRule), locale), scheduledInputKeyboard("cron", id, locale));
     return;
   }
 
@@ -1427,7 +1427,7 @@ async function handleScheduledCallback(ctx: Context) {
   if (action === "edit" && value && isScheduledInputField(value)) {
     if (!ctx.from) return;
     scheduledInputDrafts.set(ctx.from.id, { scheduledMessageId: scheduled.id, field: value });
-    await editOrReply(ctx, scheduledInputPrompt(value, locale), scheduledInputKeyboard(value, scheduled.id, locale));
+    await editOrReply(ctx, scheduledInputPromptText(value, locale, scheduled), scheduledInputKeyboard(value, scheduled.id, locale));
     return;
   }
 
@@ -1707,7 +1707,7 @@ async function handleScheduledInputMessage(ctx: Context, locale: Locale) {
   if (draft.field === "media") {
     const media = extractPublishMedia(ctx.message);
     if (!media) {
-      await ctx.reply(scheduledInputPrompt("media", locale), {
+      await ctx.reply(scheduledInputPromptText("media", locale, scheduled), {
         parse_mode: "HTML",
         reply_markup: scheduledInputKeyboard("media", scheduled.id, locale)
       });
@@ -1728,7 +1728,7 @@ async function handleScheduledInputMessage(ctx: Context, locale: Locale) {
 
   const text = getMessageText(ctx.message);
   if (!text) {
-    await ctx.reply(scheduledInputPrompt(draft.field, locale), {
+    await ctx.reply(scheduledInputPromptText(draft.field, locale, scheduled), {
       parse_mode: "HTML",
       reply_markup: scheduledInputKeyboard(draft.field, scheduled.id, locale)
     });
@@ -1897,6 +1897,104 @@ function scheduledInputPrompt(field: ScheduledInputField, locale: Locale) {
   return prompts[field];
 }
 
+function scheduledInputPromptText(
+  field: ScheduledInputField,
+  locale: Locale,
+  scheduled?: { repeatRule: Prisma.JsonValue | null }
+) {
+  const repeatRule = scheduled ? parseScheduledRepeatRule(scheduled.repeatRule) : null;
+  const currentStart = repeatRule?.startAt ? formatDateTimeForDisplay(new Date(repeatRule.startAt)) : "None";
+  const currentEnd = repeatRule?.endAt ? formatDateTimeForDisplay(new Date(repeatRule.endAt)) : "None";
+
+  if (locale !== "zh-CN") {
+    const prompts: Record<ScheduledInputField, string> = {
+      name: "Send the scheduled message name.",
+      text: [
+        "Now send the text to set your message content.",
+        "",
+        "HTML (/html) and Telegram text formatting are supported."
+      ].join("\n"),
+      media: "Reply with a photo, video, sticker, or animation to set the media.",
+      button: scheduledButtonPromptText("en"),
+      interval: "Send the repeat interval, for example: <code>10m</code>, <code>2h</code>, or <code>1d</code>.",
+      cron: "Send a five-field Cron expression, for example: <code>*/10 * * * *</code>.",
+      time_window: [
+        "⏰ Scheduled messages",
+        "",
+        "Set a time window so messages are only sent inside that range.",
+        "Template 1: <code>8:00-18:00</code>",
+        "Template 2: <code>8-18</code>"
+      ].join("\n"),
+      start: [
+        "⏰ Scheduled messages",
+        "",
+        "When enabled, messages will only be sent after the start time you set.",
+        "",
+        "Format: year-month-day hour:minute:second",
+        "",
+        "Example: <code>2026-08-01 08:59:41</code>",
+        "",
+        `Current start time: ${escapeHtml(currentStart)}`
+      ].join("\n"),
+      end: [
+        "⏰ Scheduled messages",
+        "",
+        "When enabled, messages will stop sending after the end time you set.",
+        "",
+        "Format: year-month-day hour:minute",
+        "",
+        "Example: <code>2026-08-01 09:58:09</code>",
+        "",
+        `Current end time: ${escapeHtml(currentEnd)}`
+      ].join("\n")
+    };
+    return prompts[field];
+  }
+
+  const prompts: Record<ScheduledInputField, string> = {
+    name: "请发送定时消息名称。",
+    text: [
+      "现在输入文本设置你的消息内容",
+      "",
+      '支持 HTML ( <a href="tg://bot_command?command=html">/html</a> ) 和文字字体格式(加粗、链接、剧透、引用等字体):'
+    ].join("\n"),
+    media: "请回复图片、视频、贴图、动画表情进行设置",
+    button: scheduledButtonPromptText("zh-CN"),
+    interval: "请发送重复间隔，例如：<code>10分钟</code>、<code>2小时</code>、<code>30m</code>、<code>1d</code>。",
+    cron: "请发送 5 段 Cron 表达式，例如：<code>*/10 * * * *</code>。",
+    time_window: [
+      "⏰ 定时消息",
+      "",
+      "设置一个时段，仅在这个时段内发送,点击复制模板⬇️",
+      "模板1: <code>8:00-18:00</code>",
+      "模板2: <code>8-18</code>"
+    ].join("\n"),
+    start: [
+      "⏰ 定时消息",
+      "",
+      "在开启状态下，到达设定时间才会发送消息，请回复开始时间：",
+      "",
+      "格式:年-月-日 时:分:秒",
+      "",
+      "例如:<code>2026-08-01 08:59:41</code>",
+      "",
+      `当前设置的开始时间: ${escapeHtml(currentStart)}`
+    ].join("\n"),
+    end: [
+      "⏰ 定时消息",
+      "",
+      "在开启状态下，到达设定时间终止发送消息，请回复终止时间：",
+      "",
+      "格式:年-月-日 时:分",
+      "",
+      "例如:<code>2026-08-01 09:58:09</code>",
+      "",
+      `当前设置的终止时间: ${escapeHtml(currentEnd)}`
+    ].join("\n")
+  };
+  return prompts[field];
+}
+
 function scheduledButtonPromptText(locale: Locale) {
   if (locale !== "zh-CN") {
     return [
@@ -1945,6 +2043,30 @@ function scheduledInputKeyboard(field: ScheduledInputField, id: string, locale: 
       .text("Copy2", `scheduled:example:${id}:2`)
       .row()
       .text(locale === "zh-CN" ? "🚫 清空消息按钮" : "🚫 Clear buttons", `scheduled:clear:${id}:button`)
+      .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `scheduled:open:${id}`);
+  }
+
+  if (field === "time_window") {
+    return new InlineKeyboard()
+      .text(locale === "zh-CN" ? "🚫 清空已设置的时段" : "🚫 Clear time window", `scheduled:clear:${id}:time_window`)
+      .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `scheduled:open:${id}`);
+  }
+
+  if (field === "start") {
+    return new InlineKeyboard()
+      .text(locale === "zh-CN" ? "🚫 移除已设置的开始时间" : "🚫 Remove start time", `scheduled:clear:${id}:start`)
+      .row()
+      .text(locale === "zh-CN" ? "🌍 设置时区" : "🌍 Timezone", "menu:timezone")
+      .row()
+      .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `scheduled:open:${id}`);
+  }
+
+  if (field === "end") {
+    return new InlineKeyboard()
+      .text(locale === "zh-CN" ? "🚫 移除已设置的终止时间" : "🚫 Remove end time", `scheduled:clear:${id}:end`)
+      .row()
+      .text(locale === "zh-CN" ? "🌍 设置时区" : "🌍 Timezone", "menu:timezone")
+      .row()
       .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `scheduled:open:${id}`);
   }
 
@@ -2124,10 +2246,10 @@ function parseScheduleDurationMinutes(input: string) {
 }
 
 function parseScheduleTimeWindow(input: string) {
-  const match = input.trim().match(/^(\d{1,2}:\d{2})\s*(?:-|~|至|到)\s*(\d{1,2}:\d{2})$/);
-  if (!match?.[1] || !match[2]) return null;
-  const timeStart = normalizeClockTime(match[1]);
-  const timeEnd = normalizeClockTime(match[2]);
+  const match = input.trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(?:-|~|至|到)\s*(\d{1,2})(?::(\d{2}))?$/);
+  if (!match?.[1] || !match[3]) return null;
+  const timeStart = normalizeClockTime(`${match[1]}:${match[2] ?? "00"}`);
+  const timeEnd = normalizeClockTime(`${match[3]}:${match[4] ?? "00"}`);
   return timeStart && timeEnd ? { timeStart, timeEnd } : null;
 }
 
@@ -2142,19 +2264,22 @@ function normalizeClockTime(input: string) {
 
 function parseScheduleDateTime(input: string) {
   const normalized = input.trim().replace("T", " ");
-  const match = normalized.match(/^(\d{4}-\d{2}-\d{2})(?:\s+(\d{1,2}):(\d{2}))?$/);
+  const match = normalized.match(/^(\d{4}-\d{2}-\d{2})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
   if (!match?.[1]) return null;
   const hours = match[2] ? Number(match[2]) : 0;
   const minutes = match[3] ? Number(match[3]) : 0;
-  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
-  const date = new Date(`${match[1]}T${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:00`);
+  const seconds = match[4] ? Number(match[4]) : 0;
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59 || seconds < 0 || seconds > 59) return null;
+  const date = new Date(
+    `${match[1]}T${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+  );
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
 function formatDateTimeForDisplay(date: Date) {
   if (Number.isNaN(date.getTime())) return "-";
   const pad = (value: number) => String(value).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 function formatDurationZh(minutes: number) {
@@ -3791,3 +3916,4 @@ void cancelScheduledMessageJob;
 void enqueueGiveawayDraw;
 void cancelGiveawayDrawJob;
 void ScheduledMessageStatus;
+
