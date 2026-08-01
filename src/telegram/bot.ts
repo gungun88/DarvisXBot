@@ -377,11 +377,14 @@ export function createBot(config: AppConfig) {
 }
 
 export async function registerBotCommands(bot: Bot) {
-  await bot.api.setMyCommands(botCommands.map(({ command, description }) => ({ command, description })));
+  await bot.api.setMyCommands(botCommands.map(({ command, description }) => ({ command, description }))).catch((error) => {
+    console.error("Failed to register bot commands", error);
+  });
 }
 
 async function handleStartCommand(ctx: Context, config: AppConfig) {
   const locale = await getLocale(ctx);
+  if (ctx.from) clearUserInputState(ctx.from.id);
   const payload = extractStartPayload(ctx);
   const targetTelegramChatId = payload ? parseStartChatPayload(payload) : null;
 
@@ -450,6 +453,12 @@ async function openChatPanelFromStartPayload(
   return true;
 }
 
+function clearUserInputState(userId: number) {
+  timezoneInputUsers.delete(userId);
+  scheduledInputDrafts.delete(userId);
+  const publishDraft = publishDrafts.get(userId);
+  if (publishDraft) publishDraft.waitingFor = undefined;
+}
 function extractStartPayload(ctx: Context) {
   const match = "match" in ctx ? ctx.match : undefined;
   if (typeof match === "string") return match.trim();
@@ -832,7 +841,7 @@ function publishSummaryKeyboard(locale: Locale, userId: number) {
     .text(locale === "zh-CN" ? "💬 消息1" : "💬 Message1", "publish:message:1")
     .text(locale === "zh-CN" ? "🔧 设置" : "🔧 Settings", "publish:settings")
     .text(locale === "zh-CN" ? "删除🗑️" : "Delete🗑️", "publish:delete")
-    .switchInline(locale === "zh-CN" ? "分享" : "Share", inlineQuery)
+    .switchInlineCurrent(locale === "zh-CN" ? "分享" : "Share", inlineQuery)
     .row()
     .text(locale === "zh-CN" ? "➕ 添加" : "➕ Add", "publish:add")
     .row()
@@ -880,7 +889,7 @@ function publishSettingsKeyboard(locale: Locale, userId: number) {
     .text(locale === "zh-CN" ? "👀 预览消息" : "👀 Preview", "publish:preview")
     .row()
     .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "publish:list")
-    .switchInline(locale === "zh-CN" ? "分享" : "Share", inlineQuery);
+    .switchInlineCurrent(locale === "zh-CN" ? "分享" : "Share", inlineQuery);
 }
 
 function publishTextInputKeyboard(locale: Locale) {
