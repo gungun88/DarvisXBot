@@ -205,7 +205,11 @@ export function createBot(config: AppConfig) {
     console.error("Telegram bot error", {
       message: error.message,
       updateId: error.ctx.update.update_id,
-      cause: error.error instanceof Error ? error.error.message : String(error.error)
+      cause: error.error instanceof Error ? error.error.message : String(error.error),
+      stack: error.error instanceof Error ? error.error.stack : undefined,
+      updateType: error.ctx.update ? Object.keys(error.ctx.update).find((key) => key !== "update_id") ?? "unknown" : "unknown",
+      callbackData: error.ctx.callbackQuery?.data,
+      messageText: error.ctx.message && "text" in error.ctx.message ? error.ctx.message.text : undefined
     });
   });
 
@@ -1389,6 +1393,7 @@ async function handleScheduledCallback(ctx: Context) {
   if (action === "cron") {
     const scheduled = await prisma.scheduledMessage.findUnique({ where: { id } });
     if (!scheduled || !ctx.from) return;
+    clearUserInputState(ctx.from.id);
     scheduledInputDrafts.set(ctx.from.id, { scheduledMessageId: id, field: "cron" });
     await editOrReply(ctx, scheduledCronPromptText(parseScheduledRepeatRule(scheduled.repeatRule), locale), scheduledInputKeyboard("cron", id, locale));
     return;
@@ -1527,6 +1532,7 @@ async function handleScheduledCallback(ctx: Context) {
 
   if (action === "edit" && value && isScheduledInputField(value)) {
     if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
     scheduledInputDrafts.set(ctx.from.id, { scheduledMessageId: scheduled.id, field: value });
     await editOrReply(ctx, scheduledInputPromptText(value, locale, scheduled), scheduledInputKeyboard(value, scheduled.id, locale));
     return;
@@ -2109,7 +2115,9 @@ async function applyScheduledInput(
     if (!date) {
       return {
         ok: false as const,
-        message: locale === "zh-CN" ? "日期格式不正确，请发送：<code>2026-08-01 10:00</code>" : "Invalid date. Send: <code>2026-08-01 10:00</code>"
+        message: locale === "zh-CN"
+          ? "日期格式不正确，请发送：<code>2026-08-02 08:59:41</code>"
+          : "Invalid date. Send: <code>2026-08-02 08:59:41</code>"
       };
     }
     await saveScheduledRepeatRule(id, {
@@ -2218,7 +2226,7 @@ function scheduledInputPromptText(
         "",
         "When enabled, messages will stop sending after the end time you set.",
         "",
-        "Format: year-month-day hour:minute",
+        "Format: year-month-day hour:minute:second",
         "",
         "Example: <code>2026-08-01 09:58:09</code>",
         "",
@@ -2266,7 +2274,7 @@ function scheduledInputPromptText(
       "",
       "在开启状态下，到达设定时间终止发送消息，请回复终止时间：",
       "",
-      "格式:年-月-日 时:分",
+      "格式:年-月-日 时:分:秒",
       "",
       "例如:<code>2026-08-01 09:58:09</code>",
       "",
@@ -2542,16 +2550,45 @@ function normalizeClockTime(input: string) {
 }
 
 function parseScheduleDateTime(input: string) {
-  const normalized = input.trim().replace("T", " ");
-  const match = normalized.match(/^(\d{4}-\d{2}-\d{2})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
-  if (!match?.[1]) return null;
-  const hours = match[2] ? Number(match[2]) : 0;
-  const minutes = match[3] ? Number(match[3]) : 0;
-  const seconds = match[4] ? Number(match[4]) : 0;
-  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59 || seconds < 0 || seconds > 59) return null;
-  const date = new Date(
-    `${match[1]}T${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
-  );
+  const normalized = input
+    .trim()
+    .replace(/[ＴT]/g, " ")
+    .replace(/：/g, ":")
+    .replace(/[／/]/g, "-")
+    .replace(/\s+/g, " ");
+  const match = normalized.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (!match?.[1] || !match[2] || !match[3]) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hours = match[4] ? Number(match[4]) : 0;
+  const minutes = match[5] ? Number(match[5]) : 0;
+  const seconds = match[6] ? Number(match[6]) : 0;
+  if (
+    month < 1
+    || month > 12
+    || day < 1
+    || day > 31
+    || hours < 0
+    || hours > 23
+    || minutes < 0
+    || minutes > 59
+    || seconds < 0
+    || seconds > 59
+  ) {
+    return null;
+  }
+  const date = new Date(year, month - 1, day, hours, minutes, seconds);
+  if (
+    date.getFullYear() !== year
+    || date.getMonth() !== month - 1
+    || date.getDate() !== day
+    || date.getHours() !== hours
+    || date.getMinutes() !== minutes
+    || date.getSeconds() !== seconds
+  ) {
+    return null;
+  }
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
