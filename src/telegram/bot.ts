@@ -346,9 +346,9 @@ export function createBot(config: AppConfig) {
 
   bot.on("message", async (ctx) => {
     const locale = await getLocale(ctx);
+    if (await handleTimezoneInputMessage(ctx, config, locale)) return;
     if (await handleScheduledInputMessage(ctx, locale)) return;
     if (await handlePublishInputMessage(ctx, locale)) return;
-    if (await handleTimezoneInputMessage(ctx, config, locale)) return;
     if (await handleNewMemberLimitPrivateMessage(ctx, config, locale)) return;
     if (await handleOpenClosePrivateMessage(ctx, config, locale)) return;
     if (await handleOpenCloseGroupMessage(ctx)) return;
@@ -1156,7 +1156,10 @@ async function handleMenuCallback(ctx: Context, config: AppConfig) {
 
   if (action === "timezone") {
     if (parts[2] === "settings") {
-      if (ctx.from) timezoneInputUsers.add(ctx.from.id);
+      if (ctx.from) {
+        clearUserInputState(ctx.from.id);
+        timezoneInputUsers.add(ctx.from.id);
+      }
       await editOrReply(ctx, timezonePromptText(locale), timezonePromptKeyboard(locale));
       return;
     }
