@@ -134,6 +134,11 @@ type ScheduledMessageListItem = {
   status: ScheduledMessageStatus;
 };
 
+type ScheduledBulkEnableResult = {
+  enabled: number;
+  skipped: number;
+};
+
 const botCommands = [
   { command: "start", description: "开始菜单" },
   { command: "help", description: "帮助" },
@@ -1373,11 +1378,38 @@ async function handleScheduledCallback(ctx: Context) {
   if (action === "bulk") {
     const chat = await prisma.chat.findUnique({ where: { id } });
     if (!chat) return;
-    await editOrReply(
-      ctx,
-      locale === "zh-CN" ? "批量操作后续接入。" : "Bulk actions will be wired up next.",
-      scheduledMessageListKeyboard(chat.id, [], chat.type === "CHANNEL" ? "channel" : "group", locale)
-    );
+    await openScheduledBulkPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "bulk_on") {
+    const chat = await prisma.chat.findUnique({ where: { id } });
+    if (!chat) return;
+    const result = await bulkEnableScheduledMessages(chat.id);
+    await openScheduledBulkPanel(ctx, locale, chat, scheduledBulkResultText(result, locale));
+    return;
+  }
+
+  if (action === "bulk_off") {
+    const chat = await prisma.chat.findUnique({ where: { id } });
+    if (!chat) return;
+    const count = await bulkDisableScheduledMessages(chat.id);
+    await openScheduledBulkPanel(ctx, locale, chat, scheduledBulkDisabledText(count, locale));
+    return;
+  }
+
+  if (action === "bulk_delete_confirm") {
+    const chat = await prisma.chat.findUnique({ where: { id } });
+    if (!chat) return;
+    await editOrReply(ctx, scheduledBulkDeleteConfirmText(chat, locale), scheduledBulkDeleteConfirmKeyboard(chat.id, locale));
+    return;
+  }
+
+  if (action === "bulk_delete") {
+    const chat = await prisma.chat.findUnique({ where: { id } });
+    if (!chat) return;
+    const count = await bulkDeleteScheduledMessages(chat.id);
+    await openScheduledBulkPanel(ctx, locale, chat, scheduledBulkDeletedText(count, locale));
     return;
   }
 
@@ -1575,6 +1607,130 @@ function scheduledMessageListKeyboard(
     .text(locale === "zh-CN" ? "➕添加" : "➕Add", `scheduled:add:${chatId}`)
     .row()
     .text(locale === "zh-CN" ? "🔙返回" : "🔙Back", `menu:chat:${scope}:${chatId}`);
+}
+
+async function openScheduledBulkPanel(ctx: Context, locale: Locale, chat: PrismaChat, notice?: string) {
+  await editOrReply(ctx, scheduledBulkPanelText(chat, locale, notice), scheduledBulkKeyboard(chat.id, locale));
+}
+
+function scheduledBulkPanelText(chat: PrismaChat, locale: Locale, notice?: string) {
+  const title = escapeHtml(chat.title ?? chat.username ?? String(chat.telegramChatId));
+  const lines = locale === "zh-CN"
+    ? [
+        "🧰 <b>批量操作</b>",
+        "",
+        `当前对象: <b>${title}</b>`,
+        "",
+        "可以批量开启、关闭或删除当前频道/群组下的全部定时消息。"
+      ]
+    : [
+        "🧰 <b>Bulk actions</b>",
+        "",
+        `Target: <b>${title}</b>`,
+        "",
+        "Enable, disable, or delete all scheduled messages in this chat."
+      ];
+  return notice ? [...lines, "", notice].join("\n") : lines.join("\n");
+}
+
+function scheduledBulkKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "✅ 批量开启" : "✅ Enable all", `scheduled:bulk_on:${chatId}`)
+    .text(locale === "zh-CN" ? "❌ 批量关闭" : "❌ Disable all", `scheduled:bulk_off:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🗑 批量删除" : "🗑 Delete all", `scheduled:bulk_delete_confirm:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `scheduled:back:${chatId}`);
+}
+
+function scheduledBulkDeleteConfirmText(chat: PrismaChat, locale: Locale) {
+  const title = escapeHtml(chat.title ?? chat.username ?? String(chat.telegramChatId));
+  return locale === "zh-CN"
+    ? [
+        "⚠️ <b>确认批量删除</b>",
+        "",
+        `将删除 <b>${title}</b> 下的全部定时消息。`,
+        "此操作不能撤销。"
+      ].join("\n")
+    : [
+        "⚠️ <b>Confirm bulk delete</b>",
+        "",
+        `All scheduled messages in <b>${title}</b> will be deleted.`,
+        "This cannot be undone."
+      ].join("\n");
+}
+
+function scheduledBulkDeleteConfirmKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "确认删除全部" : "Confirm delete all", `scheduled:bulk_delete:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `scheduled:bulk:${chatId}`);
+}
+
+function scheduledBulkResultText(result: ScheduledBulkEnableResult, locale: Locale) {
+  if (locale !== "zh-CN") {
+    return `✅ Enabled ${result.enabled} scheduled messages. Skipped ${result.skipped} empty messages.`;
+  }
+  return `✅ 已开启 ${result.enabled} 条定时消息，跳过 ${result.skipped} 条空内容消息。`;
+}
+
+function scheduledBulkDisabledText(count: number, locale: Locale) {
+  return locale === "zh-CN" ? `❌ 已关闭 ${count} 条定时消息。` : `❌ Disabled ${count} scheduled messages.`;
+}
+
+function scheduledBulkDeletedText(count: number, locale: Locale) {
+  return locale === "zh-CN" ? `🗑 已删除 ${count} 条定时消息。` : `🗑 Deleted ${count} scheduled messages.`;
+}
+
+async function bulkEnableScheduledMessages(chatId: string): Promise<ScheduledBulkEnableResult> {
+  const messages = await prisma.scheduledMessage.findMany({ where: { chatId } });
+  let enabled = 0;
+  let skipped = 0;
+
+  for (const message of messages) {
+    const content = parseScheduledContent(message.content);
+    if (!hasScheduledMessageContent(content)) {
+      skipped += 1;
+      continue;
+    }
+    const repeatRule = parseScheduledRepeatRule(message.repeatRule);
+    const sendAt = nextScheduledRun(repeatRule, new Date()) ?? new Date(Date.now() + repeatRule.intervalMinutes * 60_000);
+    await prisma.scheduledMessage.update({
+      where: { id: message.id },
+      data: { status: ScheduledMessageStatus.PENDING, sendAt }
+    });
+    await enqueueScheduledMessage(message.id, sendAt);
+    enabled += 1;
+  }
+
+  return { enabled, skipped };
+}
+
+async function bulkDisableScheduledMessages(chatId: string) {
+  const messages = await prisma.scheduledMessage.findMany({
+    where: { chatId },
+    select: { id: true }
+  });
+  for (const message of messages) {
+    await cancelScheduledMessageJob(message.id);
+  }
+  const result = await prisma.scheduledMessage.updateMany({
+    where: { chatId },
+    data: { status: ScheduledMessageStatus.DRAFT }
+  });
+  return result.count;
+}
+
+async function bulkDeleteScheduledMessages(chatId: string) {
+  const messages = await prisma.scheduledMessage.findMany({
+    where: { chatId },
+    select: { id: true }
+  });
+  for (const message of messages) {
+    await cancelScheduledMessageJob(message.id);
+  }
+  const result = await prisma.scheduledMessage.deleteMany({ where: { chatId } });
+  return result.count;
 }
 
 async function openScheduledIntervalPanel(ctx: Context, locale: Locale, id: string) {
