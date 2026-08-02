@@ -235,9 +235,11 @@ const timezoneInputUsers = new Set<number>();
 const publishDrafts = new Map<number, PublishDraft>();
 const scheduledInputDrafts = new Map<number, ScheduledInputDraft>();
 const autoReplyInputDrafts = new Map<number, AutoReplyInputDraft>();
+const autoReplySelectedChats = new Map<number, string>();
 
 function rememberSelectedChatForModules(userId: number | undefined, chatId: string) {
   if (typeof userId !== "number") return;
+  autoReplySelectedChats.set(userId, chatId);
   rememberSelectedNewMemberLimitChat(userId, chatId);
   rememberSelectedOpenCloseChat(userId, chatId);
   rememberSelectedAdultCheckChat(userId, chatId);
@@ -3733,7 +3735,7 @@ async function handleAutoReplyCallback(ctx: Context, config: AppConfig) {
   let chatId: string | undefined;
   let value: string | undefined;
   if (action === "cancel" || action === "skip_buttons") {
-    chatId = draft?.chatId ?? parts[2];
+    chatId = draft?.chatId ?? parts[2] ?? (ctx.from ? autoReplySelectedChats.get(ctx.from.id) : undefined);
   } else if (action === "trigger") {
     if (parts[2] === "exact" || parts[2] === "contains") {
       chatId = draft?.chatId;
