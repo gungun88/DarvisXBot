@@ -100,11 +100,21 @@ type AutoDeleteSettings = {
   seconds: number;
 };
 
+type AutoReplyMediaKind = "photo" | "video" | "animation" | "sticker" | "document" | "audio" | "voice";
+
+type AutoReplyButton = {
+  text: string;
+  url: string;
+};
+
 type AutoReplyRule = {
   id: string;
   keyword: string;
   matchType: "exact" | "contains";
   response: string;
+  mediaKind?: AutoReplyMediaKind;
+  mediaFileId?: string;
+  buttons?: AutoReplyButton[][];
 };
 
 type AutoReplySettings = {
@@ -140,8 +150,16 @@ type ScheduledInputDraft = {
   field: ScheduledInputField;
 };
 
+type AutoReplyInputStage = "keyword" | "response" | "buttons";
+
 type AutoReplyInputDraft = {
   chatId: string;
+  stage: AutoReplyInputStage;
+  keyword?: string;
+  matchType?: "exact" | "contains";
+  response?: string;
+  mediaKind?: AutoReplyMediaKind;
+  mediaFileId?: string;
 };
 
 type ScheduledMessageListItem = {
@@ -1193,7 +1211,14 @@ function autoReplyDeleteKeyboard(chatId: string, settings: AutoReplySettings, lo
 }
 
 function autoReplyCancelKeyboard(chatId: string, locale: Locale) {
-  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `chat_feature:auto_reply:${chatId}`);
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `auto_reply:cancel:${chatId}`);
+}
+
+function autoReplyButtonsKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard().text(
+    locale === "zh-CN" ? "♻️ 不设置，跳过" : "♻️ Skip buttons",
+    `auto_reply:skip_buttons:${chatId}`
+  );
 }
 
 async function handleMenuCallback(ctx: Context, config: AppConfig) {
@@ -2792,49 +2817,173 @@ async function handleAutoReplyInputMessage(ctx: Context, locale: Locale) {
   if (!ctx.from) return false;
   const draft = autoReplyInputDrafts.get(ctx.from.id);
   if (!draft) return false;
+  if (draft.stage === "keyword") {
+    const text = getMessageText(ctx.message);
+    const parsed = text ? parseAutoReplyKeyword(text) : null;
+    if (!parsed) {
+      const settings = await getAutoReplySettings(draft.chatId);
+      await ctx.reply(autoReplyKeywordPromptText(settings, locale), {
+        parse_mode: "HTML",
+        reply_markup: autoReplyCancelKeyboard(draft.chatId, locale)
+      });
+      return true;
+    }
+
+    draft.keyword = parsed.keyword;
+    draft.matchType = parsed.matchType;
+    draft.stage = "response";
+    await ctx.reply(autoReplyResponsePromptText(parsed.keyword, locale), {
+      parse_mode: "HTML",
+      reply_markup: autoReplyCancelKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
+  if (draft.stage === "response") {
+    const content = extractAutoReplyContent(ctx.message);
+    if (!content) {
+      await ctx.reply(autoReplyResponsePromptText(draft.keyword ?? "", locale), {
+        parse_mode: "HTML",
+        reply_markup: autoReplyCancelKeyboard(draft.chatId, locale)
+      });
+      return true;
+    }
+
+    draft.response = content.text;
+    if (content.mediaKind && content.mediaFileId) {
+      draft.mediaKind = content.mediaKind;
+      draft.mediaFileId = content.mediaFileId;
+    } else {
+      delete draft.mediaKind;
+      delete draft.mediaFileId;
+    }
+    draft.stage = "buttons";
+    await ctx.reply(autoReplyButtonsPromptText(locale), {
+      parse_mode: "HTML",
+      reply_markup: autoReplyButtonsKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
 
   const text = getMessageText(ctx.message);
-  const parsed = text ? parseAutoReplyInput(text) : null;
-  if (!parsed) {
+  const buttons = text ? parseAutoReplyButtonLayout(text) : null;
+  if (!buttons) {
     await ctx.reply(
       locale === "zh-CN"
-        ? "格式不正确。请按示例发送：\n\n<code>-关键词</code>\n<code>回复内容</code>\n\n<code>*关键词</code>\n<code>回复内容</code>"
-        : "Invalid format. Send:\n\n<code>-keyword</code>\n<code>reply content</code>\n\n<code>*keyword</code>\n<code>reply content</code>",
-      { parse_mode: "HTML", reply_markup: autoReplyCancelKeyboard(draft.chatId, locale) }
+        ? "按钮格式不正确，请按示例输入，或点击“不设置，跳过”。"
+        : "Invalid button format. Use the example or tap Skip buttons.",
+      { parse_mode: "HTML", reply_markup: autoReplyButtonsKeyboard(draft.chatId, locale) }
     );
     return true;
   }
 
+  await finalizeAutoReplyRule(ctx, locale, draft, buttons);
+  return true;
+}
+
+async function finalizeAutoReplyRule(
+  ctx: Context,
+  locale: Locale,
+  draft: AutoReplyInputDraft,
+  buttons?: AutoReplyButton[][]
+) {
+  if (!ctx.from || !draft.keyword || !draft.matchType || (!draft.response && !draft.mediaFileId)) return;
+
   const settings = await getAutoReplySettings(draft.chatId);
-  settings.rules.push({
+  const rule: AutoReplyRule = {
     id: createAutoReplyRuleId(),
-    keyword: parsed.keyword,
-    matchType: parsed.matchType,
-    response: parsed.response
-  });
+    keyword: draft.keyword,
+    matchType: draft.matchType,
+    response: draft.response ?? ""
+  };
+
+  if (draft.mediaKind && draft.mediaFileId) {
+    rule.mediaKind = draft.mediaKind;
+    rule.mediaFileId = draft.mediaFileId;
+  }
+  if (buttons?.length) rule.buttons = buttons;
+
+  settings.rules.push(rule);
   autoReplyInputDrafts.delete(ctx.from.id);
   await saveAutoReplySettings(draft.chatId, settings);
   await ctx.reply(locale === "zh-CN" ? "✅ 设置成功，点击按钮返回。" : "✅ Saved. Tap the button to return.", {
     parse_mode: "HTML",
     reply_markup: autoReplyCancelKeyboard(draft.chatId, locale)
   });
-  return true;
 }
 
-function parseAutoReplyInput(input: string) {
-  const lines = input.split(/\r?\n/);
-  const firstLine = lines.shift()?.trim() ?? "";
-  const prefix = firstLine[0];
-  if (prefix !== "-" && prefix !== "*") return null;
+function parseAutoReplyKeyword(input: string) {
+  const value = input.trim();
+  if (!value) return null;
 
-  const keyword = firstLine.slice(1).trim();
-  const response = lines.join("\n").trim();
-  if (!keyword || !response) return null;
+  const prefix = value[0];
+  const matchType = prefix === "*" ? "contains" : "exact";
+  const keyword = prefix === "-" || prefix === "*" ? value.slice(1).trim() : value;
+  if (!keyword) return null;
+
   return {
     keyword: keyword.slice(0, 80),
-    response: response.slice(0, 4000),
-    matchType: prefix === "-" ? "exact" as const : "contains" as const
+    matchType
+  } as const;
+}
+
+function extractAutoReplyContent(message: Message | undefined) {
+  if (!message) return null;
+  const text = getMessageText(message) ?? "";
+  const media = extractAutoReplyMedia(message);
+  if (!text && !media) return null;
+  return {
+    text: text.slice(0, 4000),
+    mediaKind: media?.kind,
+    mediaFileId: media?.fileId
   };
+}
+
+function extractAutoReplyMedia(message: Message | undefined): { kind: AutoReplyMediaKind; fileId: string } | null {
+  if (!message) return null;
+  if ("photo" in message && message.photo?.length) {
+    const photo = message.photo[message.photo.length - 1];
+    return photo ? { kind: "photo", fileId: photo.file_id } : null;
+  }
+  if ("video" in message && message.video) return { kind: "video", fileId: message.video.file_id };
+  if ("animation" in message && message.animation) return { kind: "animation", fileId: message.animation.file_id };
+  if ("sticker" in message && message.sticker) return { kind: "sticker", fileId: message.sticker.file_id };
+  if ("document" in message && message.document) return { kind: "document", fileId: message.document.file_id };
+  if ("audio" in message && message.audio) return { kind: "audio", fileId: message.audio.file_id };
+  if ("voice" in message && message.voice) return { kind: "voice", fileId: message.voice.file_id };
+  return null;
+}
+
+function parseAutoReplyButtonLayout(input: string): AutoReplyButton[][] | null {
+  const rows = input
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.split("&&").map((item) => parseAutoReplyButton(item.trim())).filter((item): item is AutoReplyButton => Boolean(item)))
+    .filter((row) => row.length > 0);
+
+  if (!rows.length) return null;
+  const sourceItems = input.split(/\r?\n/).flatMap((line) => line.split("&&").map((item) => item.trim()).filter(Boolean));
+  const parsedItems = rows.flat();
+  return parsedItems.length === sourceItems.length ? rows : null;
+}
+
+function parseAutoReplyButton(input: string): AutoReplyButton | null {
+  const separatorIndex = input.indexOf(" - ");
+  const compactIndex = separatorIndex >= 0 ? separatorIndex : input.indexOf("-");
+  if (compactIndex <= 0) return null;
+
+  const text = input.slice(0, compactIndex).trim();
+  const rawUrl = input.slice(compactIndex + (separatorIndex >= 0 ? 3 : 1)).trim();
+  if (!text || !rawUrl) return null;
+
+  try {
+    const url = new URL(/^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    return { text: text.slice(0, 64), url: url.toString() };
+  } catch {
+    return null;
+  }
 }
 
 function createAutoReplyRuleId() {
@@ -3517,6 +3666,12 @@ async function handleAutoReplyCallback(ctx: Context) {
   const locale = await getLocale(ctx);
   const settings = await getAutoReplySettings(chatId);
 
+  if (action === "cancel") {
+    if (ctx.from) autoReplyInputDrafts.delete(ctx.from.id);
+    await editOrReply(ctx, autoReplyText(settings, locale), autoReplyKeyboard(chatId, settings, locale));
+    return;
+  }
+
   if (action === "noop") return;
 
   if (action === "toggle") {
@@ -3540,11 +3695,19 @@ async function handleAutoReplyCallback(ctx: Context) {
     return;
   }
 
+  if (action === "skip_buttons") {
+    if (!ctx.from) return;
+    const draft = autoReplyInputDrafts.get(ctx.from.id);
+    if (!draft || draft.chatId !== chatId || draft.stage !== "buttons") return;
+    await finalizeAutoReplyRule(ctx, locale, draft);
+    return;
+  }
+
   if (action === "add") {
     if (!ctx.from) return;
     clearUserInputState(ctx.from.id);
-    autoReplyInputDrafts.set(ctx.from.id, { chatId });
-    await editOrReply(ctx, autoReplyAddPromptText(locale), autoReplyCancelKeyboard(chatId, locale));
+    autoReplyInputDrafts.set(ctx.from.id, { chatId, stage: "keyword" });
+    await editOrReply(ctx, autoReplyKeywordPromptText(settings, locale), autoReplyCancelKeyboard(chatId, locale));
     return;
   }
 
@@ -4065,7 +4228,17 @@ async function saveAutoReplySettings(chatId: string, settings: AutoReplySettings
     enabled: settings.enabled,
     deleteAfterMinutes: settings.deleteAfterMinutes,
     deletePreviousMessage: settings.deletePreviousMessage,
-    rules: settings.rules
+    rules: settings.rules.map((rule) => ({
+      id: rule.id,
+      keyword: rule.keyword,
+      matchType: rule.matchType,
+      response: rule.response,
+      ...(rule.mediaKind && rule.mediaFileId ? {
+        mediaKind: rule.mediaKind,
+        mediaFileId: rule.mediaFileId
+      } : {}),
+      ...(rule.buttons?.length ? { buttons: rule.buttons } : {})
+    }))
   }));
 }
 
@@ -4075,8 +4248,43 @@ function parseAutoReplyRule(value: unknown): AutoReplyRule | null {
   const keyword = typeof value.keyword === "string" ? value.keyword.trim() : "";
   const response = typeof value.response === "string" ? value.response.trim() : "";
   const matchType = value.matchType === "contains" ? "contains" : value.matchType === "exact" ? "exact" : null;
-  if (!id || !keyword || !response || !matchType) return null;
-  return { id, keyword, response, matchType };
+  const mediaKind = isAutoReplyMediaKind(value.mediaKind) ? value.mediaKind : undefined;
+  const mediaFileId = typeof value.mediaFileId === "string" ? value.mediaFileId : undefined;
+  const buttons = parseAutoReplyButtons(value.buttons);
+  if (!id || !keyword || !matchType || (!response && !(mediaKind && mediaFileId))) return null;
+  return {
+    id,
+    keyword,
+    response,
+    matchType,
+    ...(mediaKind && mediaFileId ? { mediaKind, mediaFileId } : {}),
+    ...(buttons ? { buttons } : {})
+  };
+}
+
+function isAutoReplyMediaKind(value: unknown): value is AutoReplyMediaKind {
+  return value === "photo"
+    || value === "video"
+    || value === "animation"
+    || value === "sticker"
+    || value === "document"
+    || value === "audio"
+    || value === "voice";
+}
+
+function parseAutoReplyButtons(value: unknown): AutoReplyButton[][] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const rows = value
+    .map((row) => Array.isArray(row)
+      ? row
+        .map((item) => {
+          if (!isRecord(item) || typeof item.text !== "string" || typeof item.url !== "string") return null;
+          return { text: item.text.slice(0, 64), url: item.url } as AutoReplyButton;
+        })
+        .filter((item): item is AutoReplyButton => Boolean(item))
+      : [])
+    .filter((row) => row.length > 0);
+  return rows.length ? rows : undefined;
 }
 
 async function getSettingRecord(chatId: string, key: string): Promise<SettingRecord> {
@@ -4182,6 +4390,73 @@ async function maybeAutoDelete(ctx: Context, chatId: string, message: Message) {
   }, settings.seconds * 1000);
 }
 
+function autoReplyInlineKeyboard(buttons: AutoReplyButton[][] | undefined) {
+  if (!buttons?.length) return undefined;
+  const keyboard = new InlineKeyboard();
+  buttons.forEach((row, rowIndex) => {
+    row.forEach((button) => keyboard.url(button.text, button.url));
+    if (rowIndex < buttons.length - 1) keyboard.row();
+  });
+  return keyboard;
+}
+
+async function sendAutoReplyResponse(ctx: Context, rule: AutoReplyRule, triggerMessageId: number): Promise<Message[]> {
+  if (!ctx.chat) return [];
+
+  const replyMarkup = autoReplyInlineKeyboard(rule.buttons);
+  const baseOptions = {
+    reply_to_message_id: triggerMessageId,
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+  };
+  const captionOptions = rule.response
+    ? { caption: rule.response, parse_mode: "HTML" as const }
+    : {};
+
+  try {
+    if (!rule.mediaKind || !rule.mediaFileId) {
+      const sent = await ctx.api.sendMessage(ctx.chat.id, rule.response, {
+        ...baseOptions,
+        parse_mode: "HTML"
+      });
+      return [sent];
+    }
+
+    if (rule.mediaKind === "photo") {
+      return [await ctx.api.sendPhoto(ctx.chat.id, rule.mediaFileId, { ...baseOptions, ...captionOptions })];
+    }
+    if (rule.mediaKind === "video") {
+      return [await ctx.api.sendVideo(ctx.chat.id, rule.mediaFileId, { ...baseOptions, ...captionOptions })];
+    }
+    if (rule.mediaKind === "animation") {
+      return [await ctx.api.sendAnimation(ctx.chat.id, rule.mediaFileId, { ...baseOptions, ...captionOptions })];
+    }
+    if (rule.mediaKind === "document") {
+      return [await ctx.api.sendDocument(ctx.chat.id, rule.mediaFileId, { ...baseOptions, ...captionOptions })];
+    }
+    if (rule.mediaKind === "audio") {
+      return [await ctx.api.sendAudio(ctx.chat.id, rule.mediaFileId, { ...baseOptions, ...captionOptions })];
+    }
+    if (rule.mediaKind === "voice") {
+      return [await ctx.api.sendVoice(ctx.chat.id, rule.mediaFileId, { ...baseOptions, ...captionOptions })];
+    }
+
+    const sticker = await ctx.api.sendSticker(ctx.chat.id, rule.mediaFileId, baseOptions);
+    if (!rule.response) return [sticker];
+    const text = await ctx.api.sendMessage(ctx.chat.id, rule.response, {
+      ...baseOptions,
+      parse_mode: "HTML"
+    });
+    return [sticker, text];
+  } catch (error) {
+    console.error("Failed to send auto reply", {
+      chatId: ctx.chat.id,
+      ruleId: rule.id,
+      error
+    });
+    return [];
+  }
+}
+
 async function maybeSendAutoReply(ctx: Context, chatId: string, message: Message) {
   if (!ctx.chat || ctx.from?.is_bot) return;
   const text = getMessageText(message);
@@ -4198,15 +4473,16 @@ async function maybeSendAutoReply(ctx: Context, chatId: string, message: Message
   );
   if (!rule) return;
 
-  const sent = await ctx.reply(rule.response, {
-    reply_to_message_id: message.message_id
-  }).catch(() => null);
-  if (sent && settings.deletePreviousMessage) {
+  const sentMessages = await sendAutoReplyResponse(ctx, rule, message.message_id);
+  if (!sentMessages.length) return;
+  if (settings.deletePreviousMessage) {
     await ctx.api.deleteMessage(ctx.chat.id, message.message_id).catch(() => undefined);
   }
-  if (sent && settings.deleteAfterMinutes > 0) {
+  if (settings.deleteAfterMinutes > 0) {
     setTimeout(() => {
-      void ctx.api.deleteMessage(ctx.chat!.id, sent.message_id).catch(() => undefined);
+      for (const sent of sentMessages) {
+        void ctx.api.deleteMessage(ctx.chat!.id, sent.message_id).catch(() => undefined);
+      }
     }, settings.deleteAfterMinutes * 60 * 1000);
   }
 }
@@ -4356,29 +4632,78 @@ function autoReplyDeleteText(settings: AutoReplySettings, locale: Locale) {
     : ["🗑 <b>Delete keyword</b>", "", "Choose a keyword to delete:", ...lines].join("\n");
 }
 
-function autoReplyAddPromptText(locale: Locale) {
+function autoReplyKeywordPromptText(settings: AutoReplySettings, locale: Locale) {
+  const rules = settings.rules.length
+    ? settings.rules.map((rule) => `${rule.matchType === "exact" ? "-" : "*"} ${escapeHtml(rule.keyword)}`)
+    : ["[None]"];
+
   return locale === "zh-CN"
     ? [
-        "✍ <b>添加关键词回复</b>",
+        "💬 关键词回复",
         "",
-        "请发送关键词和回复内容：",
+        "<strong>已添加的关键词:</strong>",
+        ...rules,
         "",
-        "<code>-关键词</code>",
-        "<code>回复内容</code>",
-        "",
-        "<code>*关键词</code>",
-        "<code>回复内容</code>"
+        "👉 第一步 请输入关键词:",
+        "<i>直接输入为精准匹配，使用 * 开头为包含匹配</i>"
       ].join("\n")
     : [
-        "✍ <b>Add keyword reply</b>",
+        "💬 Keyword replies",
         "",
-        "Send a keyword and reply content:",
+        "<strong>Added keywords:</strong>",
+        ...rules,
         "",
-        "<code>-keyword</code>",
-        "<code>reply content</code>",
+        "👉 Step 1: Send a keyword:",
+        "<i>Plain text matches exactly; use * for contains matching.</i>"
+      ].join("\n");
+}
+
+function autoReplyResponsePromptText(keyword: string, locale: Locale) {
+  const escapedKeyword = escapeHtml(keyword);
+  return locale === "zh-CN"
+    ? [
+        "💬 关键词回复",
         "",
-        "<code>*keyword</code>",
-        "<code>reply content</code>"
+        `👉 第二步 请输入关键词<code>${escapedKeyword}</code>的回复内容（支持 <a href="tg://bot_command?command=html">HTML</a>，文字字体格式(加粗、链接、剧透、块引用等)，图片，表情，视频，文件等）:`
+      ].join("\n")
+    : [
+        "💬 Keyword replies",
+        "",
+        `👉 Step 2: Send the reply content for <code>${escapedKeyword}</code> (HTML, formatting, images, videos, and files are supported):`
+      ].join("\n");
+}
+
+function autoReplyButtonsPromptText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "💬 关键词回复",
+        "",
+        "第三步 回复内容添加按钮链接",
+        "",
+        "按钮内容格式(点击文本复制):",
+        "",
+        "<code>官网 - link.com\n电报 - t.me/DarvisXBot\n官网 - link.com &amp;&amp; 电报 - t.me/DarvisXBot</code>",
+        "",
+        "· 按钮文字和网址中间用英文-隔开",
+        "· 两个按钮在一行，请用 &amp;&amp; (没有空格)分隔",
+        "· 网址有无 https:// 都可以",
+        "",
+        "<strong>👉 输入按钮内容进行设置:</strong>"
+      ].join("\n")
+    : [
+        "💬 Keyword replies",
+        "",
+        "Step 3: Add link buttons to the reply",
+        "",
+        "Button format:",
+        "",
+        "<code>Website - link.com\nTelegram - t.me/DarvisXBot\nWebsite - link.com &amp;&amp; Telegram - t.me/DarvisXBot</code>",
+        "",
+        "Use a hyphen between button text and URL.",
+        "Use && without spaces to put two buttons on one row.",
+        "https:// is optional.",
+        "",
+        "<strong>👉 Send button content:</strong>"
       ].join("\n");
 }
 
