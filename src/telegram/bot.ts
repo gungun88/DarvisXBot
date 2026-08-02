@@ -365,7 +365,7 @@ export function createBot(config: AppConfig) {
   });
 
   bot.callbackQuery(/^auto_reply:/, async (ctx) => {
-    await handleAutoReplyCallback(ctx);
+    await handleAutoReplyCallback(ctx, config);
   });
 
   bot.callbackQuery(/^new_member_limit:/, async (ctx) => {
@@ -439,6 +439,11 @@ async function handleStartCommand(ctx: Context, config: AppConfig) {
   const locale = await getLocale(ctx);
   if (ctx.from) clearUserInputState(ctx.from.id);
   const payload = extractStartPayload(ctx);
+  if (payload === "_CommandHelp") {
+    await ctx.reply(commandHelpText(locale), { parse_mode: "HTML" });
+    return;
+  }
+
   const targetTelegramChatId = payload ? parseStartChatPayload(payload) : null;
 
   if (targetTelegramChatId && ctx.from) {
@@ -527,6 +532,13 @@ function parseStartChatPayload(payload: string) {
   const decoded = decodeURIComponent(payload.trim());
   const match = decoded.match(/^(-?\d+)_home$/);
   return match?.[1] ? BigInt(match[1]) : null;
+}
+
+function commandHelpText(locale: Locale) {
+  const lines = botCommands.map((item) => `/${item.command} - ${escapeHtml(item.description)}`);
+  return locale === "zh-CN"
+    ? ["<b>命令帮助</b>", "", ...lines].join("\n")
+    : ["<b>Command help</b>", "", ...lines].join("\n");
 }
 
 async function handleBotAddedToChat(ctx: Context, config: AppConfig) {
@@ -1178,25 +1190,19 @@ function autoDeleteKeyboard(chatId: string, settings: AutoDeleteSettings, locale
 function autoReplyKeyboard(chatId: string, settings: AutoReplySettings, locale: Locale) {
   return new InlineKeyboard()
     .text(locale === "zh-CN" ? "状态:" : "Status:", `auto_reply:noop:${chatId}`)
-    .text(settings.enabled ? "✅开启" : "开启", `auto_reply:toggle:${chatId}:on`)
+    .text(settings.enabled ? "✅启用" : "启用", `auto_reply:toggle:${chatId}:on`)
     .text(!settings.enabled ? "✅关闭" : "关闭", `auto_reply:toggle:${chatId}:off`)
     .row()
-    .text(locale === "zh-CN" ? "删除消息(分钟)⬇️" : "Delete reply (minutes) ⬇️", `auto_reply:noop:${chatId}`)
+    .text(locale === "zh-CN" ? "删除消息(分钟) ⤵︎" : "Delete reply (minutes) ⤵︎", `auto_reply:noop:${chatId}`)
     .row()
     .text(settings.deleteAfterMinutes === 0 ? "✅否" : "否", `auto_reply:delete_after:${chatId}:0`)
     .text(settings.deleteAfterMinutes === 1 ? "✅1" : "1", `auto_reply:delete_after:${chatId}:1`)
     .text(settings.deleteAfterMinutes === 5 ? "✅5" : "5", `auto_reply:delete_after:${chatId}:5`)
     .text(settings.deleteAfterMinutes === 10 ? "✅10" : "10", `auto_reply:delete_after:${chatId}:10`)
+    .text(settings.deleteAfterMinutes === 30 ? "✅30" : "30", `auto_reply:delete_after:${chatId}:30`)
     .row()
-    .text(
-      settings.deletePreviousMessage
-        ? (locale === "zh-CN" ? "✅删除上一条" : "✅Delete previous")
-        : (locale === "zh-CN" ? "删除上一条" : "Delete previous"),
-      `auto_reply:delete_previous:${chatId}:${settings.deletePreviousMessage ? "off" : "on"}`
-    )
-    .row()
-    .text(locale === "zh-CN" ? "📌关键词列表" : "📌Keyword list", `auto_reply:delete:${chatId}`)
     .text(locale === "zh-CN" ? "✍ 添加" : "✍ Add", `auto_reply:add:${chatId}`)
+    .text(locale === "zh-CN" ? "🗑 删除" : "🗑 Delete", `auto_reply:delete:${chatId}`)
     .row()
     .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `menu:chat:group:${chatId}`);
 }
@@ -3373,7 +3379,7 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
 
   if (feature === "auto_reply") {
     const settings = await getAutoReplySettings(chatId);
-    await editOrReply(ctx, autoReplyText(settings, locale), autoReplyKeyboard(chatId, settings, locale));
+    await editOrReply(ctx, autoReplyText(settings, locale, config.botUsername), autoReplyKeyboard(chatId, settings, locale));
     return;
   }
 
@@ -3655,7 +3661,7 @@ async function handleAutoDeleteCallback(ctx: Context) {
   await editOrReply(ctx, autoDeleteText(settings, locale), autoDeleteKeyboard(chatId, settings, locale));
 }
 
-async function handleAutoReplyCallback(ctx: Context) {
+async function handleAutoReplyCallback(ctx: Context, config: AppConfig) {
   await ctx.answerCallbackQuery().catch(() => undefined);
   const data = ctx.callbackQuery?.data;
   if (!data) return;
@@ -3668,7 +3674,7 @@ async function handleAutoReplyCallback(ctx: Context) {
 
   if (action === "cancel") {
     if (ctx.from) autoReplyInputDrafts.delete(ctx.from.id);
-    await editOrReply(ctx, autoReplyText(settings, locale), autoReplyKeyboard(chatId, settings, locale));
+    await editOrReply(ctx, autoReplyText(settings, locale, config.botUsername), autoReplyKeyboard(chatId, settings, locale));
     return;
   }
 
@@ -3677,21 +3683,21 @@ async function handleAutoReplyCallback(ctx: Context) {
   if (action === "toggle") {
     settings.enabled = value !== "off";
     await saveAutoReplySettings(chatId, settings);
-    await editOrReply(ctx, autoReplyText(settings, locale), autoReplyKeyboard(chatId, settings, locale));
+    await editOrReply(ctx, autoReplyText(settings, locale, config.botUsername), autoReplyKeyboard(chatId, settings, locale));
     return;
   }
 
   if (action === "delete_after") {
     settings.deleteAfterMinutes = clampNumber(Number(value ?? 0), 0, 1440);
     await saveAutoReplySettings(chatId, settings);
-    await editOrReply(ctx, autoReplyText(settings, locale), autoReplyKeyboard(chatId, settings, locale));
+    await editOrReply(ctx, autoReplyText(settings, locale, config.botUsername), autoReplyKeyboard(chatId, settings, locale));
     return;
   }
 
   if (action === "delete_previous") {
     settings.deletePreviousMessage = value === "on";
     await saveAutoReplySettings(chatId, settings);
-    await editOrReply(ctx, autoReplyText(settings, locale), autoReplyKeyboard(chatId, settings, locale));
+    await editOrReply(ctx, autoReplyText(settings, locale, config.botUsername), autoReplyKeyboard(chatId, settings, locale));
     return;
   }
 
@@ -3725,7 +3731,7 @@ async function handleAutoReplyCallback(ctx: Context) {
   if (action === "delete_rule" && value) {
     settings.rules = settings.rules.filter((rule) => rule.id !== value);
     await saveAutoReplySettings(chatId, settings);
-    await editOrReply(ctx, autoReplyText(settings, locale), autoReplyKeyboard(chatId, settings, locale));
+    await editOrReply(ctx, autoReplyText(settings, locale, config.botUsername), autoReplyKeyboard(chatId, settings, locale));
   }
 }
 
@@ -4617,12 +4623,32 @@ function autoDeleteText(settings: AutoDeleteSettings, locale: Locale) {
     : `<b>🧹 Auto delete</b>\nStatus: ${onOff(settings.enabled)}\nDelay: ${settings.seconds}s`;
 }
 
-function autoReplyText(settings: AutoReplySettings, locale: Locale) {
+function autoReplyText(settings: AutoReplySettings, locale: Locale, botUsername: string) {
+  const username = encodeURIComponent(botUsername.replace(/^@/, ""));
+  const commandHelpUrl = `https://t.me/${username}?start=_CommandHelp`;
+  const rules = settings.rules.length
+    ? settings.rules.map((rule) => `${rule.matchType === "exact" ? "-" : "*"} ${escapeHtml(rule.keyword)}`)
+    : [locale === "zh-CN" ? "[空]" : "[None]"];
+
   if (locale !== "zh-CN") {
-    return `💬 Keyword replies <b>Configured:</b> ${settings.rules.length}`;
+    return [
+      `💬 Keyword replies  [<a href="${commandHelpUrl}">❔Command help</a>]`,
+      "",
+      "<strong>Added keywords:</strong>",
+      ...rules,
+      "- exact match",
+      "* contains match"
+    ].join("\n");
   }
 
-  return `💬 关键词回复 <b>已设置:</b> ${settings.rules.length} 条`;
+  return [
+    `💬 关键词回复  [<a href="${commandHelpUrl}">❔命令帮助</a>]`,
+    "",
+    "<strong>已添加的关键词:</strong>",
+    ...rules,
+    "- 表示精准触发",
+    " * 表示包含触发"
+  ].join("\n");
 }
 
 function autoReplyDeleteText(settings: AutoReplySettings, locale: Locale) {
