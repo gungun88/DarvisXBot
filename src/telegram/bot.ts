@@ -110,6 +110,7 @@ type AutoReplyRule = {
 type AutoReplySettings = {
   enabled: boolean;
   deleteAfterMinutes: number;
+  deletePreviousMessage: boolean;
   rules: AutoReplyRule[];
 };
 
@@ -204,6 +205,7 @@ const defaultAutoDeleteSettings: AutoDeleteSettings = {
 const defaultAutoReplySettings: AutoReplySettings = {
   enabled: true,
   deleteAfterMinutes: 0,
+  deletePreviousMessage: true,
   rules: []
 };
 
@@ -1158,19 +1160,26 @@ function autoDeleteKeyboard(chatId: string, settings: AutoDeleteSettings, locale
 function autoReplyKeyboard(chatId: string, settings: AutoReplySettings, locale: Locale) {
   return new InlineKeyboard()
     .text(locale === "zh-CN" ? "状态:" : "Status:", `auto_reply:noop:${chatId}`)
-    .text(settings.enabled ? "✅启用" : "启用", `auto_reply:toggle:${chatId}:on`)
+    .text(settings.enabled ? "✅开启" : "开启", `auto_reply:toggle:${chatId}:on`)
     .text(!settings.enabled ? "✅关闭" : "关闭", `auto_reply:toggle:${chatId}:off`)
     .row()
-    .text(locale === "zh-CN" ? "删除消息(分钟) ⤵︎" : "Delete reply (minutes) ⤵︎", `auto_reply:noop:${chatId}`)
+    .text(locale === "zh-CN" ? "删除消息(分钟)⬇️" : "Delete reply (minutes) ⬇️", `auto_reply:noop:${chatId}`)
     .row()
     .text(settings.deleteAfterMinutes === 0 ? "✅否" : "否", `auto_reply:delete_after:${chatId}:0`)
     .text(settings.deleteAfterMinutes === 1 ? "✅1" : "1", `auto_reply:delete_after:${chatId}:1`)
     .text(settings.deleteAfterMinutes === 5 ? "✅5" : "5", `auto_reply:delete_after:${chatId}:5`)
     .text(settings.deleteAfterMinutes === 10 ? "✅10" : "10", `auto_reply:delete_after:${chatId}:10`)
-    .text(settings.deleteAfterMinutes === 30 ? "✅30" : "30", `auto_reply:delete_after:${chatId}:30`)
     .row()
+    .text(
+      settings.deletePreviousMessage
+        ? (locale === "zh-CN" ? "✅删除上一条" : "✅Delete previous")
+        : (locale === "zh-CN" ? "删除上一条" : "Delete previous"),
+      `auto_reply:delete_previous:${chatId}:${settings.deletePreviousMessage ? "off" : "on"}`
+    )
+    .row()
+    .text(locale === "zh-CN" ? "📌关键词列表" : "📌Keyword list", `auto_reply:delete:${chatId}`)
     .text(locale === "zh-CN" ? "✍ 添加" : "✍ Add", `auto_reply:add:${chatId}`)
-    .text(locale === "zh-CN" ? "🗑 删除" : "🗑 Delete", `auto_reply:delete:${chatId}`)
+    .row()
     .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `menu:chat:group:${chatId}`);
 }
 
@@ -3524,6 +3533,13 @@ async function handleAutoReplyCallback(ctx: Context) {
     return;
   }
 
+  if (action === "delete_previous") {
+    settings.deletePreviousMessage = value === "on";
+    await saveAutoReplySettings(chatId, settings);
+    await editOrReply(ctx, autoReplyText(settings, locale), autoReplyKeyboard(chatId, settings, locale));
+    return;
+  }
+
   if (action === "add") {
     if (!ctx.from) return;
     clearUserInputState(ctx.from.id);
@@ -4037,6 +4053,9 @@ async function getAutoReplySettings(chatId: string) {
     ...defaultAutoReplySettings,
     enabled: typeof raw.enabled === "boolean" ? raw.enabled : defaultAutoReplySettings.enabled,
     deleteAfterMinutes: clampNumber(Number(raw.deleteAfterMinutes ?? defaultAutoReplySettings.deleteAfterMinutes), 0, 1440),
+    deletePreviousMessage: typeof raw.deletePreviousMessage === "boolean"
+      ? raw.deletePreviousMessage
+      : defaultAutoReplySettings.deletePreviousMessage,
     rules
   } as AutoReplySettings;
 }
@@ -4045,6 +4064,7 @@ async function saveAutoReplySettings(chatId: string, settings: AutoReplySettings
   await saveSetting(chatId, "auto_reply", settingsToJson({
     enabled: settings.enabled,
     deleteAfterMinutes: settings.deleteAfterMinutes,
+    deletePreviousMessage: settings.deletePreviousMessage,
     rules: settings.rules
   }));
 }
@@ -4181,6 +4201,9 @@ async function maybeSendAutoReply(ctx: Context, chatId: string, message: Message
   const sent = await ctx.reply(rule.response, {
     reply_to_message_id: message.message_id
   }).catch(() => null);
+  if (sent && settings.deletePreviousMessage) {
+    await ctx.api.deleteMessage(ctx.chat.id, message.message_id).catch(() => undefined);
+  }
   if (sent && settings.deleteAfterMinutes > 0) {
     setTimeout(() => {
       void ctx.api.deleteMessage(ctx.chat!.id, sent.message_id).catch(() => undefined);
@@ -4319,28 +4342,18 @@ function autoDeleteText(settings: AutoDeleteSettings, locale: Locale) {
 }
 
 function autoReplyText(settings: AutoReplySettings, locale: Locale) {
-  const rules = settings.rules.length
-    ? settings.rules.map((rule) => `${rule.matchType === "exact" ? "-" : "*"} ${escapeHtml(rule.keyword)}`)
-    : ["[空]"];
-
   if (locale !== "zh-CN") {
     return [
       "💬 Keyword replies",
       "",
-      "<b>Added keywords:</b>",
-      ...rules,
-      "- exact match",
-      "* contains match"
+      `<b>Configured:</b> ${settings.rules.length}`
     ].join("\n");
   }
 
   return [
     "💬 关键词回复",
     "",
-    "<b>已添加的关键词:</b>",
-    ...rules,
-    "- 表示精准触发",
-    " * 表示包含触发"
+    `<b>已设置:</b> ${settings.rules.length} 条`
   ].join("\n");
 }
 
