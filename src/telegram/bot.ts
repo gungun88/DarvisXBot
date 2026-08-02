@@ -4343,18 +4343,10 @@ function autoDeleteText(settings: AutoDeleteSettings, locale: Locale) {
 
 function autoReplyText(settings: AutoReplySettings, locale: Locale) {
   if (locale !== "zh-CN") {
-    return [
-      "💬 Keyword replies",
-      "",
-      `<b>Configured:</b> ${settings.rules.length}`
-    ].join("\n");
+    return `💬 Keyword replies <b>Configured:</b> ${settings.rules.length}`;
   }
 
-  return [
-    "💬 关键词回复",
-    "",
-    `<b>已设置:</b> ${settings.rules.length} 条`
-  ].join("\n");
+  return `💬 关键词回复 <b>已设置:</b> ${settings.rules.length} 条`;
 }
 
 function autoReplyDeleteText(settings: AutoReplySettings, locale: Locale) {
