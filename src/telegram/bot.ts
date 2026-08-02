@@ -1,6 +1,6 @@
-import { Bot, InlineKeyboard } from "grammy";
+import { Bot, InlineKeyboard, InputFile } from "grammy";
 import type { Context } from "grammy";
-import type { Chat, ChatInviteLink, ChatJoinRequest, InlineKeyboardMarkup, InlineQueryResult, Message, User } from "grammy/types";
+import type { Chat, ChatInviteLink, ChatJoinRequest, ChatPermissions, InlineKeyboardMarkup, InlineQueryResult, Message, User } from "grammy/types";
 import {
   ChatStatsEventType,
   ChatStatus,
@@ -26,7 +26,14 @@ import {
   deactivateTelegramChat,
   listManagedChats
 } from "../chats/chat.service.js";
-import { getBotPermissionReport, isUserChatAdmin } from "./permissions.js";
+import {
+  canConfigureChat,
+  getBotPermissionReport,
+  getControlPermissionMode,
+  isControlPermissionMode,
+  isUserChatAdmin,
+  setControlPermissionMode
+} from "./permissions.js";
 import {
   cancelScheduledMessageJob,
   clampIntervalMinutes,
@@ -67,20 +74,49 @@ import {
   openOpenCloseMenu,
   rememberSelectedOpenCloseChat
 } from "./open-close.js";
+import {
+  createJoinVerificationChallenge,
+  isJoinVerifyMode,
+  type JoinVerificationChallenge,
+  type JoinVerifyMode
+} from "./join-verification.js";
 
 type Locale = "zh-CN" | "en";
 
 type SettingRecord = Record<string, unknown>;
 
+type ControlPermissionMode = "all_admins" | "can_promote_members" | "creator" | "can_restrict_members";
+
+const controlPermissionCallbackTokens: Record<ControlPermissionMode, string> = {
+  all_admins: "all",
+  can_promote_members: "promote",
+  creator: "creator",
+  can_restrict_members: "restrict"
+};
+
+function controlPermissionModeFromCallbackToken(value: string | undefined): ControlPermissionMode | undefined {
+  if (value === "all") return "all_admins";
+  if (value === "promote") return "can_promote_members";
+  if (value === "creator") return "creator";
+  if (value === "restrict") return "can_restrict_members";
+  return undefined;
+}
+
 type WelcomeSettings = {
   enabled: boolean;
   text: string;
   deleteAfterMinutes: number;
+  mediaKind: PublishMediaKind | undefined;
+  mediaFileId: string | undefined;
+  buttonText: string;
+  buttonUrl: string;
+  lastMessageIds: number[];
 };
 
 type JoinVerifySettings = {
   enabled: boolean;
   adminApproval: boolean;
+  mode: JoinVerifyMode;
   durationMinutes: number;
   punishment: "kick" | "ban" | "mute";
 };
@@ -93,6 +129,21 @@ type BlocklistSettings = {
   flashWindowSeconds: number;
   raidWindowSeconds: number;
   raidJoinThreshold: number;
+};
+
+type InviteLinkSettings = {
+  enabled: boolean;
+  notify: boolean;
+  createsJoinRequest: boolean;
+  expireSeconds: number;
+  memberLimit: number;
+};
+
+type InviteLinkInputField = "expireDays" | "memberLimit";
+
+type InviteLinkInputDraft = {
+  chatId: string;
+  field: InviteLinkInputField;
 };
 
 type AutoDeleteSettings = {
@@ -124,11 +175,39 @@ type AutoReplySettings = {
   rules: AutoReplyRule[];
 };
 
+type MemberStatsSnapshot = {
+  date: string;
+  count: number;
+  collectedAt: string;
+};
+
+type MemberStatsSettings = {
+  enabled: boolean;
+  lastCollectedDate: string | undefined;
+  lastCount: number | undefined;
+  snapshots: MemberStatsSnapshot[];
+};
+
 type PendingVerification = {
   chatId: number;
   userId: number;
   messageId: number;
   timeout: NodeJS.Timeout;
+  answer?: string;
+};
+
+type TelegramApi = Context["api"];
+
+type StoredJoinVerification = {
+  id: string;
+  chatId: string;
+  telegramChatId: bigint;
+  telegramUserId: bigint;
+  messageId: number;
+  mode: string;
+  answer: string;
+  punishment: JoinVerifySettings["punishment"];
+  expiresAt: Date;
 };
 
 type PublishMediaKind = "photo" | "video" | "animation" | "sticker";
@@ -163,6 +242,13 @@ type AutoReplyInputDraft = {
   buttons?: AutoReplyButton[][];
 };
 
+type WelcomeInputField = "text" | "media" | "button";
+
+type WelcomeInputDraft = {
+  chatId: string;
+  field: WelcomeInputField;
+};
+
 type ScheduledMessageListItem = {
   id: string;
   content: Prisma.JsonValue;
@@ -193,17 +279,26 @@ const botCommands = [
   { command: "permissions", description: "检查 Bot 权限" }
 ] as const;
 
+const legacyDefaultWelcomeText = "欢迎 {name} 加入 {chat}！";
+const defaultWelcomeText = "👏 欢迎 {MENTION} 加入本群";
+
 const defaultWelcomeSettings: WelcomeSettings = {
   enabled: false,
-  text: "欢迎 {name} 加入 {chat}！",
-  deleteAfterMinutes: 0
+  text: defaultWelcomeText,
+  deleteAfterMinutes: 0,
+  mediaKind: undefined,
+  mediaFileId: undefined,
+  buttonText: "",
+  buttonUrl: "",
+  lastMessageIds: []
 };
 
 const defaultJoinVerifySettings: JoinVerifySettings = {
   enabled: false,
   adminApproval: false,
-  durationMinutes: 5,
-  punishment: "kick"
+  mode: "button",
+  durationMinutes: 1,
+  punishment: "mute"
 };
 
 const defaultBlocklistSettings: BlocklistSettings = {
@@ -214,6 +309,14 @@ const defaultBlocklistSettings: BlocklistSettings = {
   flashWindowSeconds: 120,
   raidWindowSeconds: 60,
   raidJoinThreshold: 10
+};
+
+const defaultInviteLinkSettings: InviteLinkSettings = {
+  enabled: false,
+  notify: false,
+  createsJoinRequest: false,
+  expireSeconds: 0,
+  memberLimit: 0
 };
 
 const defaultAutoDeleteSettings: AutoDeleteSettings = {
@@ -228,6 +331,13 @@ const defaultAutoReplySettings: AutoReplySettings = {
   rules: []
 };
 
+const defaultMemberStatsSettings: MemberStatsSettings = {
+  enabled: false,
+  lastCollectedDate: undefined,
+  lastCount: undefined,
+  snapshots: []
+};
+
 const pendingVerifications = new Map<string, PendingVerification>();
 const recentJoins = new Map<string, number>();
 const raidJoinEvents = new Map<string, number[]>();
@@ -236,6 +346,8 @@ const publishDrafts = new Map<number, PublishDraft>();
 const scheduledInputDrafts = new Map<number, ScheduledInputDraft>();
 const autoReplyInputDrafts = new Map<number, AutoReplyInputDraft>();
 const autoReplySelectedChats = new Map<number, string>();
+const welcomeInputDrafts = new Map<number, WelcomeInputDraft>();
+const inviteLinkInputDrafts = new Map<number, InviteLinkInputDraft>();
 
 function rememberSelectedChatForModules(userId: number | undefined, chatId: string) {
   if (typeof userId !== "number") return;
@@ -281,7 +393,7 @@ export function createBot(config: AppConfig) {
     await ctx.reply(
       [
         "<b>粗体</b>、<i>斜体</i>、<code>代码</code> 可以用于欢迎语和发布内容。",
-        "可用变量：<code>{name}</code>、<code>{username}</code>、<code>{chat}</code>。"
+        "可用变量：<code>{NAME}</code>、<code>{MENTION}</code>、<code>{GROUPNAME}</code>。"
       ].join("\n"),
       { parse_mode: "HTML" }
     );
@@ -351,6 +463,18 @@ export function createBot(config: AppConfig) {
     await handleChatFeatureCallback(ctx, config);
   });
 
+  bot.callbackQuery(/^invite:/, async (ctx) => {
+    await handleInviteLinkCallback(ctx);
+  });
+
+  bot.callbackQuery(/^group_stats:/, async (ctx) => {
+    await handleGroupStatsCallback(ctx);
+  });
+
+  bot.callbackQuery(/^member_stats:/, async (ctx) => {
+    await handleMemberStatsCallback(ctx);
+  });
+
   bot.callbackQuery(/^blocklist:/, async (ctx) => {
     await handleBlocklistCallback(ctx);
   });
@@ -361,6 +485,10 @@ export function createBot(config: AppConfig) {
 
   bot.callbackQuery(/^join_verify:/, async (ctx) => {
     await handleJoinVerifyCallback(ctx);
+  });
+
+  bot.callbackQuery(/^control_permissions:/, async (ctx) => {
+    await handleControlPermissionsCallback(ctx);
   });
 
   bot.callbackQuery(/^auto_delete:/, async (ctx) => {
@@ -402,6 +530,8 @@ export function createBot(config: AppConfig) {
   bot.on("message", async (ctx) => {
     const locale = await getLocale(ctx);
     if (await handleAutoReplyInputMessage(ctx, locale)) return;
+    if (await handleWelcomeInputMessage(ctx, locale)) return;
+    if (await handleInviteLinkInputMessage(ctx, locale)) return;
     if (await handleTimezoneInputMessage(ctx, config, locale)) return;
     if (await handleScheduledInputMessage(ctx, locale)) return;
     if (await handlePublishInputMessage(ctx, locale)) return;
@@ -409,7 +539,6 @@ export function createBot(config: AppConfig) {
     if (await handleOpenClosePrivateMessage(ctx, config, locale)) return;
     if (await handleOpenCloseGroupMessage(ctx)) return;
     if (await handleAdultCheckMessage(ctx, locale)) return;
-    await handleNewMemberLimitNewChatMembers(ctx);
     await handleIncomingMessage(ctx, config);
   });
 
@@ -429,6 +558,7 @@ export function createBot(config: AppConfig) {
     }
   });
 
+  void recoverPendingJoinVerifications(bot.api);
   return bot;
 }
 
@@ -518,6 +648,8 @@ function clearUserInputState(userId: number) {
   timezoneInputUsers.delete(userId);
   scheduledInputDrafts.delete(userId);
   autoReplyInputDrafts.delete(userId);
+  welcomeInputDrafts.delete(userId);
+  inviteLinkInputDrafts.delete(userId);
   const publishDraft = publishDrafts.get(userId);
   if (publishDraft) publishDraft.waitingFor = undefined;
 }
@@ -1163,19 +1295,185 @@ function blocklistKeyboard(chatId: string, settings: BlocklistSettings, locale: 
     .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `menu:chat:group:${chatId}`);
 }
 
-function welcomeKeyboard(chatId: string, settings: WelcomeSettings, locale: Locale) {
+function inviteLinkKeyboard(chatId: string, settings: InviteLinkSettings, locale: Locale) {
+  const selected = (active: boolean, label: string) => active ? `✅${label}` : label;
+  const labels = locale === "zh-CN"
+    ? {
+        status: "状态:",
+        notify: "邀请提醒:",
+        approval: "链接审核：",
+        on: "开启",
+        off: "关闭",
+        expire: "🔧链接过期时间",
+        limit: "🔧最大邀请人数",
+        export: "🖨导出",
+        clear: "🗑清空数据",
+        reset: "🧹重置链接",
+        home: "🏠返回首页"
+      }
+    : {
+        status: "Status:",
+        notify: "Invite notice:",
+        approval: "Link approval:",
+        on: "On",
+        off: "Off",
+        expire: "🔧Link expiration",
+        limit: "🔧Member limit",
+        export: "🖨Export",
+        clear: "🗑Clear data",
+        reset: "🧹Reset links",
+        home: "🏠Home"
+      };
+
   return new InlineKeyboard()
-    .text(settings.enabled ? "✅ On" : "⬜ Off", `welcome:toggle:${chatId}`)
+    .text(labels.status, `invite:noop:${chatId}`)
+    .text(selected(settings.enabled, labels.on), `invite:status:${chatId}:on`)
+    .text(selected(!settings.enabled, labels.off), `invite:status:${chatId}:off`)
     .row()
-    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `menu:chat:group:${chatId}`);
+    .text(labels.notify, `invite:noop:${chatId}`)
+    .text(selected(settings.notify, labels.on), `invite:notify:${chatId}:on`)
+    .text(selected(!settings.notify, labels.off), `invite:notify:${chatId}:off`)
+    .row()
+    .text(labels.approval, `invite:noop:${chatId}`)
+    .text(selected(settings.createsJoinRequest, labels.on), `invite:approval:${chatId}:on`)
+    .text(selected(!settings.createsJoinRequest, labels.off), `invite:approval:${chatId}:off`)
+    .row()
+    .text(`${labels.expire}（${formatInviteExpire(settings.expireSeconds, locale)}）`, `invite:expire:${chatId}`)
+    .row()
+    .text(`${labels.limit}（${settings.memberLimit || (locale === "zh-CN" ? "无限制" : "Unlimited")}）`, `invite:limit:${chatId}`)
+    .row()
+    .text(labels.export, `invite:export:${chatId}`)
+    .text(labels.clear, `invite:clear:${chatId}`)
+    .row()
+    .text(labels.reset, `invite:reset:${chatId}`)
+    .row()
+    .text(labels.home, "menu:home");
+}
+
+function welcomeKeyboard(chatId: string, settings: WelcomeSettings, locale: Locale) {
+  const selected = (active: boolean, label: string) => active ? `✅${label}` : label;
+  const labels = locale === "zh-CN"
+    ? {
+        status: "状态:",
+        on: "开启",
+        off: "关闭",
+        deleteAfter: "删除消息(分钟)⬇️",
+        no: "否",
+        deleteLast: "删除上一条",
+        preview: "👀预览消息",
+        editText: "📃修改文本",
+        editMedia: "📷修改媒体",
+        editButton: "🔠修改按钮",
+        back: "🔙返回"
+      }
+    : {
+        status: "Status:",
+        on: "On",
+        off: "Off",
+        deleteAfter: "Delete message (minutes)⬇️",
+        no: "No",
+        deleteLast: "Delete previous",
+        preview: "👀 Preview",
+        editText: "📃 Edit text",
+        editMedia: "📷 Edit media",
+        editButton: "🔠 Edit button",
+        back: "🔙 Back"
+      };
+
+  return new InlineKeyboard()
+    .text(labels.status, `welcome:noop:${chatId}`)
+    .text(selected(settings.enabled, labels.on), `welcome:status:${chatId}:on`)
+    .text(selected(!settings.enabled, labels.off), `welcome:status:${chatId}:off`)
+    .row()
+    .text(labels.deleteAfter, `welcome:noop:${chatId}`)
+    .row()
+    .text(selected(settings.deleteAfterMinutes === 0, labels.no), `welcome:delete_after:${chatId}:0`)
+    .text(selected(settings.deleteAfterMinutes === 1, "1"), `welcome:delete_after:${chatId}:1`)
+    .text(selected(settings.deleteAfterMinutes === 5, "5"), `welcome:delete_after:${chatId}:5`)
+    .text(selected(settings.deleteAfterMinutes === 10, "10"), `welcome:delete_after:${chatId}:10`)
+    .row()
+    .text(labels.deleteLast, `welcome:delete_last:${chatId}`)
+    .row()
+    .text(labels.preview, `welcome:preview:${chatId}`)
+    .row()
+    .text(labels.editText, `welcome:edit:${chatId}:text`)
+    .text(labels.editMedia, `welcome:edit:${chatId}:media`)
+    .row()
+    .text(labels.editButton, `welcome:edit:${chatId}:button`)
+    .row()
+    .text(labels.back, `menu:chat:group:${chatId}`);
+}
+
+function welcomeInputKeyboard(chatId: string, _field: WelcomeInputField, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `chat_feature:welcome:${chatId}`);
+}
+
+function welcomeSavedKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `chat_feature:welcome:${chatId}`);
 }
 
 function joinVerifyKeyboard(chatId: string, settings: JoinVerifySettings, locale: Locale) {
+  const selected = (active: boolean, label: string) => active ? `✅${label}` : label;
+  const text = locale === "zh-CN"
+    ? {
+        status: "状态:",
+        on: "开启",
+        off: "关闭",
+        approval: "管理员审批:",
+        mode: "模式:",
+        button: "按钮",
+        math: "数学题",
+        captcha: "数字验证码",
+        emoji: "Emoji识别",
+        duration: "验证时长:",
+        mute: "禁言",
+        kick: "踢出",
+        punishment: "超时惩罚:",
+        back: "🔙 返回"
+      }
+    : {
+        status: "Status:",
+        on: "On",
+        off: "Off",
+        approval: "Admin approval:",
+        mode: "Mode:",
+        button: "Button",
+        math: "Math",
+        captcha: "Number captcha",
+        emoji: "Emoji",
+        duration: "Duration:",
+        mute: "Mute",
+        kick: "Kick",
+        punishment: "Timeout:",
+        back: "🔙 Back"
+      };
+
   return new InlineKeyboard()
-    .text(settings.enabled ? "✅ On" : "⬜ Off", `join_verify:toggle:${chatId}`)
-    .text(settings.adminApproval ? "✅ Admin approval" : "⬜ Admin approval", `join_verify:approval:${chatId}`)
+    .text(text.status, `join_verify:noop:${chatId}`)
+    .text(selected(settings.enabled, text.on), `join_verify:status:on:${chatId}`)
+    .text(selected(!settings.enabled, text.off), `join_verify:status:off:${chatId}`)
     .row()
-    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `menu:chat:group:${chatId}`);
+    .text(text.approval, `join_verify:noop:${chatId}`)
+    .text(selected(settings.adminApproval, text.on), `join_verify:approval:on:${chatId}`)
+    .text(selected(!settings.adminApproval, text.off), `join_verify:approval:off:${chatId}`)
+    .row()
+    .text(text.mode, `join_verify:noop:${chatId}`)
+    .text(selected(settings.mode === "button", text.button), `join_verify:mode:button:${chatId}`)
+    .text(selected(settings.mode === "math", text.math), `join_verify:mode:math:${chatId}`)
+    .text(selected(settings.mode === "captcha", text.captcha), `join_verify:mode:captcha:${chatId}`)
+    .row()
+    .text(selected(settings.mode === "emoji", text.emoji), `join_verify:mode:emoji:${chatId}`)
+    .row()
+    .text(text.duration, `join_verify:noop:${chatId}`)
+    .text(selected(settings.durationMinutes === 1, locale === "zh-CN" ? "1分钟" : "1m"), `join_verify:duration:1:${chatId}`)
+    .text(selected(settings.durationMinutes === 5, locale === "zh-CN" ? "5分钟" : "5m"), `join_verify:duration:5:${chatId}`)
+    .text(selected(settings.durationMinutes === 10, locale === "zh-CN" ? "10分钟" : "10m"), `join_verify:duration:10:${chatId}`)
+    .row()
+    .text(text.punishment, `join_verify:noop:${chatId}`)
+    .text(selected(settings.punishment === "mute", text.mute), `join_verify:punishment:mute:${chatId}`)
+    .text(selected(settings.punishment === "kick", text.kick), `join_verify:punishment:kick:${chatId}`)
+    .row()
+    .text(text.back, `menu:chat:group:${chatId}`);
 }
 
 function autoDeleteKeyboard(chatId: string, settings: AutoDeleteSettings, locale: Locale) {
@@ -1224,7 +1522,7 @@ function autoReplyCancelKeyboard(_chatId: string, locale: Locale) {
 }
 
 function autoReplyDoneKeyboard(chatId: string, locale: Locale) {
-  return new InlineKeyboard().text(locale === "zh-CN" ? "\u{1F519} \u8FD4\u56DE" : "\u{1F519} Back", `chat_feature:auto_reply:${chatId}`);
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `chat_feature:auto_reply:${chatId}`);
 }
 
 function autoReplyButtonsKeyboard(_chatId: string, locale: Locale) {
@@ -1238,6 +1536,68 @@ function autoReplyTriggerKeyboard(_chatId: string, locale: Locale) {
   return new InlineKeyboard()
     .text(locale === "zh-CN" ? "包含触发" : "Contains", "auto_reply:trigger:contains")
     .text(locale === "zh-CN" ? "精准触发" : "Exact", "auto_reply:trigger:exact");
+}
+
+function groupStatsKeyboard(chatId: string, locale: Locale) {
+  if (locale !== "zh-CN") {
+    return new InlineKeyboard()
+      .text("🔽 Message stats 🔽", `group_stats:noop:${chatId}`)
+      .row()
+      .text("Today message ranking", `group_stats:speech_today_rank:${chatId}`)
+      .row()
+      .text("7-day message ranking", `group_stats:speech_7d_rank:${chatId}`)
+      .text("7-day message stats", `group_stats:speech_7d_stats:${chatId}`)
+      .row()
+      .text("Monthly message ranking", `group_stats:speech_month_rank:${chatId}`)
+      .row()
+      .text("🔽 Invite stats 🔽", `group_stats:noop:${chatId}`)
+      .row()
+      .text("Today invite ranking", `group_stats:invite_today_rank:${chatId}`)
+      .text("7-day invite stats", `group_stats:invite_7d_stats:${chatId}`)
+      .row()
+      .text("🔽 Join/leave stats 🔽", `group_stats:noop:${chatId}`)
+      .row()
+      .text("Today join/leave data", `group_stats:member_today:${chatId}`)
+      .text("7-day join/leave stats", `group_stats:member_7d:${chatId}`)
+      .row()
+      .text("🏠 Home", `menu:chat:group:${chatId}`);
+  }
+
+  return new InlineKeyboard()
+    .text("🔽发言统计🔽", `group_stats:noop:${chatId}`)
+    .row()
+    .text("今日发言排名", `group_stats:speech_today_rank:${chatId}`)
+    .row()
+    .text("7日发言排名", `group_stats:speech_7d_rank:${chatId}`)
+    .text("7日发言统计", `group_stats:speech_7d_stats:${chatId}`)
+    .row()
+    .text("月发言排名", `group_stats:speech_month_rank:${chatId}`)
+    .row()
+    .text("🔽邀请统计🔽", `group_stats:noop:${chatId}`)
+    .row()
+    .text("今日邀请排名", `group_stats:invite_today_rank:${chatId}`)
+    .text("7日邀请统计", `group_stats:invite_7d_stats:${chatId}`)
+    .row()
+    .text("🔽进退群统计🔽", `group_stats:noop:${chatId}`)
+    .row()
+    .text("今日进退群数据", `group_stats:member_today:${chatId}`)
+    .text("7日进退群统计", `group_stats:member_7d:${chatId}`)
+    .row()
+    .text("🏠返回首页", `menu:chat:group:${chatId}`);
+}
+
+function memberStatsKeyboard(chat: PrismaChat, settings: MemberStatsSettings, locale: Locale) {
+  const scope = chat.type === "CHANNEL" ? "channel" : "group";
+  const labels = locale === "zh-CN"
+    ? { status: "状态:", on: "开启", off: "关闭", back: "🔙返回" }
+    : { status: "Status:", on: "On", off: "Off", back: "🔙Back" };
+
+  return new InlineKeyboard()
+    .text(labels.status, `member_stats:noop:${chat.id}`)
+    .text(settings.enabled ? `✅${labels.on}` : labels.on, `member_stats:toggle:${chat.id}:on`)
+    .text(!settings.enabled ? `✅${labels.off}` : labels.off, `member_stats:toggle:${chat.id}:off`)
+    .row()
+    .text(labels.back, `menu:chat:${scope}:${chat.id}`);
 }
 
 async function handleMenuCallback(ctx: Context, config: AppConfig) {
@@ -1437,6 +1797,18 @@ async function handleMembershipCallback(ctx: Context) {
   );
 }
 
+async function resolveScheduledCallbackChat(action: string, id: string) {
+  if (["list", "back", "add", "bulk", "bulk_on", "bulk_off", "bulk_delete_confirm", "bulk_delete"].includes(action)) {
+    return prisma.chat.findUnique({ where: { id } });
+  }
+
+  const scheduled = await prisma.scheduledMessage.findUnique({
+    where: { id },
+    include: { chat: true }
+  });
+  return scheduled?.chat ?? null;
+}
+
 async function handleScheduledCallback(ctx: Context) {
   await ctx.answerCallbackQuery().catch(() => undefined);
   const locale = await getLocale(ctx);
@@ -1445,6 +1817,10 @@ async function handleScheduledCallback(ctx: Context) {
 
   const [, action, id, value] = data.split(":");
   if (!action || !id) return;
+
+  const accessChat = await resolveScheduledCallbackChat(action, id);
+  if (!accessChat) return;
+  if (!(await ensureControlPermissionAccess(ctx, accessChat, locale))) return;
 
   if (action === "list_message") {
     const scheduled = await prisma.scheduledMessage.findUnique({
@@ -2094,10 +2470,18 @@ async function handleScheduledInputMessage(ctx: Context, locale: Locale) {
   const draft = scheduledInputDrafts.get(ctx.from.id);
   if (!draft) return false;
 
-  const scheduled = await prisma.scheduledMessage.findUnique({ where: { id: draft.scheduledMessageId } });
+  const scheduled = await prisma.scheduledMessage.findUnique({
+    where: { id: draft.scheduledMessageId },
+    include: { chat: true }
+  });
   if (!scheduled) {
     scheduledInputDrafts.delete(ctx.from.id);
     return false;
+  }
+
+  if (!(await ensureControlPermissionAccess(ctx, scheduled.chat, locale))) {
+    scheduledInputDrafts.delete(ctx.from.id);
+    return true;
   }
 
   if (draft.field === "media") {
@@ -2836,6 +3220,12 @@ async function handleAutoReplyInputMessage(ctx: Context, locale: Locale) {
   if (!ctx.from) return false;
   const draft = autoReplyInputDrafts.get(ctx.from.id);
   if (!draft) return false;
+
+  if (!(await ensureControlPermissionForChatId(ctx, draft.chatId, locale))) {
+    autoReplyInputDrafts.delete(ctx.from.id);
+    return true;
+  }
+
   if (draft.stage === "keyword") {
     const text = getMessageText(ctx.message);
     const parsed = text ? parseAutoReplyKeyword(text) : null;
@@ -3053,6 +3443,121 @@ function parseAutoReplyButton(input: string): AutoReplyButton | null {
   }
 }
 
+async function handleWelcomeInputMessage(ctx: Context, locale: Locale) {
+  if (!ctx.from || ctx.chat?.type !== "private") return false;
+  const draft = welcomeInputDrafts.get(ctx.from.id);
+  if (!draft) return false;
+
+  if (!(await ensureControlPermissionForChatId(ctx, draft.chatId, locale))) {
+    welcomeInputDrafts.delete(ctx.from.id);
+    return true;
+  }
+
+  const settings = await getWelcomeSettings(draft.chatId);
+
+  if (draft.field === "media") {
+    const media = extractPublishMedia(ctx.message);
+    if (!media) {
+      await ctx.reply(welcomeInputPromptText("media", settings, locale), {
+        parse_mode: "HTML",
+        reply_markup: welcomeInputKeyboard(draft.chatId, "media", locale)
+      });
+      return true;
+    }
+
+    settings.mediaKind = media.kind;
+    settings.mediaFileId = media.fileId;
+    welcomeInputDrafts.delete(ctx.from.id);
+    await saveWelcomeSettings(draft.chatId, settings);
+    await ctx.reply(welcomeInputSavedText(locale), {
+      parse_mode: "HTML",
+      reply_markup: welcomeSavedKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
+  const text = getMessageText(ctx.message);
+  if (!text) {
+    await ctx.reply(welcomeInputPromptText(draft.field, settings, locale), {
+      parse_mode: "HTML",
+      reply_markup: welcomeInputKeyboard(draft.chatId, draft.field, locale)
+    });
+    return true;
+  }
+
+  if (draft.field === "button") {
+    const button = parsePublishButton(text);
+    if (!button) {
+      await ctx.reply(welcomeInputPromptText("button", settings, locale), {
+        parse_mode: "HTML",
+        reply_markup: welcomeInputKeyboard(draft.chatId, "button", locale)
+      });
+      return true;
+    }
+    settings.buttonText = button.text;
+    settings.buttonUrl = button.url;
+  } else {
+    settings.text = text.slice(0, 4000);
+  }
+
+  welcomeInputDrafts.delete(ctx.from.id);
+  await saveWelcomeSettings(draft.chatId, settings);
+  await ctx.reply(welcomeInputSavedText(locale), {
+    parse_mode: "HTML",
+    reply_markup: welcomeSavedKeyboard(draft.chatId, locale)
+  });
+  return true;
+}
+
+async function handleInviteLinkInputMessage(ctx: Context, locale: Locale) {
+  if (!ctx.from || ctx.chat?.type !== "private") return false;
+  const draft = inviteLinkInputDrafts.get(ctx.from.id);
+  if (!draft) return false;
+
+  if (!(await ensureControlPermissionForChatId(ctx, draft.chatId, locale))) {
+    inviteLinkInputDrafts.delete(ctx.from.id);
+    return true;
+  }
+
+  const text = getMessageText(ctx.message);
+  const value = text ? parseNonNegativeInteger(text) : null;
+  const maxValue = draft.field === "expireDays" ? 365 : 99_999;
+
+  if (value === null || value > maxValue) {
+    const retryText = locale === "zh-CN"
+      ? `请输入 0-${maxValue} 之间的整数。`
+      : `Send an integer from 0 to ${maxValue}.`;
+    await ctx.reply(`${retryText}\n\n${inviteLinkInputPromptText(draft.field, locale)}`, {
+      parse_mode: "HTML",
+      reply_markup: inviteLinkInputKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
+  const settings = await getInviteLinkSettings(draft.chatId);
+  if (draft.field === "expireDays") {
+    settings.expireSeconds = value * 86400;
+  } else {
+    settings.memberLimit = value;
+  }
+
+  inviteLinkInputDrafts.delete(ctx.from.id);
+  await saveInviteLinkSettings(draft.chatId, settings);
+  await ctx.reply(inviteLinkInputSavedText(locale), {
+    parse_mode: "HTML",
+    reply_markup: inviteLinkSavedKeyboard(draft.chatId, locale)
+  });
+  return true;
+}
+
+function parseNonNegativeInteger(input: string) {
+  const value = input.trim();
+  if (!/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) return null;
+  return parsed;
+}
+
 function createAutoReplyRuleId() {
   return `ar${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -3074,6 +3579,10 @@ function extractPublishMedia(message: Message | undefined): { kind: PublishMedia
   if ("animation" in message && message.animation) return { kind: "animation", fileId: message.animation.file_id };
   if ("sticker" in message && message.sticker) return { kind: "sticker", fileId: message.sticker.file_id };
   return null;
+}
+
+function isPublishMediaKind(value: unknown): value is PublishMediaKind {
+  return value === "photo" || value === "video" || value === "animation" || value === "sticker";
 }
 
 function parsePublishButton(input: string) {
@@ -3412,6 +3921,19 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
     return;
   }
 
+  if (isConfigurationFeature(feature)) {
+    const allowed = await canConfigureChat(ctx, chat, ctx.from?.id ?? 0).catch(() => false);
+    if (!allowed) {
+      await ctx.answerCallbackQuery({
+        text: locale === "zh-CN"
+          ? "只有符合控制权限的管理员可以设置机器人。"
+          : "Only permitted admins can configure the bot.",
+        show_alert: true
+      }).catch(() => undefined);
+      return;
+    }
+  }
+
   rememberSelectedChatForModules(ctx.from?.id, chat.id);
 
   if (feature === "block") {
@@ -3465,9 +3987,12 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
   }
 
   if (feature === "stats") {
-    const statDate = formatDate(new Date());
-    const stats = await getStats(chat.id, statDate);
-    await editOrReply(ctx, statsText(stats, 1, locale), chatPanelKeyboard(chat.id, chat.type === "CHANNEL" ? "channel" : "group", locale));
+    await openGroupStatsPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (feature === "member_stats") {
+    await openMemberStatsPanel(ctx, locale, chat);
     return;
   }
 
@@ -3477,12 +4002,12 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
   }
 
   if (feature === "permissions") {
-    await openPermissionsPanel(ctx, locale, chat);
+    await openControlPermissionsPanel(ctx, locale, chat);
     return;
   }
 
   if (feature === "invite") {
-    await openInviteLinkPanel(ctx, config, locale, chat);
+    await openInviteLinkPanel(ctx, locale, chat);
     return;
   }
 
@@ -3496,7 +4021,7 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
     return;
   }
 
-  if (feature === "member_stats" || feature === "schedule" || feature === "night_mode" || feature === "commands" || feature === "speech_check" || feature === "banned_words" || feature === "anti_spam" || feature === "import" || feature === "members" || feature === "sync") {
+  if (feature === "schedule" || feature === "night_mode" || feature === "commands" || feature === "speech_check" || feature === "banned_words" || feature === "anti_spam" || feature === "import" || feature === "members" || feature === "sync") {
     await editOrReply(
       ctx,
       locale === "zh-CN"
@@ -3534,6 +4059,142 @@ async function handleAdultCheckCallback(ctx: Context) {
   await handleAdultCheckAction(ctx, locale, key);
 }
 
+async function handleInviteLinkCallback(ctx: Context) {
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  const locale = await getLocale(ctx);
+  const data = ctx.callbackQuery?.data;
+  if (!data) return;
+
+  const [, action, chatId, value] = data.split(":");
+  if (!action || !chatId) return;
+
+  const chat = await prisma.chat.findUnique({ where: { id: chatId } });
+  if (!chat) {
+    await editOrReply(ctx, locale === "zh-CN" ? "找不到该群组。" : "Managed group not found.", homeKeyboard(locale));
+    return;
+  }
+
+  if (!(await ensureControlPermissionAccess(ctx, chat, locale))) return;
+
+  const settings = await getInviteLinkSettings(chatId);
+
+  if (action === "status") settings.enabled = value === "on";
+  if (action === "notify") settings.notify = value === "on";
+  if (action === "approval") settings.createsJoinRequest = value === "on";
+
+  if (["status", "notify", "approval"].includes(action)) {
+    await saveInviteLinkSettings(chatId, settings);
+    await openInviteLinkPanel(ctx, locale, chat);
+    return;
+  }
+
+  if ((action === "expire" || action === "limit") && ctx.from) {
+    clearUserInputState(ctx.from.id);
+    const field: InviteLinkInputField = action === "expire" ? "expireDays" : "memberLimit";
+    inviteLinkInputDrafts.set(ctx.from.id, { chatId, field });
+    await editOrReply(ctx, inviteLinkInputPromptText(field, locale), inviteLinkInputKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "cancel" && ctx.from) {
+    inviteLinkInputDrafts.delete(ctx.from.id);
+    await openInviteLinkPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "export") {
+    await exportInviteLinkData(ctx, locale, chat);
+    await openInviteLinkPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "clear") {
+    await prisma.inviteJoin.deleteMany({ where: { chatId } });
+    await openInviteLinkPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "reset") {
+    await resetInviteLinks(ctx, chat);
+    await openInviteLinkPanel(ctx, locale, chat);
+    return;
+  }
+
+}
+
+async function handleGroupStatsCallback(ctx: Context) {
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  const locale = await getLocale(ctx);
+  const [, action, chatId] = ctx.callbackQuery?.data?.split(":") ?? [];
+  if (!action || !chatId || action === "noop") return;
+
+  const chat = await prisma.chat.findUnique({ where: { id: chatId } });
+  if (!chat) {
+    await editOrReply(ctx, locale === "zh-CN" ? "未找到这个已绑定群组。" : "That bound group was not found.", homeKeyboard(locale));
+    return;
+  }
+
+  if (action === "home") {
+    await openGroupStatsPanel(ctx, locale, chat);
+    return;
+  }
+
+  const text = await renderGroupStatsActionText(chat.id, action, locale);
+  await editOrReply(ctx, text, groupStatsKeyboard(chat.id, locale));
+}
+
+async function handleMemberStatsCallback(ctx: Context) {
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  const locale = await getLocale(ctx);
+  const [, action, chatId, value] = ctx.callbackQuery?.data?.split(":") ?? [];
+  if (!action || !chatId || action === "noop") return;
+
+  const chat = await prisma.chat.findUnique({ where: { id: chatId } });
+  if (!chat) {
+    await editOrReply(ctx, locale === "zh-CN" ? "未找到这个已绑定群组。" : "That bound group was not found.", homeKeyboard(locale));
+    return;
+  }
+
+  const allowed = await canConfigureChat(ctx, chat, ctx.from?.id ?? 0).catch(() => false);
+  if (!allowed) {
+    await ctx.answerCallbackQuery({
+      text: locale === "zh-CN"
+        ? "只有符合控制权限的管理员可以设置机器人。"
+        : "Only permitted admins can configure the bot.",
+      show_alert: true
+    }).catch(() => undefined);
+    return;
+  }
+
+  let settings = await getMemberStatsSettings(chat.id);
+  if (action === "toggle") {
+    settings.enabled = value === "on";
+    await saveMemberStatsSettings(chat.id, settings);
+    settings = await maybeRecordMemberCountSnapshot(ctx, chat, settings);
+  }
+
+  await editOrReply(ctx, memberStatsText(settings, locale), memberStatsKeyboard(chat, settings, locale));
+}
+
+async function handleControlPermissionsCallback(ctx: Context) {
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  const locale = await getLocale(ctx);
+  const parts = ctx.callbackQuery?.data?.split(":") ?? [];
+  const mode = controlPermissionModeFromCallbackToken(parts[1]);
+  const chatId = parts[2];
+  if (!chatId || !isControlPermissionMode(mode)) return;
+
+  const chat = await prisma.chat.findUnique({ where: { id: chatId } });
+  if (!chat) {
+    await editOrReply(ctx, locale === "zh-CN" ? "找不到该管理对象。" : "Managed chat not found.", homeKeyboard(locale));
+    return;
+  }
+
+  if (!(await ensureControlPermissionAccess(ctx, chat, locale))) return;
+  await setControlPermissionMode(chat.id, mode);
+  await openControlPermissionsPanel(ctx, locale, chat);
+}
+
 async function openPermissionsPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
   const scope = chat.type === "CHANNEL" ? "channel" : "group";
   const report = await getBotPermissionReport(ctx, Number(chat.telegramChatId)).catch(() => null);
@@ -3549,48 +4210,125 @@ async function openPermissionsPanel(ctx: Context, locale: Locale, chat: PrismaCh
   await editOrReply(ctx, text, chatPanelKeyboard(chat.id, scope, locale));
 }
 
-async function openInviteLinkPanel(ctx: Context, config: AppConfig, locale: Locale, chat: PrismaChat) {
-  if (!ctx.from) return;
-  const scope = chat.type === "CHANNEL" ? "channel" : "group";
-  const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
-  const invite = await ctx.api.createChatInviteLink(Number(chat.telegramChatId), {
-    name: `xd-${ctx.from.id}-${Date.now()}`.slice(0, 32)
-  }).catch(() => null);
+async function ensureControlPermissionAccess(ctx: Context, chat: PrismaChat, locale: Locale) {
+  if (!ctx.from) return false;
+  const allowed = await canConfigureChat(ctx, chat, ctx.from.id).catch(() => false);
+  if (allowed) return true;
 
-  if (!invite) {
-    await editOrReply(
-      ctx,
-      locale === "zh-CN" ? "无法创建邀请链接，请确认 Bot 拥有邀请用户权限。" : "Could not create an invite link. Check bot permissions.",
-      chatPanelKeyboard(chat.id, scope, locale)
-    );
-    return;
+  const text = locale === "zh-CN"
+    ? "只有符合控制权限的管理员可以设置机器人。"
+    : "Only permitted admins can configure the bot.";
+  if (ctx.callbackQuery) {
+    await ctx.answerCallbackQuery({ text, show_alert: true }).catch(() => undefined);
+  } else {
+    await ctx.reply(text).catch(() => undefined);
+  }
+  return false;
+}
+
+async function ensureControlPermissionForChatId(ctx: Context, chatId: string, locale: Locale) {
+  const chat = await prisma.chat.findUnique({ where: { id: chatId } });
+  if (!chat) {
+    await editOrReply(ctx, locale === "zh-CN" ? "找不到该管理对象。" : "Managed chat not found.", homeKeyboard(locale));
+    return null;
+  }
+  return await ensureControlPermissionAccess(ctx, chat, locale) ? chat : null;
+}
+
+function isConfigurationFeature(feature: string) {
+  return [
+    "permissions",
+    "block",
+    "welcome",
+    "join_verify",
+    "auto_delete",
+    "auto_reply",
+    "new_member_limit",
+    "open_close",
+    "adult_check",
+    "scheduled",
+    "invite",
+    "member_stats"
+  ].includes(feature);
+}
+
+async function openControlPermissionsPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  const scope = chat.type === "CHANNEL" ? "channel" : "group";
+  const mode = await getControlPermissionMode(chat.id);
+  const report = await getBotPermissionReport(ctx, Number(chat.telegramChatId)).catch(() => null);
+  await editOrReply(ctx, controlPermissionsText(mode, report, locale), controlPermissionsKeyboard(chat.id, scope, mode, locale));
+}
+
+function controlPermissionsText(
+  mode: ControlPermissionMode,
+  report: Awaited<ReturnType<typeof getBotPermissionReport>> | null,
+  locale: Locale
+) {
+  const title = locale === "zh-CN" ? "<b>⚙️ 控制权限</b>" : "<b>⚙️ Permissions</b>";
+  const selected = controlPermissionModeLabel(mode, locale);
+  const reportText = report
+    ? report.canManageBaseFeatures
+      ? (locale === "zh-CN" ? "Bot 权限检查通过。" : "Bot permission check passed.")
+      : `${locale === "zh-CN" ? "缺少权限：" : "Missing permissions:"}\n${report.missingPermissions.join("\n")}`
+    : (locale === "zh-CN" ? "无法读取 Bot 权限。" : "Could not read Bot permissions.");
+
+  return [
+    title,
+    "",
+    locale === "zh-CN"
+      ? "你可以指定哪些管理员能够设置机器人。"
+      : "Choose which administrators can configure the bot.",
+    "",
+    `${locale === "zh-CN" ? "当前模式：" : "Current mode:"} ${selected}`,
+    "",
+    locale === "zh-CN"
+      ? "提示：如果权限未生效，请切换按钮后重新勾选。"
+      : "Tip: if permissions do not take effect, switch the button and select again.",
+    "",
+    reportText
+  ].join("\n");
+}
+
+function controlPermissionsKeyboard(chatId: string, scope: "group" | "channel", mode: ControlPermissionMode, locale: Locale) {
+  const selected = (active: boolean, label: string) => (active ? `✅${label}` : label);
+  const labels = {
+    allAdmins: locale === "zh-CN" ? "所有管理" : "All admins",
+    promote: locale === "zh-CN" ? "拥有添加管理员权限" : "Can promote members",
+    creator: locale === "zh-CN" ? "仅创建者" : "Creator only",
+    restrict: locale === "zh-CN" ? "拥有封禁权限" : "Can restrict members",
+    back: locale === "zh-CN" ? "返回" : "Back"
+  };
+
+  return new InlineKeyboard()
+    .text(selected(mode === "all_admins", labels.allAdmins), `control_permissions:${controlPermissionCallbackTokens.all_admins}:${chatId}`)
+    .row()
+    .text(selected(mode === "can_promote_members", labels.promote), `control_permissions:${controlPermissionCallbackTokens.can_promote_members}:${chatId}`)
+    .row()
+    .text(selected(mode === "creator", labels.creator), `control_permissions:${controlPermissionCallbackTokens.creator}:${chatId}`)
+    .row()
+    .text(selected(mode === "can_restrict_members", labels.restrict), `control_permissions:${controlPermissionCallbackTokens.can_restrict_members}:${chatId}`)
+    .row()
+    .text(labels.back, `menu:chat:${scope}:${chatId}`);
+}
+
+function controlPermissionModeLabel(mode: ControlPermissionMode, locale: Locale) {
+  if (locale === "zh-CN") {
+    if (mode === "all_admins") return "所有管理";
+    if (mode === "can_promote_members") return "拥有添加管理员权限";
+    if (mode === "creator") return "仅创建者";
+    return "拥有封禁权限";
   }
 
-  await prisma.inviteLink.upsert({
-    where: { inviteLink: invite.invite_link },
-    create: {
-      chatId: chat.id,
-      creatorUserId: user.id,
-      inviteLink: invite.invite_link,
-      expireAt: invite.expire_date ? new Date(invite.expire_date * 1000) : null,
-      memberLimit: invite.member_limit ?? null,
-      createsJoinRequest: invite.creates_join_request,
-      revokedAt: invite.is_revoked ? new Date() : null
-    },
-    update: {
-      revokedAt: invite.is_revoked ? new Date() : null
-    }
-  }).catch(() => undefined);
+  if (mode === "all_admins") return "All admins";
+  if (mode === "can_promote_members") return "Can promote members";
+  if (mode === "creator") return "Creator only";
+  return "Can restrict members";
+}
 
-  await editOrReply(
-    ctx,
-    [
-      locale === "zh-CN" ? "<b>🔗 邀请链接</b>" : "<b>🔗 Invite links</b>",
-      "",
-      invite.invite_link
-    ].join("\n"),
-    chatPanelKeyboard(chat.id, scope, locale)
-  );
+async function openInviteLinkPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  const settings = await getInviteLinkSettings(chat.id);
+  const stats = await getInviteLinkStats(chat.id);
+  await editOrReply(ctx, inviteLinkText(chat, settings, stats, locale), inviteLinkKeyboard(chat.id, settings, locale));
 }
 
 async function openGiveawayPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
@@ -3662,6 +4400,9 @@ async function handleBlocklistCallback(ctx: Context) {
   const [, action, key, chatId] = data.split(":");
   if (action !== "toggle" || !key || !chatId) return;
 
+  const locale = await getLocale(ctx);
+  if (!(await ensureControlPermissionForChatId(ctx, chatId, locale))) return;
+
   const settings = await getBlocklistSettings(chatId);
   if (key in settings && typeof settings[key as keyof BlocklistSettings] === "boolean") {
     const typedKey = key as keyof Pick<BlocklistSettings, "blockBots" | "banAfterLeave" | "blockFlashJoinLeave" | "blockFollowerRaid">;
@@ -3669,38 +4410,122 @@ async function handleBlocklistCallback(ctx: Context) {
     await saveSetting(chatId, "blocklist", settingsToJson(settings));
   }
 
-  const locale = await getLocale(ctx);
   await editOrReply(ctx, blocklistText(settings, locale), blocklistKeyboard(chatId, settings, locale));
 }
 
 async function handleWelcomeCallback(ctx: Context) {
   await ctx.answerCallbackQuery().catch(() => undefined);
+  const locale = await getLocale(ctx);
   const data = ctx.callbackQuery?.data;
-  const chatId = data?.split(":")[2];
-  if (!chatId) return;
+  const [, action, chatId, value] = data?.split(":") ?? [];
+  if (!action || !chatId || action === "noop") return;
+
+  const chat = await prisma.chat.findUnique({ where: { id: chatId } });
+  if (!chat) {
+    await editOrReply(ctx, locale === "zh-CN" ? "未找到这个已绑定群组。" : "That bound group was not found.", homeKeyboard(locale));
+    return;
+  }
+
+  if (!(await ensureControlPermissionAccess(ctx, chat, locale))) return;
 
   const settings = await getWelcomeSettings(chatId);
-  settings.enabled = !settings.enabled;
-  await saveSetting(chatId, "welcome", settingsToJson(settings));
 
-  const locale = await getLocale(ctx);
+  if (action === "toggle") {
+    settings.enabled = !settings.enabled;
+    await saveWelcomeSettings(chatId, settings);
+    await editOrReply(ctx, welcomeText(settings, locale), welcomeKeyboard(chatId, settings, locale));
+    return;
+  }
+
+  if (action === "status" && (value === "on" || value === "off")) {
+    settings.enabled = value === "on";
+    await saveWelcomeSettings(chatId, settings);
+    await editOrReply(ctx, welcomeText(settings, locale), welcomeKeyboard(chatId, settings, locale));
+    return;
+  }
+
+  if (action === "delete_after") {
+    settings.deleteAfterMinutes = clampNumber(Number(value ?? 0), 0, 1440);
+    await saveWelcomeSettings(chatId, settings);
+    await editOrReply(ctx, welcomeText(settings, locale), welcomeKeyboard(chatId, settings, locale));
+    return;
+  }
+
+  if (action === "delete_last") {
+    await deleteStoredWelcomeMessages(ctx, chat, settings);
+    settings.lastMessageIds = [];
+    await saveWelcomeSettings(chatId, settings);
+    await editOrReply(ctx, welcomeText(settings, locale), welcomeKeyboard(chatId, settings, locale));
+    return;
+  }
+
+  if (action === "preview") {
+    if (!ctx.from) return;
+    await sendWelcomePreview(ctx, chat, ctx.from, settings, locale);
+    return;
+  }
+
+  if (action === "edit" && isWelcomeInputField(value)) {
+    if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    welcomeInputDrafts.set(ctx.from.id, { chatId, field: value });
+    await editOrReply(ctx, welcomeInputPromptText(value, settings, locale), welcomeInputKeyboard(chatId, value, locale));
+    return;
+  }
+
+  if (action === "clear" && isWelcomeInputField(value)) {
+    clearWelcomeField(settings, value);
+    await saveWelcomeSettings(chatId, settings);
+    await editOrReply(ctx, welcomeText(settings, locale), welcomeKeyboard(chatId, settings, locale));
+    return;
+  }
+
   await editOrReply(ctx, welcomeText(settings, locale), welcomeKeyboard(chatId, settings, locale));
 }
 
 async function handleJoinVerifyCallback(ctx: Context) {
   await ctx.answerCallbackQuery().catch(() => undefined);
-  const data = ctx.callbackQuery?.data;
-  const parts = data?.split(":") ?? [];
+  const parts = ctx.callbackQuery?.data?.split(":") ?? [];
   const action = parts[1];
-  const chatId = parts[2];
+  const value = parts[2];
+  const chatId = parts[3] ?? (
+    action === "toggle" || action === "approval" || action === "noop" ? value : undefined
+  );
   if (!action || !chatId) return;
 
-  const settings = await getJoinVerifySettings(chatId);
-  if (action === "toggle") settings.enabled = !settings.enabled;
-  if (action === "approval") settings.adminApproval = !settings.adminApproval;
-  await saveSetting(chatId, "join_verify", settingsToJson(settings));
-
   const locale = await getLocale(ctx);
+  if (!(await ensureControlPermissionForChatId(ctx, chatId, locale))) return;
+
+  const settings = await getJoinVerifySettings(chatId);
+  let changed = false;
+
+  if (action === "status" && (value === "on" || value === "off")) {
+    settings.enabled = value === "on";
+    changed = true;
+  } else if (action === "approval" && (value === "on" || value === "off")) {
+    settings.adminApproval = value === "on";
+    changed = true;
+  } else if (action === "mode" && isJoinVerifyMode(value)) {
+    settings.mode = value;
+    changed = true;
+  } else if (action === "duration" && (value === "1" || value === "5" || value === "10")) {
+    settings.durationMinutes = Number(value);
+    changed = true;
+  } else if (action === "punishment" && (value === "mute" || value === "kick")) {
+    settings.punishment = value;
+    changed = true;
+  } else if (action === "toggle") {
+    settings.enabled = !settings.enabled;
+    changed = true;
+  } else if (action === "approval" && parts[3] === undefined) {
+    settings.adminApproval = !settings.adminApproval;
+    changed = true;
+  }
+
+  if (changed) {
+    await saveSetting(chatId, "join_verify", settingsToJson(settings));
+  }
+
   await editOrReply(ctx, joinVerifyText(settings, locale), joinVerifyKeyboard(chatId, settings, locale));
 }
 
@@ -3713,12 +4538,14 @@ async function handleAutoDeleteCallback(ctx: Context) {
   const chatId = parts[3] ?? parts[2];
   if (!action || !chatId || action === "noop") return;
 
+  const locale = await getLocale(ctx);
+  if (!(await ensureControlPermissionForChatId(ctx, chatId, locale))) return;
+
   const settings = await getAutoDeleteSettings(chatId);
   if (action === "toggle") settings.enabled = !settings.enabled;
   if (action === "seconds" && value) settings.seconds = clampNumber(Number(value), 0, 86400);
   await saveSetting(chatId, "auto_delete", settingsToJson(settings));
 
-  const locale = await getLocale(ctx);
   await editOrReply(ctx, autoDeleteText(settings, locale), autoDeleteKeyboard(chatId, settings, locale));
 }
 
@@ -3751,6 +4578,8 @@ async function handleAutoReplyCallback(ctx: Context, config: AppConfig) {
   if (!chatId) return;
 
   const locale = await getLocale(ctx);
+  if (!(await ensureControlPermissionForChatId(ctx, chatId, locale))) return;
+
   const settings = await getAutoReplySettings(chatId);
 
   if (action === "cancel") {
@@ -3837,6 +4666,7 @@ async function handleIncomingMessage(ctx: Context, config: AppConfig) {
   const chat = await getActiveChatByTelegramId(ctx.chat.id);
   if (chat && ctx.from && isGroupLike(ctx.chat)) {
     await recordMessageStat(chat.id, ctx.from, config.defaultTimezone);
+    await maybeRecordMemberCountSnapshot(ctx, chat);
   }
 
   if ("new_chat_members" in message && message.new_chat_members?.length) {
@@ -3847,6 +4677,7 @@ async function handleIncomingMessage(ctx: Context, config: AppConfig) {
   if ("left_chat_member" in message && message.left_chat_member) {
     await handleBlocklistLeftChatMember(ctx, message.left_chat_member);
     if (chat) await recordStatsEvent(chat.id, ChatStatsEventType.LEAVE, ctx.from, message.left_chat_member, config.defaultTimezone);
+    if (chat) await recordInviteLeave(chat.id, message.left_chat_member);
     return;
   }
 
@@ -3862,16 +4693,20 @@ async function handleNewChatMembers(ctx: Context, config: AppConfig, members: Us
   const chat = await getActiveChatByTelegramId(ctx.chat.id);
   if (!chat) return;
 
+  const joinVerify = await getJoinVerifySettings(chat.id);
+  if (!joinVerify.enabled) {
+    await handleNewMemberLimitNewChatMembers(ctx);
+  }
+
   for (const member of members) {
     await upsertTelegramUser(member, config.defaultTimezone).catch(() => undefined);
     await recordStatsEvent(chat.id, ChatStatsEventType.JOIN, ctx.from, member, config.defaultTimezone);
-    await recordInviteJoin(chat.id, member, ctx.message);
+    await recordInviteJoin(ctx, chat, member);
 
     const blocked = await handleBlocklistNewMember(ctx, chat, member);
     if (blocked) continue;
 
-    const joinVerify = await getJoinVerifySettings(chat.id);
-    if (joinVerify.enabled) {
+    if (joinVerify.enabled && !member.is_bot) {
       await startJoinVerification(ctx, chat, member, joinVerify);
       continue;
     }
@@ -3956,85 +4791,453 @@ async function handleBlocklistLeftChatMember(ctx: Context, member: User) {
 }
 
 async function handleVerificationCallback(ctx: Context) {
-  const data = ctx.callbackQuery?.data;
-  const parts = data?.split(":") ?? [];
+  const parts = ctx.callbackQuery?.data?.split(":") ?? [];
   const chatId = Number(parts[1]);
   const userId = Number(parts[2]);
+  const answer = parts[3];
 
-  if (!ctx.from || ctx.from.id !== userId || !Number.isFinite(chatId)) {
+  if (!ctx.from || ctx.from.id !== userId || !Number.isFinite(chatId) || !answer) {
     await ctx.answerCallbackQuery({ text: "This verification is not for you.", show_alert: true }).catch(() => undefined);
     return;
   }
 
   const key = verificationKey(chatId, userId);
   const pending = pendingVerifications.get(key);
-  if (!pending) {
+  const stored = pending ? null : await getStoredJoinVerification(chatId, userId);
+  if (!pending && !stored) {
     await ctx.answerCallbackQuery({ text: "Verification expired.", show_alert: true }).catch(() => undefined);
     return;
   }
 
-  clearTimeout(pending.timeout);
+  if (stored && stored.expiresAt.getTime() <= Date.now()) {
+    await expireStoredJoinVerification(ctx.api, stored);
+    await ctx.answerCallbackQuery({ text: "Verification expired.", show_alert: true }).catch(() => undefined);
+    return;
+  }
+
+  const expectedAnswer = pending?.answer ?? stored?.answer ?? "button";
+  if (expectedAnswer !== answer) {
+    await ctx.answerCallbackQuery({ text: "验证答案不正确，请重试。", show_alert: true }).catch(() => undefined);
+    return;
+  }
+
+  if (pending) clearTimeout(pending.timeout);
   pendingVerifications.delete(key);
-  await ctx.api.restrictChatMember(chatId, userId, fullChatPermissions()).catch(() => undefined);
-  await ctx.api.deleteMessage(chatId, pending.messageId).catch(() => undefined);
-  await ctx.answerCallbackQuery({ text: "OK" }).catch(() => undefined);
+  await deleteStoredJoinVerification(chatId, userId);
+  await restoreVerifiedMember(ctx.api, chatId, userId);
+  await ctx.api.deleteMessage(chatId, pending?.messageId ?? stored?.messageId ?? 0).catch(() => undefined);
+  await ctx.answerCallbackQuery({ text: "验证通过" }).catch(() => undefined);
+  await sendWelcomeAfterVerification(ctx, chatId, userId);
 }
 
 async function startJoinVerification(ctx: Context, chat: PrismaChat, member: User, settings: JoinVerifySettings) {
   const telegramChatId = Number(chat.telegramChatId);
+  const challenge = createJoinVerificationChallenge(settings.mode);
   await ctx.api.restrictChatMember(telegramChatId, member.id, noChatPermissions()).catch(() => undefined);
 
   const sent = await ctx.api.sendMessage(
     telegramChatId,
-    `${displayName(member)}，请点击按钮完成进群验证。`,
+    [
+      `${displayName(member)}，请在 ${settings.durationMinutes} 分钟内完成进群验证。`,
+      challenge.prompt
+    ].join("\n"),
     {
-      reply_markup: new InlineKeyboard().text("✅ 我不是机器人", `verify:${telegramChatId}:${member.id}`)
+      parse_mode: "HTML",
+      reply_markup: joinVerificationKeyboard(telegramChatId, member.id, challenge)
     }
   );
 
   const key = verificationKey(telegramChatId, member.id);
   const existing = pendingVerifications.get(key);
   if (existing) clearTimeout(existing.timeout);
+  const expiresAt = new Date(Date.now() + settings.durationMinutes * 60 * 1000);
+
+  let stored: StoredJoinVerification;
+  try {
+    stored = await upsertStoredJoinVerification(chat, telegramChatId, member.id, sent.message_id, settings, challenge, expiresAt);
+  } catch (error) {
+    console.error("Failed to store join verification", { chatId: chat.id, userId: member.id, error });
+    await restoreVerifiedMember(ctx.api, telegramChatId, member.id);
+    await ctx.api.deleteMessage(telegramChatId, sent.message_id).catch(() => undefined);
+    return;
+  }
 
   const timeout = setTimeout(() => {
     pendingVerifications.delete(key);
-    void punishUnverifiedMember(ctx, telegramChatId, member.id, settings.punishment);
-    void ctx.api.deleteMessage(telegramChatId, sent.message_id).catch(() => undefined);
-  }, settings.durationMinutes * 60 * 1000);
+    void expireStoredJoinVerification(ctx.api, stored);
+  }, Math.max(0, expiresAt.getTime() - Date.now()));
 
   pendingVerifications.set(key, {
     chatId: telegramChatId,
     userId: member.id,
     messageId: sent.message_id,
-    timeout
+    timeout,
+    answer: challenge.answer
   });
 }
 
-async function punishUnverifiedMember(ctx: Context, chatId: number, userId: number, punishment: JoinVerifySettings["punishment"]) {
+function joinVerificationKeyboard(chatId: number, userId: number, challenge: JoinVerificationChallenge) {
+  const keyboard = new InlineKeyboard();
+  challenge.choices.forEach((choice, index) => {
+    keyboard.text(choice.label, `verify:${chatId}:${userId}:${choice.value}`);
+    if ((index + 1) % 3 === 0 && index + 1 < challenge.choices.length) keyboard.row();
+  });
+  return keyboard;
+}
+
+async function recoverPendingJoinVerifications(api: TelegramApi) {
+  try {
+    const rows = await listStoredJoinVerifications();
+    await Promise.all(rows.map(async (row) => {
+      if (row.expiresAt.getTime() <= Date.now()) {
+        await expireStoredJoinVerification(api, row);
+        return;
+      }
+      trackStoredJoinVerification(api, row);
+    }));
+  } catch (error) {
+    console.error("Failed to recover join verifications", error);
+  }
+}
+
+function trackStoredJoinVerification(api: TelegramApi, row: StoredJoinVerification) {
+  const telegramChatId = Number(row.telegramChatId);
+  const telegramUserId = Number(row.telegramUserId);
+  const key = verificationKey(telegramChatId, telegramUserId);
+  const existing = pendingVerifications.get(key);
+  if (existing) clearTimeout(existing.timeout);
+
+  const timeout = setTimeout(() => {
+    pendingVerifications.delete(key);
+    void expireStoredJoinVerification(api, row);
+  }, Math.max(0, row.expiresAt.getTime() - Date.now()));
+
+  pendingVerifications.set(key, {
+    chatId: telegramChatId,
+    userId: telegramUserId,
+    messageId: row.messageId,
+    timeout,
+    answer: row.answer
+  });
+}
+
+async function upsertStoredJoinVerification(
+  chat: PrismaChat,
+  telegramChatId: number,
+  telegramUserId: number,
+  messageId: number,
+  settings: JoinVerifySettings,
+  challenge: JoinVerificationChallenge,
+  expiresAt: Date
+) {
+  const id = joinVerificationRecordId(chat.id, telegramUserId);
+  const rows = await prisma.$queryRaw<StoredJoinVerification[]>`
+    INSERT INTO "join_verifications" (
+      "id",
+      "chat_id",
+      "telegram_chat_id",
+      "telegram_user_id",
+      "message_id",
+      "mode",
+      "answer",
+      "punishment",
+      "expires_at",
+      "updated_at"
+    )
+    VALUES (
+      ${id},
+      ${chat.id},
+      ${BigInt(telegramChatId)},
+      ${BigInt(telegramUserId)},
+      ${messageId},
+      ${settings.mode},
+      ${challenge.answer},
+      ${settings.punishment},
+      ${expiresAt},
+      CURRENT_TIMESTAMP
+    )
+    ON CONFLICT ("chat_id", "telegram_user_id") DO UPDATE SET
+      "telegram_chat_id" = EXCLUDED."telegram_chat_id",
+      "message_id" = EXCLUDED."message_id",
+      "mode" = EXCLUDED."mode",
+      "answer" = EXCLUDED."answer",
+      "punishment" = EXCLUDED."punishment",
+      "expires_at" = EXCLUDED."expires_at",
+      "updated_at" = CURRENT_TIMESTAMP
+    RETURNING
+      "id",
+      "chat_id" AS "chatId",
+      "telegram_chat_id" AS "telegramChatId",
+      "telegram_user_id" AS "telegramUserId",
+      "message_id" AS "messageId",
+      "mode",
+      "answer",
+      "punishment",
+      "expires_at" AS "expiresAt"
+  `;
+  const row = normalizeStoredJoinVerification(rows[0]);
+  if (!row) throw new Error("Stored join verification was not returned");
+  return row;
+}
+
+async function listStoredJoinVerifications() {
+  const rows = await prisma.$queryRaw<StoredJoinVerification[]>`
+    SELECT
+      "id",
+      "chat_id" AS "chatId",
+      "telegram_chat_id" AS "telegramChatId",
+      "telegram_user_id" AS "telegramUserId",
+      "message_id" AS "messageId",
+      "mode",
+      "answer",
+      "punishment",
+      "expires_at" AS "expiresAt"
+    FROM "join_verifications"
+  `;
+  return rows.map(normalizeStoredJoinVerification).filter((row): row is StoredJoinVerification => Boolean(row));
+}
+
+async function getStoredJoinVerification(telegramChatId: number, telegramUserId: number) {
+  const rows = await prisma.$queryRaw<StoredJoinVerification[]>`
+    SELECT
+      "id",
+      "chat_id" AS "chatId",
+      "telegram_chat_id" AS "telegramChatId",
+      "telegram_user_id" AS "telegramUserId",
+      "message_id" AS "messageId",
+      "mode",
+      "answer",
+      "punishment",
+      "expires_at" AS "expiresAt"
+    FROM "join_verifications"
+    WHERE "telegram_chat_id" = ${BigInt(telegramChatId)}
+      AND "telegram_user_id" = ${BigInt(telegramUserId)}
+    LIMIT 1
+  `;
+  return normalizeStoredJoinVerification(rows[0]);
+}
+
+async function deleteStoredJoinVerification(telegramChatId: number, telegramUserId: number) {
+  const rows = await prisma.$queryRaw<{ id: string }[]>`
+    DELETE FROM "join_verifications"
+    WHERE "telegram_chat_id" = ${BigInt(telegramChatId)}
+      AND "telegram_user_id" = ${BigInt(telegramUserId)}
+    RETURNING "id"
+  `;
+  return rows.length > 0;
+}
+
+async function deleteStoredJoinVerificationById(id: string) {
+  const rows = await prisma.$queryRaw<{ id: string }[]>`
+    DELETE FROM "join_verifications"
+    WHERE "id" = ${id}
+    RETURNING "id"
+  `;
+  return rows.length > 0;
+}
+
+function normalizeStoredJoinVerification(row: StoredJoinVerification | undefined) {
+  if (!row || !isJoinVerifyPunishment(row.punishment)) return null;
+  return row;
+}
+
+async function expireStoredJoinVerification(api: TelegramApi, row: StoredJoinVerification) {
+  const deleted = await deleteStoredJoinVerificationById(row.id).catch((error) => {
+    console.error("Failed to delete expired join verification", { id: row.id, error });
+    return false;
+  });
+  if (!deleted) return;
+
+  const telegramChatId = Number(row.telegramChatId);
+  const telegramUserId = Number(row.telegramUserId);
+  const key = verificationKey(telegramChatId, telegramUserId);
+  const pending = pendingVerifications.get(key);
+  if (pending) clearTimeout(pending.timeout);
+  pendingVerifications.delete(key);
+  await punishUnverifiedMember(api, telegramChatId, telegramUserId, row.punishment);
+  await api.deleteMessage(telegramChatId, row.messageId).catch(() => undefined);
+}
+
+async function sendWelcomeAfterVerification(ctx: Context, telegramChatId: number, telegramUserId: number) {
+  const chat = await getActiveChatByTelegramId(telegramChatId);
+  if (!chat) return;
+  const welcome = await getWelcomeSettings(chat.id);
+  if (!welcome.enabled) return;
+
+  const member = await ctx.api.getChatMember(telegramChatId, telegramUserId).catch(() => null);
+  const user = member?.user;
+  if (!user) return;
+  await sendWelcome(ctx, chat, user, welcome);
+}
+
+async function restoreVerifiedMember(api: TelegramApi, chatId: number, userId: number) {
+  const permissions = await resolveDefaultMemberPermissions(api, chatId);
+  await api.restrictChatMember(chatId, userId, permissions, { until_date: 0 }).catch((error) => {
+    console.error("Failed to restore verified member permissions", { chatId, userId, error });
+  });
+}
+
+async function resolveDefaultMemberPermissions(api: TelegramApi, chatId: number) {
+  const chat = await api.getChat(chatId).catch(() => null);
+  const permissions = chat && "permissions" in chat ? chat.permissions : undefined;
+  return defaultMemberPermissions(permissions);
+}
+
+function defaultMemberPermissions(permissions: ChatPermissions | undefined): ChatPermissions {
+  return {
+    can_send_messages: permissions?.can_send_messages ?? true,
+    can_send_audios: permissions?.can_send_audios ?? true,
+    can_send_documents: permissions?.can_send_documents ?? true,
+    can_send_photos: permissions?.can_send_photos ?? true,
+    can_send_videos: permissions?.can_send_videos ?? true,
+    can_send_video_notes: permissions?.can_send_video_notes ?? true,
+    can_send_voice_notes: permissions?.can_send_voice_notes ?? true,
+    can_send_polls: permissions?.can_send_polls ?? true,
+    can_send_other_messages: permissions?.can_send_other_messages ?? true,
+    can_add_web_page_previews: permissions?.can_add_web_page_previews ?? true,
+    can_change_info: permissions?.can_change_info ?? false,
+    can_invite_users: permissions?.can_invite_users ?? true,
+    can_pin_messages: permissions?.can_pin_messages ?? false,
+    can_manage_topics: permissions?.can_manage_topics ?? true
+  };
+}
+
+async function punishUnverifiedMember(api: TelegramApi, chatId: number, userId: number, punishment: JoinVerifySettings["punishment"]) {
   if (punishment === "mute") {
-    await ctx.api.restrictChatMember(chatId, userId, noChatPermissions()).catch(() => undefined);
+    const untilDate = Math.floor((Date.now() + 24 * 60 * 60 * 1000) / 1000);
+    await api.restrictChatMember(chatId, userId, noChatPermissions(), { until_date: untilDate }).catch(() => undefined);
     return;
   }
   if (punishment === "ban") {
-    await banUser(ctx, chatId, userId);
+    await api.banChatMember(chatId, userId).catch((error) => {
+      console.error("Failed to ban member", { chatId, userId, error });
+    });
     return;
   }
-  await ctx.api.banChatMember(chatId, userId).catch(() => undefined);
-  await ctx.api.unbanChatMember(chatId, userId, { only_if_banned: true }).catch(() => undefined);
+  await api.banChatMember(chatId, userId).catch(() => undefined);
+  await api.unbanChatMember(chatId, userId, { only_if_banned: true }).catch(() => undefined);
 }
 
 async function sendWelcome(ctx: Context, chat: PrismaChat, member: User, settings: WelcomeSettings) {
-  const text = settings.text
-    .replaceAll("{name}", displayName(member))
-    .replaceAll("{username}", member.username ? `@${member.username}` : displayName(member))
-    .replaceAll("{chat}", chat.title ?? "this group");
+  const telegramChatId = Number(chat.telegramChatId);
+  const sentMessages = await sendWelcomeMessages(ctx, telegramChatId, chat, member, settings).catch(() => []);
+  if (!sentMessages.length) return;
 
-  const sent = await ctx.api.sendMessage(Number(chat.telegramChatId), text, { parse_mode: "HTML" }).catch(() => null);
-  if (sent && settings.deleteAfterMinutes > 0) {
-    setTimeout(() => {
-      void ctx.api.deleteMessage(Number(chat.telegramChatId), sent.message_id).catch(() => undefined);
-    }, settings.deleteAfterMinutes * 60 * 1000);
+  settings.lastMessageIds = sentMessages.map((message) => message.message_id);
+  await saveWelcomeSettings(chat.id, settings).catch((error) => {
+    console.error("Failed to store welcome message IDs", error);
+  });
+  scheduleWelcomeMessageDeletion(ctx, telegramChatId, settings, settings.lastMessageIds);
+}
+
+async function sendWelcomePreview(ctx: Context, chat: PrismaChat, member: User, settings: WelcomeSettings, locale: Locale) {
+  if (!ctx.chat) return;
+  if (!settings.text.trim() && !settings.mediaFileId) {
+    await ctx.reply(
+      locale === "zh-CN" ? "请先设置文本内容或媒体后再预览。" : "Set text content or media before previewing."
+    );
+    return;
   }
+
+  const sentMessages = await sendWelcomeMessages(ctx, ctx.chat.id, chat, member, settings).catch(() => []);
+  if (!sentMessages.length) {
+    await ctx.reply(locale === "zh-CN" ? "预览发送失败，请检查媒体或 Bot 权限。" : "Preview failed. Check the media or bot permissions.");
+    return;
+  }
+  scheduleWelcomeMessageDeletion(ctx, ctx.chat.id, settings, sentMessages.map((message) => message.message_id));
+}
+
+async function sendWelcomeMessages(
+  ctx: Context,
+  telegramChatId: number,
+  chat: PrismaChat,
+  member: User,
+  settings: WelcomeSettings
+): Promise<Message[]> {
+  const text = renderWelcomeMessageText(chat, member, settings.text);
+  const replyMarkup = welcomeInlineKeyboard(settings);
+  const sentMessages: Message[] = [];
+
+  if (settings.mediaKind === "photo" && settings.mediaFileId) {
+    sentMessages.push(await ctx.api.sendPhoto(telegramChatId, settings.mediaFileId, {
+      ...(text ? { caption: text, parse_mode: "HTML" } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    }));
+    return sentMessages;
+  }
+
+  if (settings.mediaKind === "video" && settings.mediaFileId) {
+    sentMessages.push(await ctx.api.sendVideo(telegramChatId, settings.mediaFileId, {
+      ...(text ? { caption: text, parse_mode: "HTML" } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    }));
+    return sentMessages;
+  }
+
+  if (settings.mediaKind === "animation" && settings.mediaFileId) {
+    sentMessages.push(await ctx.api.sendAnimation(telegramChatId, settings.mediaFileId, {
+      ...(text ? { caption: text, parse_mode: "HTML" } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    }));
+    return sentMessages;
+  }
+
+  if (settings.mediaKind === "sticker" && settings.mediaFileId) {
+    sentMessages.push(await ctx.api.sendSticker(telegramChatId, settings.mediaFileId, {
+      ...(!text && replyMarkup ? { reply_markup: replyMarkup } : {})
+    }));
+    if (text) {
+      sentMessages.push(await ctx.api.sendMessage(telegramChatId, text, {
+        parse_mode: "HTML",
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+      }));
+    }
+    return sentMessages;
+  }
+
+  if (!text) return sentMessages;
+  sentMessages.push(await ctx.api.sendMessage(telegramChatId, text, {
+    parse_mode: "HTML",
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+  }));
+  return sentMessages;
+}
+
+function renderWelcomeMessageText(chat: PrismaChat, member: User, template: string) {
+  const name = displayName(member);
+  const username = member.username ? `@${escapeHtml(member.username)}` : name;
+  const mention = `<a href="tg://user?id=${member.id}">${name}</a>`;
+  const groupName = escapeHtml(chat.title ?? "this group");
+  return template
+    .replaceAll("{NAME}", name)
+    .replaceAll("{MENTION}", mention)
+    .replaceAll("{GROUPNAME}", groupName)
+    .replaceAll("{name}", name)
+    .replaceAll("{username}", username)
+    .replaceAll("{chat}", groupName);
+}
+
+function welcomeInlineKeyboard(settings: WelcomeSettings) {
+  if (!settings.buttonText || !settings.buttonUrl) return undefined;
+  return new InlineKeyboard().url(settings.buttonText, settings.buttonUrl);
+}
+
+function scheduleWelcomeMessageDeletion(ctx: Context, telegramChatId: number, settings: WelcomeSettings, messageIds: number[]) {
+  if (settings.deleteAfterMinutes <= 0) return;
+  setTimeout(() => {
+    for (const messageId of messageIds) {
+      void ctx.api.deleteMessage(telegramChatId, messageId).catch(() => undefined);
+    }
+  }, settings.deleteAfterMinutes * 60 * 1000);
+}
+
+async function deleteStoredWelcomeMessages(ctx: Context, chat: PrismaChat, settings: WelcomeSettings) {
+  if (!settings.lastMessageIds.length) return;
+  await Promise.all(
+    settings.lastMessageIds.map((messageId) =>
+      ctx.api.deleteMessage(Number(chat.telegramChatId), messageId).catch(() => undefined)
+    )
+  );
 }
 
 async function handleInfoCommand(ctx: Context, config: AppConfig) {
@@ -4106,23 +5309,35 @@ async function handleInviteLinkCommand(ctx: Context, config: AppConfig) {
     return;
   }
 
-  const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
-  const link = await ctx.api.createChatInviteLink(ctx.chat.id, {
-    name: `xdoing-${ctx.from.id}-${Date.now()}`
-  });
+  const settings = await getInviteLinkSettings(chat.id);
+  if (!settings.enabled) {
+    await ctx.reply(locale === "zh-CN" ? "邀请链接生成功能未开启。" : "Invite link generation is disabled.");
+    return;
+  }
 
-  await prisma.inviteLink.create({
-    data: {
+  const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
+  const link = await getOrCreateInviteLink(ctx, chat, user.id, settings);
+  if (!link) {
+    await ctx.reply(locale === "zh-CN" ? "无法创建邀请链接，请确认 Bot 拥有邀请用户权限。" : "Could not create an invite link. Check bot permissions.");
+    return;
+  }
+
+  const inviteCount = await prisma.inviteJoin.count({
+    where: {
       chatId: chat.id,
-      creatorUserId: user.id,
-      inviteLink: link.invite_link,
-      expireAt: link.expire_date ? new Date(link.expire_date * 1000) : null,
-      memberLimit: link.member_limit ?? null,
-      createsJoinRequest: link.creates_join_request ?? false
+      inviteLink: { is: { creatorUserId: user.id } }
     }
   });
 
-  await ctx.reply(`${locale === "zh-CN" ? "邀请链接：" : "Invite link:"}\n${link.invite_link}`);
+  await ctx.reply(
+    [
+      locale === "zh-CN" ? "🔗 <b>你的邀请链接</b>" : "🔗 <b>Your invite link</b>",
+      link.inviteLink,
+      "",
+      `${locale === "zh-CN" ? "有效邀请人数" : "Valid invites"}: ${inviteCount}`
+    ].join("\n"),
+    { parse_mode: "HTML" }
+  );
 }
 
 async function handleSignInCommand(ctx: Context, config: AppConfig) {
@@ -4273,19 +5488,25 @@ async function showManagedChats(ctx: Context, scope: "group" | "channel", locale
 }
 
 async function getWelcomeSettings(chatId: string) {
+  const raw = await getSettingRecord(chatId, "welcome");
+  const rawText = typeof raw.text === "string" ? raw.text : undefined;
   return {
     ...defaultWelcomeSettings,
-    ...await getSettingRecord(chatId, "welcome")
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : defaultWelcomeSettings.enabled,
+    text: rawText ? (rawText === legacyDefaultWelcomeText ? defaultWelcomeSettings.text : rawText) : defaultWelcomeSettings.text,
+    deleteAfterMinutes: clampNumber(Number(raw.deleteAfterMinutes ?? defaultWelcomeSettings.deleteAfterMinutes), 0, 1440),
+    mediaKind: isPublishMediaKind(raw.mediaKind) ? raw.mediaKind : undefined,
+    mediaFileId: typeof raw.mediaFileId === "string" ? raw.mediaFileId : undefined,
+    buttonText: typeof raw.buttonText === "string" ? raw.buttonText : "",
+    buttonUrl: typeof raw.buttonUrl === "string" ? raw.buttonUrl : "",
+    lastMessageIds: Array.isArray(raw.lastMessageIds)
+      ? raw.lastMessageIds.map((item) => Number(item)).filter((item) => Number.isInteger(item) && item > 0)
+      : []
   } as WelcomeSettings;
 }
 
-async function getJoinVerifySettings(chatId: string) {
-  const raw = await getSettingRecord(chatId, "join_verify");
-  return {
-    ...defaultJoinVerifySettings,
-    ...raw,
-    punishment: raw.punishment === "ban" || raw.punishment === "mute" ? raw.punishment : defaultJoinVerifySettings.punishment
-  } as JoinVerifySettings;
+async function saveWelcomeSettings(chatId: string, settings: WelcomeSettings) {
+  await saveSetting(chatId, "welcome", settingsToJson(settings));
 }
 
 async function getBlocklistSettings(chatId: string) {
@@ -4297,6 +5518,305 @@ async function getBlocklistSettings(chatId: string) {
     raidWindowSeconds: clampNumber(Number(raw.raidWindowSeconds ?? defaultBlocklistSettings.raidWindowSeconds), 10, 3600),
     raidJoinThreshold: clampNumber(Number(raw.raidJoinThreshold ?? defaultBlocklistSettings.raidJoinThreshold), 3, 100)
   } as BlocklistSettings;
+}
+
+async function getInviteLinkSettings(chatId: string) {
+  const raw = await getSettingRecord(chatId, "invite_links");
+  return {
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : defaultInviteLinkSettings.enabled,
+    notify: typeof raw.notify === "boolean" ? raw.notify : defaultInviteLinkSettings.notify,
+    createsJoinRequest: typeof raw.createsJoinRequest === "boolean"
+      ? raw.createsJoinRequest
+      : defaultInviteLinkSettings.createsJoinRequest,
+    expireSeconds: clampNumber(Number(raw.expireSeconds ?? defaultInviteLinkSettings.expireSeconds), 0, 31_536_000),
+    memberLimit: clampNumber(Number(raw.memberLimit ?? defaultInviteLinkSettings.memberLimit), 0, 99_999)
+  } as InviteLinkSettings;
+}
+
+async function saveInviteLinkSettings(chatId: string, settings: InviteLinkSettings) {
+  await saveSetting(chatId, "invite_links", settingsToJson(settings));
+}
+
+async function getInviteLinkStats(chatId: string) {
+  const [activeLinks, totalInvites] = await Promise.all([
+    prisma.inviteLink.count({
+      where: { chatId, revokedAt: null }
+    }),
+    prisma.inviteJoin.count({
+      where: { chatId, inviteLinkId: { not: null } }
+    })
+  ]);
+
+  return { activeLinks, totalInvites };
+}
+
+async function getOrCreateInviteLink(ctx: Context, chat: PrismaChat, creatorUserId: string, settings: InviteLinkSettings) {
+  const now = new Date();
+  const existing = await prisma.inviteLink.findFirst({
+    where: {
+      chatId: chat.id,
+      creatorUserId,
+      revokedAt: null,
+      OR: [
+        { expireAt: null },
+        { expireAt: { gt: now } }
+      ]
+    },
+    orderBy: { createdAt: "desc" }
+  });
+  if (existing) return existing;
+
+  const created = await createTelegramInviteLink(ctx, chat, settings).catch(() => null);
+  if (!created) return null;
+
+  return prisma.inviteLink.upsert({
+    where: { inviteLink: created.invite_link },
+    create: inviteLinkCreateData(chat.id, creatorUserId, created),
+    update: {
+      expireAt: created.expire_date ? new Date(created.expire_date * 1000) : null,
+      memberLimit: created.member_limit ?? null,
+      createsJoinRequest: Boolean(created.creates_join_request),
+      revokedAt: created.is_revoked ? new Date() : null
+    }
+  });
+}
+
+async function createTelegramInviteLink(ctx: Context, chat: PrismaChat, settings: InviteLinkSettings) {
+  const options: {
+    name: string;
+    expire_date?: number;
+    member_limit?: number;
+    creates_join_request?: boolean;
+  } = {
+    name: `dx-${ctx.from?.id ?? "user"}-${Date.now()}`.slice(0, 32)
+  };
+
+  if (settings.expireSeconds > 0) {
+    options.expire_date = Math.floor(Date.now() / 1000) + settings.expireSeconds;
+  }
+  if (settings.createsJoinRequest) {
+    options.creates_join_request = true;
+  } else if (settings.memberLimit > 0) {
+    options.member_limit = settings.memberLimit;
+  }
+
+  return ctx.api.createChatInviteLink(Number(chat.telegramChatId), options);
+}
+
+function inviteLinkCreateData(chatId: string, creatorUserId: string, link: ChatInviteLink) {
+  return {
+    chatId,
+    creatorUserId,
+    inviteLink: link.invite_link,
+    expireAt: link.expire_date ? new Date(link.expire_date * 1000) : null,
+    memberLimit: link.member_limit ?? null,
+    createsJoinRequest: Boolean(link.creates_join_request),
+    revokedAt: link.is_revoked ? new Date() : null
+  };
+}
+
+async function exportInviteLinkData(ctx: Context, locale: Locale, chat: PrismaChat) {
+  if (!ctx.chat) return;
+
+  const [links, joins] = await Promise.all([
+    prisma.inviteLink.findMany({
+      where: { chatId: chat.id },
+      include: { creator: true, _count: { select: { joins: true } } },
+      orderBy: { createdAt: "desc" }
+    }),
+    prisma.inviteJoin.findMany({
+      where: { chatId: chat.id },
+      include: { user: true, inviteLink: { include: { creator: true } } },
+      orderBy: { joinedAt: "desc" }
+    })
+  ]);
+
+  const rows = [
+    [
+      "section",
+      "invite_link",
+      "creator_telegram_id",
+      "creator_username",
+      "invite_count",
+      "invitee_telegram_id",
+      "invitee_username",
+      "joined_at",
+      "left_at",
+      "expire_at",
+      "member_limit",
+      "revoked_at"
+    ],
+    ...links.map((link) => [
+      "link",
+      link.inviteLink,
+      link.creator.telegramUserId.toString(),
+      link.creator.username ?? "",
+      String(link._count.joins),
+      "",
+      "",
+      "",
+      "",
+      link.expireAt?.toISOString() ?? "",
+      link.memberLimit?.toString() ?? "",
+      link.revokedAt?.toISOString() ?? ""
+    ]),
+    ...joins.map((join) => [
+      "join",
+      join.inviteLink?.inviteLink ?? "",
+      join.inviteLink?.creator.telegramUserId.toString() ?? "",
+      join.inviteLink?.creator.username ?? "",
+      "",
+      join.user.telegramUserId.toString(),
+      join.user.username ?? "",
+      join.joinedAt.toISOString(),
+      join.leftAt?.toISOString() ?? "",
+      "",
+      "",
+      ""
+    ])
+  ];
+
+  const csv = rows.map((row) => row.map(csvCell).join(",")).join("\n");
+  const fileName = `invite-links-${chat.telegramChatId.toString()}-${formatDate(new Date())}.csv`;
+  await ctx.api.sendDocument(
+    ctx.chat.id,
+    new InputFile(Buffer.from(csv, "utf8"), fileName),
+    { caption: locale === "zh-CN" ? "邀请链接数据导出" : "Invite link data export" }
+  );
+}
+
+async function resetInviteLinks(ctx: Context, chat: PrismaChat) {
+  const links = await prisma.inviteLink.findMany({
+    where: { chatId: chat.id, revokedAt: null },
+    select: { id: true, inviteLink: true }
+  });
+
+  const revokedAt = new Date();
+  for (const link of links) {
+    await ctx.api.revokeChatInviteLink(Number(chat.telegramChatId), link.inviteLink).catch(() => undefined);
+    await prisma.inviteLink.update({
+      where: { id: link.id },
+      data: { revokedAt }
+    });
+  }
+}
+
+async function maybeSendInviteNotice(ctx: Context, chat: PrismaChat, member: User, creatorUserId: string) {
+  const settings = await getInviteLinkSettings(chat.id);
+  if (!settings.notify || !ctx.chat) return;
+
+  const inviter = await prisma.user.findUnique({ where: { id: creatorUserId } });
+  const count = await prisma.inviteJoin.count({
+    where: {
+      chatId: chat.id,
+      inviteLink: { is: { creatorUserId } }
+    }
+  });
+
+  await ctx.reply(
+    [
+      `🔗 ${displayName(member)} 通过邀请链接进群`,
+      `邀请人: ${escapeHtml(inviter ? displayPrismaUser(inviter) : creatorUserId)}`,
+      `有效邀请数: ${count}`
+    ].join("\n"),
+    { parse_mode: "HTML" }
+  ).catch(() => undefined);
+}
+
+function inviteLinkText(chat: PrismaChat, settings: InviteLinkSettings, stats: Awaited<ReturnType<typeof getInviteLinkStats>>, locale: Locale) {
+  const title = escapeHtml(chat.title ?? chat.username ?? String(chat.telegramChatId));
+  if (locale !== "zh-CN") {
+    return [
+      `🔗 <b>[ ${title} ] Invite Link Generation</b>`,
+      "",
+      "When enabled, group members can use <code>/link</code> to generate a personal invite link and check invite stats.",
+      "",
+      "Anti-cheat:",
+      "└ Only the first group join counts. Leaving and rejoining through another link will not move the invite credit.",
+      "",
+      `┌Status: ${settings.enabled ? "✅On" : "❌Off"}`,
+      `├Link expiration: ${formatInviteExpire(settings.expireSeconds, locale)}`,
+      `└Max invite members: ${settings.memberLimit || "Unlimited"}`,
+      "",
+      "Stats:",
+      `┌Generated links: ${stats.activeLinks}`,
+      `└Total invites: ${stats.totalInvites}`
+    ].join("\n");
+  }
+
+  return [
+    `🔗 <b>[ ${title} ]邀请链接生成</b>`,
+    "",
+    "开启后群组中成员使用 <code>/link</code> 指令自动生成链接和查询邀请统计",
+    "",
+    "防作弊:",
+    "└ 只有第一次进群视为有效邀请数，退群再用其他人的链接加群不计算邀请数",
+    "",
+    `┌状态: ${settings.enabled ? "✅开启" : "❌关闭"}`,
+    `├链接过期时间: ${formatInviteExpire(settings.expireSeconds, locale)}`,
+    `└最大邀请人数: ${settings.memberLimit || "无限制"}`,
+    "",
+    "统计:",
+    `┌已生成链接数: ${stats.activeLinks}`,
+    `└总邀请人数: ${stats.totalInvites}`
+  ].join("\n");
+}
+
+function formatInviteExpire(seconds: number, locale: Locale) {
+  if (seconds <= 0) return locale === "zh-CN" ? "无限制" : "Unlimited";
+  if (seconds % 86400 === 0) {
+    const days = seconds / 86400;
+    return locale === "zh-CN" ? `${days}天` : `${days}d`;
+  }
+  if (seconds % 3600 === 0) {
+    const hours = seconds / 3600;
+    return locale === "zh-CN" ? `${hours}小时` : `${hours}h`;
+  }
+  return locale === "zh-CN" ? `${seconds}秒` : `${seconds}s`;
+}
+
+function inviteLinkInputPromptText(field: InviteLinkInputField, locale: Locale) {
+  if (field === "expireDays") {
+    return locale === "zh-CN"
+      ? [
+          "👉  <strong>请回复链接过期天数(不限制请输入:0)</strong>",
+          "",
+          "注意:此设置仅应用在新生成的链接中，不会修改已生成的链接"
+        ].join("\n")
+      : [
+          "👉 <strong>Send the invite link expiration in days (send 0 for unlimited)</strong>",
+          "",
+          "Note: this only applies to newly generated links and will not modify existing links."
+        ].join("\n");
+  }
+
+  return locale === "zh-CN"
+    ? [
+        "👉  <strong>请回复生成链接的最大邀请人数(不限制请输入:0)</strong>",
+        "",
+        "注意:此设置仅应用在新生成的链接中，不会修改已生成的链接"
+      ].join("\n")
+    : [
+        "👉 <strong>Send the maximum invite members for generated links (send 0 for unlimited)</strong>",
+        "",
+        "Note: this only applies to newly generated links and will not modify existing links."
+      ].join("\n");
+}
+
+function inviteLinkInputKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `invite:cancel:${chatId}`);
+}
+
+function inviteLinkSavedKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `invite:cancel:${chatId}`);
+}
+
+function inviteLinkInputSavedText(locale: Locale) {
+  return locale === "zh-CN" ? "✅ 设置成功，点击按钮返回。" : "✅ Saved. Tap the button to return.";
+}
+
+function csvCell(value: string) {
+  return `"${value.replaceAll("\"", "\"\"")}"`;
 }
 
 async function getAutoDeleteSettings(chatId: string) {
@@ -4341,6 +5861,41 @@ async function saveAutoReplySettings(chatId: string, settings: AutoReplySettings
       ...(rule.buttons?.length ? { buttons: rule.buttons } : {})
     }))
   }));
+}
+
+async function getMemberStatsSettings(chatId: string): Promise<MemberStatsSettings> {
+  const raw = await getSettingRecord(chatId, "member_stats");
+  const snapshots = Array.isArray(raw.snapshots)
+    ? raw.snapshots.map(parseMemberStatsSnapshot).filter((item): item is MemberStatsSnapshot => Boolean(item))
+    : [];
+  const lastCount = Number(raw.lastCount);
+
+  return {
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : defaultMemberStatsSettings.enabled,
+    lastCollectedDate: typeof raw.lastCollectedDate === "string" ? raw.lastCollectedDate : undefined,
+    lastCount: Number.isInteger(lastCount) && lastCount >= 0 ? lastCount : undefined,
+    snapshots
+  };
+}
+
+async function saveMemberStatsSettings(chatId: string, settings: MemberStatsSettings) {
+  await saveSetting(chatId, "member_stats", settingsToJson({
+    enabled: settings.enabled,
+    lastCollectedDate: settings.lastCollectedDate,
+    lastCount: settings.lastCount,
+    snapshots: settings.snapshots.slice(-120)
+  }));
+}
+
+function parseMemberStatsSnapshot(value: unknown): MemberStatsSnapshot | null {
+  if (!isRecord(value)) return null;
+  const count = Number(value.count);
+  if (typeof value.date !== "string" || !Number.isInteger(count) || count < 0) return null;
+  return {
+    date: value.date,
+    count,
+    collectedAt: typeof value.collectedAt === "string" ? value.collectedAt : new Date().toISOString()
+  };
 }
 
 function parseAutoReplyRule(value: unknown): AutoReplyRule | null {
@@ -4407,6 +5962,23 @@ function settingsToJson(value: Record<string, unknown>): Prisma.InputJsonObject 
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as Prisma.InputJsonObject;
 }
 
+async function getJoinVerifySettings(chatId: string): Promise<JoinVerifySettings> {
+  const raw = await getSettingRecord(chatId, "join_verify");
+  const durationValue = Number(raw.durationMinutes);
+  return {
+    ...defaultJoinVerifySettings,
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : defaultJoinVerifySettings.enabled,
+    adminApproval: typeof raw.adminApproval === "boolean" ? raw.adminApproval : defaultJoinVerifySettings.adminApproval,
+    mode: isJoinVerifyMode(raw.mode) ? raw.mode : defaultJoinVerifySettings.mode,
+    durationMinutes: Number.isFinite(durationValue) && durationValue > 0
+      ? clampNumber(durationValue, 1, 24 * 60)
+      : defaultJoinVerifySettings.durationMinutes,
+    punishment: raw.punishment === "kick" || raw.punishment === "ban" || raw.punishment === "mute"
+      ? raw.punishment
+      : defaultJoinVerifySettings.punishment
+  };
+}
+
 async function getActiveChatByTelegramId(telegramChatId: number) {
   return prisma.chat.findFirst({
     where: {
@@ -4459,8 +6031,8 @@ async function recordStatsEvent(chatId: string, eventType: ChatStatsEventType, a
   });
 }
 
-async function recordInviteJoin(chatId: string, member: User, message: Message | undefined) {
-  const inviteLink = extractInviteLink(message);
+async function recordInviteJoin(ctx: Context, chat: PrismaChat, member: User) {
+  const inviteLink = extractInviteLink(ctx.message);
   const user = await prisma.user.findUnique({ where: { telegramUserId: BigInt(member.id) } });
   if (!user) return;
 
@@ -4468,19 +6040,63 @@ async function recordInviteJoin(chatId: string, member: User, message: Message |
     ? await prisma.inviteLink.findUnique({ where: { inviteLink: inviteLink.invite_link } })
     : null;
 
-  await prisma.inviteJoin.upsert({
-    where: { chatId_userId: { chatId, userId: user.id } },
-    create: {
-      chatId,
+  const existing = await prisma.inviteJoin.findUnique({
+    where: { chatId_userId: { chatId: chat.id, userId: user.id } }
+  });
+
+  if (existing) {
+    await prisma.inviteJoin.update({
+      where: { id: existing.id },
+      data: { leftAt: null }
+    });
+    return;
+  }
+
+  await prisma.inviteJoin.create({
+    data: {
+      chatId: chat.id,
       userId: user.id,
-      inviteLinkId: savedInviteLink?.id ?? null
-    },
-    update: {
-      joinedAt: new Date(),
-      leftAt: null,
       inviteLinkId: savedInviteLink?.id ?? null
     }
   });
+
+  if (savedInviteLink) {
+    await maybeSendInviteNotice(ctx, chat, member, savedInviteLink.creatorUserId);
+  }
+}
+
+async function recordInviteLeave(chatId: string, member: User) {
+  const user = await prisma.user.findUnique({ where: { telegramUserId: BigInt(member.id) } });
+  if (!user) return;
+
+  await prisma.inviteJoin.updateMany({
+    where: { chatId, userId: user.id, leftAt: null },
+    data: { leftAt: new Date() }
+  });
+}
+
+async function maybeRecordMemberCountSnapshot(ctx: Context, chat: PrismaChat, currentSettings?: MemberStatsSettings) {
+  const settings = currentSettings ?? await getMemberStatsSettings(chat.id);
+  if (!settings.enabled) return settings;
+
+  const today = formatDate(new Date());
+  if (settings.lastCollectedDate === today) return settings;
+
+  const count = await ctx.api.getChatMemberCount(Number(chat.telegramChatId)).catch(() => null);
+  if (typeof count !== "number") return settings;
+
+  const snapshot = { date: today, count, collectedAt: new Date().toISOString() };
+  const snapshots = settings.snapshots.filter((item) => item.date !== today);
+  snapshots.push(snapshot);
+
+  const next = {
+    ...settings,
+    lastCollectedDate: today,
+    lastCount: count,
+    snapshots: snapshots.slice(-120)
+  };
+  await saveMemberStatsSettings(chat.id, next);
+  return next;
 }
 
 async function maybeAutoDelete(ctx: Context, chatId: string, message: Message) {
@@ -4630,6 +6246,170 @@ async function addPoints(
   return result;
 }
 
+async function openGroupStatsPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  await editOrReply(ctx, groupStatsHomeText(chat, locale), groupStatsKeyboard(chat.id, locale));
+}
+
+async function openMemberStatsPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  const settings = await maybeRecordMemberCountSnapshot(ctx, chat);
+  await editOrReply(ctx, memberStatsText(settings, locale), memberStatsKeyboard(chat, settings, locale));
+}
+
+async function renderGroupStatsActionText(chatId: string, action: string, locale: Locale) {
+  const todayKeys = recentDateKeys(1);
+  const sevenDayKeys = recentDateKeys(7);
+  const monthKeys = currentMonthDateKeys();
+
+  if (action === "speech_today_rank") {
+    const rows = await getMessageRanking(chatId, todayKeys);
+    return rankingText(locale === "zh-CN" ? "今日发言排名" : "Today message ranking", todayKeys, rows, locale, locale === "zh-CN" ? "条" : "messages");
+  }
+
+  if (action === "speech_7d_rank") {
+    const rows = await getMessageRanking(chatId, sevenDayKeys);
+    return rankingText(locale === "zh-CN" ? "7日发言排名" : "7-day message ranking", sevenDayKeys, rows, locale, locale === "zh-CN" ? "条" : "messages");
+  }
+
+  if (action === "speech_7d_stats") {
+    const summary = await getMessageStatsSummary(chatId, sevenDayKeys);
+    return messageStatsSummaryText(summary, sevenDayKeys, locale);
+  }
+
+  if (action === "speech_month_rank") {
+    const rows = await getMessageRanking(chatId, monthKeys);
+    return rankingText(locale === "zh-CN" ? "月发言排名" : "Monthly message ranking", monthKeys, rows, locale, locale === "zh-CN" ? "条" : "messages");
+  }
+
+  if (action === "invite_today_rank") {
+    const rows = await getInviteRanking(chatId, todayKeys);
+    return rankingText(locale === "zh-CN" ? "今日邀请排名" : "Today invite ranking", todayKeys, rows, locale, locale === "zh-CN" ? "人" : "invites");
+  }
+
+  if (action === "invite_7d_stats") {
+    const stats = await getInviteStatsSummary(chatId, sevenDayKeys);
+    return inviteStatsSummaryText(stats, sevenDayKeys, locale);
+  }
+
+  if (action === "member_today") {
+    const stats = await getMemberStatsSummary(chatId, todayKeys);
+    return memberStatsSummaryText(stats, todayKeys, locale, false);
+  }
+
+  if (action === "member_7d") {
+    const stats = await getMemberStatsSummary(chatId, sevenDayKeys);
+    return memberStatsSummaryText(stats, sevenDayKeys, locale, true);
+  }
+
+  return locale === "zh-CN" ? "未知的统计类型。" : "Unknown stats view.";
+}
+
+async function getMessageRanking(chatId: string, dateKeys: string[]) {
+  const rows = await prisma.chatDailyMessageStat.findMany({
+    where: { chatId, statDate: { in: dateKeys } },
+    select: { userId: true, messageCount: true }
+  });
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    counts.set(row.userId, (counts.get(row.userId) ?? 0) + row.messageCount);
+  }
+  return hydrateUserCounts(counts);
+}
+
+async function getMessageStatsSummary(chatId: string, dateKeys: string[]) {
+  const rows = await prisma.chatDailyMessageStat.findMany({
+    where: { chatId, statDate: { in: dateKeys } },
+    select: { userId: true, messageCount: true }
+  });
+  return {
+    total: rows.reduce((sum, row) => sum + row.messageCount, 0),
+    users: new Set(rows.map((row) => row.userId)).size
+  };
+}
+
+async function getInviteRanking(chatId: string, dateKeys: string[]) {
+  const range = dateKeysToUtcRange(dateKeys);
+  const rows = await prisma.inviteJoin.findMany({
+    where: {
+      chatId,
+      inviteLinkId: { not: null },
+      joinedAt: { gte: range.start, lt: range.end }
+    },
+    select: {
+      inviteLink: {
+        select: { creatorUserId: true }
+      }
+    }
+  });
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    const creatorUserId = row.inviteLink?.creatorUserId;
+    if (creatorUserId) counts.set(creatorUserId, (counts.get(creatorUserId) ?? 0) + 1);
+  }
+  return hydrateUserCounts(counts);
+}
+
+async function getInviteStatsSummary(chatId: string, dateKeys: string[]) {
+  const range = dateKeysToUtcRange(dateKeys);
+  const rows = await prisma.inviteJoin.findMany({
+    where: {
+      chatId,
+      inviteLinkId: { not: null },
+      joinedAt: { gte: range.start, lt: range.end }
+    },
+    select: {
+      inviteLinkId: true,
+      inviteLink: {
+        select: { creatorUserId: true }
+      }
+    }
+  });
+  return {
+    total: rows.length,
+    inviters: new Set(rows.map((row) => row.inviteLink?.creatorUserId).filter(Boolean)).size,
+    links: new Set(rows.map((row) => row.inviteLinkId).filter(Boolean)).size
+  };
+}
+
+async function getMemberStatsSummary(chatId: string, dateKeys: string[]) {
+  const rows = await prisma.chatStatsEvent.findMany({
+    where: {
+      chatId,
+      statDate: { in: dateKeys },
+      eventType: { in: [ChatStatsEventType.JOIN, ChatStatsEventType.LEAVE] }
+    },
+    select: { statDate: true, eventType: true }
+  });
+  const byDate = new Map<string, { joins: number; leaves: number }>();
+  for (const dateKey of dateKeys) byDate.set(dateKey, { joins: 0, leaves: 0 });
+  for (const row of rows) {
+    const item = byDate.get(row.statDate) ?? { joins: 0, leaves: 0 };
+    if (row.eventType === ChatStatsEventType.JOIN) item.joins += 1;
+    if (row.eventType === ChatStatsEventType.LEAVE) item.leaves += 1;
+    byDate.set(row.statDate, item);
+  }
+  const days = [...byDate.entries()].map(([date, value]) => ({ date, ...value }));
+  return {
+    joins: days.reduce((sum, row) => sum + row.joins, 0),
+    leaves: days.reduce((sum, row) => sum + row.leaves, 0),
+    days
+  };
+}
+
+async function hydrateUserCounts(counts: Map<string, number>) {
+  const rows = [...counts.entries()]
+    .map(([userId, count]) => ({ userId, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10);
+  const users = await prisma.user.findMany({
+    where: { id: { in: rows.map((row) => row.userId) } }
+  });
+  const usersById = new Map(users.map((user) => [user.id, user]));
+  return rows.map((row) => ({
+    ...row,
+    user: usersById.get(row.userId)
+  }));
+}
+
 async function getStats(chatId: string, endDate: string, days = 1) {
   const start = new Date(`${endDate}T00:00:00Z`);
   start.setUTCDate(start.getUTCDate() - days + 1);
@@ -4673,6 +6453,126 @@ function statsText(stats: Awaited<ReturnType<typeof getStats>>, days: number, lo
   ].join("\n");
 }
 
+function memberStatsText(settings: MemberStatsSettings, locale: Locale) {
+  if (locale !== "zh-CN") {
+    return [
+      `Daily member count stats: ${settings.enabled ? "✅" : "❌"}`,
+      "",
+      "🔔 Tip: when enabled, the bot records the chat member count once per day for member trend charts."
+    ].join("\n");
+  }
+
+  return [
+    `是否统计每日人数统计: ${settings.enabled ? "✅" : "❌"}`,
+    "",
+    "🔔提示：开启后，机器人每日统计群组人数，用于生成人数趋势统计图"
+  ].join("\n");
+}
+
+function groupStatsHomeText(chat: PrismaChat, locale: Locale) {
+  const title = escapeHtml(chat.title ?? chat.username ?? String(chat.telegramChatId));
+  return locale === "zh-CN"
+    ? `📊 <b>[ ${title} ]</b>群组统计`
+    : `📊 <b>[ ${title} ]</b> Group stats`;
+}
+
+function rankingText(
+  title: string,
+  dateKeys: string[],
+  rows: Awaited<ReturnType<typeof hydrateUserCounts>>,
+  locale: Locale,
+  unit: string
+) {
+  const lines = rows.length
+    ? rows.map((row, index) => {
+        const name = row.user ? escapeHtml(displayPrismaUser(row.user)) : escapeHtml(row.userId);
+        return `${index + 1}. ${name} - ${row.count} ${unit}`;
+      })
+    : [locale === "zh-CN" ? "暂无数据。" : "No data yet."];
+
+  return [
+    `<b>${escapeHtml(title)}</b>`,
+    `${locale === "zh-CN" ? "范围" : "Range"}: ${dateRangeLabel(dateKeys)}`,
+    "",
+    ...lines
+  ].join("\n");
+}
+
+function messageStatsSummaryText(summary: { total: number; users: number }, dateKeys: string[], locale: Locale) {
+  const average = dateKeys.length ? Math.round(summary.total / dateKeys.length) : 0;
+  return locale === "zh-CN"
+    ? [
+        "<b>7日发言统计</b>",
+        `范围: ${dateRangeLabel(dateKeys)}`,
+        "",
+        `总发言: ${summary.total} 条`,
+        `发言人数: ${summary.users} 人`,
+        `日均发言: ${average} 条`
+      ].join("\n")
+    : [
+        "<b>7-day message stats</b>",
+        `Range: ${dateRangeLabel(dateKeys)}`,
+        "",
+        `Messages: ${summary.total}`,
+        `Active users: ${summary.users}`,
+        `Daily average: ${average}`
+      ].join("\n");
+}
+
+function inviteStatsSummaryText(summary: { total: number; inviters: number; links: number }, dateKeys: string[], locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "<b>7日邀请统计</b>",
+        `范围: ${dateRangeLabel(dateKeys)}`,
+        "",
+        `总邀请: ${summary.total} 人`,
+        `参与邀请人数: ${summary.inviters} 人`,
+        `涉及邀请链接: ${summary.links} 条`
+      ].join("\n")
+    : [
+        "<b>7-day invite stats</b>",
+        `Range: ${dateRangeLabel(dateKeys)}`,
+        "",
+        `Invites: ${summary.total}`,
+        `Inviters: ${summary.inviters}`,
+        `Invite links: ${summary.links}`
+      ].join("\n");
+}
+
+function memberStatsSummaryText(
+  summary: { joins: number; leaves: number; days: Array<{ date: string; joins: number; leaves: number }> },
+  dateKeys: string[],
+  locale: Locale,
+  includeDailyRows: boolean
+) {
+  const totalLines = locale === "zh-CN"
+    ? [
+        `<b>${includeDailyRows ? "7日进退群统计" : "今日进退群数据"}</b>`,
+        `范围: ${dateRangeLabel(dateKeys)}`,
+        "",
+        `进群: ${summary.joins} 人`,
+        `退群: ${summary.leaves} 人`,
+        `净增长: ${summary.joins - summary.leaves} 人`
+      ]
+    : [
+        `<b>${includeDailyRows ? "7-day join/leave stats" : "Today join/leave data"}</b>`,
+        `Range: ${dateRangeLabel(dateKeys)}`,
+        "",
+        `Joins: ${summary.joins}`,
+        `Leaves: ${summary.leaves}`,
+        `Net: ${summary.joins - summary.leaves}`
+      ];
+
+  if (!includeDailyRows) return totalLines.join("\n");
+
+  const dailyLines = summary.days.map((row) =>
+    locale === "zh-CN"
+      ? `${row.date}: 进 ${row.joins} / 退 ${row.leaves} / 净 ${row.joins - row.leaves}`
+      : `${row.date}: +${row.joins} / -${row.leaves} / net ${row.joins - row.leaves}`
+  );
+  return [...totalLines, "", ...dailyLines].join("\n");
+}
+
 function chatPanelText(chat: PrismaChat, locale: Locale) {
   const title = escapeHtml(chat.title ?? chat.username ?? String(chat.telegramChatId));
   return locale === "zh-CN"
@@ -4701,15 +6601,133 @@ function blocklistText(settings: BlocklistSettings, locale: Locale) {
 }
 
 function welcomeText(settings: WelcomeSettings, locale: Locale) {
+  const hasMedia = Boolean(settings.mediaKind && settings.mediaFileId);
+  const hasButton = Boolean(settings.buttonText && settings.buttonUrl);
+  const hasText = Boolean(settings.text.trim());
+  if (locale !== "zh-CN") {
+    return [
+      "<b>🎉 Welcome</b>",
+      "",
+      `<b>Status</b>: ${settings.enabled ? "On✅" : "Off❌"}`,
+      `<b>Delete message (minutes)</b>: ${settings.deleteAfterMinutes || "No"}`,
+      "",
+      "<b>Custom welcome content</b>:",
+      ` ┌🖼 Media: ${hasMedia ? "✅" : "❌"}`,
+      ` ├🔗 Link button: ${hasButton ? "✅" : "❌"}`,
+      ` └📃 Text content: ${hasText ? "✅" : "❌"}`
+    ].join("\n");
+  }
+
+  return [
+    "<b>🎉 进群欢迎</b>",
+    "",
+    `<b>状态</b>: ${settings.enabled ? "开启✅" : "关闭❌"}`,
+    `<b>删除消息(分钟)</b>: ${settings.deleteAfterMinutes || "否"}`,
+    "",
+    "<b>自定义欢迎内容</b>:",
+    ` ┌🖼 媒体图片: ${hasMedia ? "✅" : "❌"}`,
+    ` ├🔗 链接按钮: ${hasButton ? "✅" : "❌"}`,
+    ` └📃 文本内容: ${hasText ? "✅" : "❌"}`
+  ].join("\n");
+}
+
+function welcomeInputPromptText(field: WelcomeInputField, settings: WelcomeSettings, locale: Locale) {
+  if (field === "media") {
+    return locale === "zh-CN"
+      ? "请回复图片、视频、贴图、动画表情进行设置"
+      : "Send a photo, video, GIF, or sticker as the welcome media.";
+  }
+
+  if (field === "button") {
+    const current = settings.buttonText && settings.buttonUrl ? `${settings.buttonText} | ${settings.buttonUrl}` : "-";
+    return locale === "zh-CN"
+      ? [
+          "请输入链接按钮，格式：",
+          "<code>按钮文字 | https://example.com</code>",
+          "",
+          `当前按钮：<code>${escapeHtml(current)}</code>`
+        ].join("\n")
+      : [
+          "Send a link button in this format:",
+          "<code>Button text | https://example.com</code>",
+          "",
+          `Current button: <code>${escapeHtml(current)}</code>`
+        ].join("\n");
+  }
+
   return locale === "zh-CN"
-    ? `<b>🎉 进群欢迎</b>\n状态：${onOffZh(settings.enabled)}\n欢迎语：${escapeHtml(settings.text)}`
-    : `<b>🎉 Welcome</b>\nStatus: ${onOff(settings.enabled)}\nText: ${escapeHtml(settings.text)}`;
+    ? [
+        "👉 <strong>现在输入文本设置你的欢迎内容</strong>",
+        "",
+        '支持 💡HTML( <a href="tg://bot_command?command=html">/html</a> ) 和文字字体格式(加粗、链接、剧透、块引用等)及以下变量:',
+        "<code>{NAME}</code> • 用户名",
+        "<code>{MENTION}</code> • 用户名和链接",
+        "<code>{GROUPNAME}</code> • 群组名"
+      ].join("\n")
+    : [
+        "Send the welcome text. Available variables:",
+        "<code>{name}</code> <code>{username}</code> <code>{chat}</code>",
+        "",
+        `Current text:\n${escapeHtml(settings.text || "-")}`
+      ].join("\n");
+}
+
+function welcomeInputSavedText(locale: Locale) {
+  return locale === "zh-CN" ? "✅ 设置成功，点击按钮返回。" : "✅ Saved. Tap the button to return.";
+}
+
+function isWelcomeInputField(value: string | undefined): value is WelcomeInputField {
+  return value === "text" || value === "media" || value === "button";
+}
+
+function clearWelcomeField(settings: WelcomeSettings, field: WelcomeInputField) {
+  if (field === "text") {
+    settings.text = "";
+    return;
+  }
+  if (field === "media") {
+    settings.mediaKind = undefined;
+    settings.mediaFileId = undefined;
+    return;
+  }
+  settings.buttonText = "";
+  settings.buttonUrl = "";
 }
 
 function joinVerifyText(settings: JoinVerifySettings, locale: Locale) {
-  return locale === "zh-CN"
-    ? `<b>🧩 进群验证</b>\n状态：${onOffZh(settings.enabled)}\n管理员审批：${onOffZh(settings.adminApproval)}`
-    : `<b>🧩 Join verification</b>\nStatus: ${onOff(settings.enabled)}\nAdmin approval: ${onOff(settings.adminApproval)}`;
+  if (locale !== "zh-CN") {
+    return [
+      "<b>🤖 Join verification</b>",
+      "",
+      "New members must complete verification before they can send messages.",
+      "",
+      `<b>Status</b>: ${settings.enabled ? "On✅" : "Off❌"}`,
+      `<b>Verification time</b>: ${settings.durationMinutes} minute${settings.durationMinutes === 1 ? "" : "s"}`,
+      `<b>Timeout penalty</b>: ${settings.punishment === "mute" ? "Mute 24h" : settings.punishment === "kick" ? "Kick" : "Ban"}`,
+      "",
+      "<b>⚠️ Admin approval</b>",
+      "For public groups, enable join requests in group settings.",
+      "For private groups, create a new invite link with admin approval enabled.",
+      "The default private invite link does not trigger verification."
+    ].join("\n");
+  }
+
+  return [
+    "<b>🤖 进群验证</b>",
+    "",
+    "启用后，新用户需要完成验证，才能发送消息。",
+    "",
+    `<b>状态</b>：${settings.enabled ? "开启✅" : "关闭❌"}`,
+    `<b>验证时间</b>：${settings.durationMinutes} 分钟`,
+    `<b>超时惩罚</b>：${settings.punishment === "mute" ? "禁言24小时" : settings.punishment === "kick" ? "踢出" : "封禁"}`,
+    "",
+    "<b>⚠️ 注意事项：</b>",
+    "若启用了 <b>【管理员审批】</b>，请确保进行以下设置：",
+    "",
+    "<b>• 公共群组</b>：在群组设置中启用“新成员审核”；",
+    "<b>• 私有群组</b>：请使用 <u>新建的邀请链接</u>，并启用“管理员审批”。",
+    "    私有群组默认的邀请链接 <b>不会触发验证流程</b>！"
+  ].join("\n");
 }
 
 function autoDeleteText(settings: AutoDeleteSettings, locale: Locale) {
@@ -4884,25 +6902,6 @@ async function declineJoinRequest(ctx: Context, request: ChatJoinRequest) {
   });
 }
 
-function fullChatPermissions() {
-  return {
-    can_send_messages: true,
-    can_send_audios: true,
-    can_send_documents: true,
-    can_send_photos: true,
-    can_send_videos: true,
-    can_send_video_notes: true,
-    can_send_voice_notes: true,
-    can_send_polls: true,
-    can_send_other_messages: true,
-    can_add_web_page_previews: true,
-    can_change_info: false,
-    can_invite_users: true,
-    can_pin_messages: false,
-    can_manage_topics: true
-  };
-}
-
 function noChatPermissions() {
   return {
     can_send_messages: false,
@@ -4935,6 +6934,14 @@ function verificationKey(chatId: number, userId: number) {
   return `${chatId}:${userId}`;
 }
 
+function joinVerificationRecordId(chatId: string, userId: number) {
+  return `${chatId}:${userId}`;
+}
+
+function isJoinVerifyPunishment(value: unknown): value is JoinVerifySettings["punishment"] {
+  return value === "mute" || value === "kick" || value === "ban";
+}
+
 function isGroupLike(chat: Chat) {
   return chat.type === "group" || chat.type === "supergroup";
 }
@@ -4950,6 +6957,46 @@ function displayPrismaUser(user: PrismaUser) {
 
 function formatDate(date: Date) {
   return date.toISOString().slice(0, 10);
+}
+
+function recentDateKeys(days: number, end = new Date()) {
+  const count = Math.max(1, Math.round(days));
+  const endDate = new Date(`${formatDate(end)}T00:00:00.000Z`);
+  const keys: string[] = [];
+  for (let index = count - 1; index >= 0; index -= 1) {
+    const item = new Date(endDate);
+    item.setUTCDate(item.getUTCDate() - index);
+    keys.push(formatDate(item));
+  }
+  return keys;
+}
+
+function currentMonthDateKeys(end = new Date()) {
+  const today = new Date(`${formatDate(end)}T00:00:00.000Z`);
+  const current = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1));
+  const keys: string[] = [];
+  while (current <= today) {
+    keys.push(formatDate(current));
+    current.setUTCDate(current.getUTCDate() + 1);
+  }
+  return keys;
+}
+
+function dateKeysToUtcRange(dateKeys: string[]) {
+  const sorted = [...dateKeys].sort();
+  const first = sorted[0] ?? formatDate(new Date());
+  const last = sorted[sorted.length - 1] ?? first;
+  const start = new Date(`${first}T00:00:00.000Z`);
+  const end = new Date(`${last}T00:00:00.000Z`);
+  end.setUTCDate(end.getUTCDate() + 1);
+  return { start, end };
+}
+
+function dateRangeLabel(dateKeys: string[]) {
+  const sorted = [...dateKeys].sort();
+  const first = sorted[0] ?? "-";
+  const last = sorted[sorted.length - 1] ?? first;
+  return first === last ? first : `${first} ~ ${last}`;
 }
 
 function clampNumber(value: number, min: number, max: number) {

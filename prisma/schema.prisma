@@ -120,6 +120,7 @@ model Chat {
   statsEvents       ChatStatsEvent[]
   inviteLinks       InviteLink[]
   inviteJoins       InviteJoin[]
+  joinVerifications JoinVerification[]
   pointBalances     ChatPointBalance[]
   pointTransactions ChatPointTransaction[]
 
@@ -329,6 +330,26 @@ model InviteJoin {
   @@unique([chatId, userId])
   @@index([chatId, inviteLinkId])
   @@map("invite_joins")
+}
+
+model JoinVerification {
+  id             String   @id
+  chatId         String   @map("chat_id")
+  telegramChatId BigInt   @map("telegram_chat_id")
+  telegramUserId BigInt   @map("telegram_user_id")
+  messageId      Int      @map("message_id")
+  mode           String   @db.VarChar(32)
+  answer         String   @db.VarChar(64)
+  punishment     String   @db.VarChar(16)
+  expiresAt      DateTime @map("expires_at")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  chat Chat @relation(fields: [chatId], references: [id], onDelete: Cascade)
+
+  @@unique([chatId, telegramUserId])
+  @@index([expiresAt])
+  @@map("join_verifications")
 }
 
 model ChatPointBalance {

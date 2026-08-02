@@ -3,6 +3,7 @@ import { InlineKeyboard, type Context } from "grammy";
 import type { ChatPermissions, User } from "grammy/types";
 import type { AppConfig } from "../lib/config.js";
 import { prisma } from "../lib/prisma.js";
+import { canConfigureChat } from "./permissions.js";
 
 type Locale = "zh-CN" | "en";
 
@@ -102,6 +103,11 @@ export async function handleNewMemberLimitPrivateMessage(ctx: Context, _config: 
     return true;
   }
 
+  if (!(await ensureCanConfigureChat(ctx, chat, locale))) {
+    durationDrafts.delete(ctx.from.id);
+    return true;
+  }
+
   await saveNewMemberLimitSettings(chat.id, { durationMinutes });
   await ctx.reply(await buildNewMemberLimitMessage(locale, chat), {
     parse_mode: "HTML",
@@ -160,7 +166,25 @@ async function getSelectedGroupChat(ctx: Context, locale: Locale) {
     return null;
   }
 
+  if (!(await ensureCanConfigureChat(ctx, chat, locale))) return null;
+
   return chat;
+}
+
+async function ensureCanConfigureChat(ctx: Context, chat: PrismaChat, locale: Locale) {
+  if (!ctx.from) return false;
+  const allowed = await canConfigureChat(ctx, chat, ctx.from.id).catch(() => false);
+  if (allowed) return true;
+
+  const text = locale === "zh-CN"
+    ? "只有符合控制权限的管理员可以设置机器人。"
+    : "Only permitted admins can configure the bot.";
+  if (ctx.callbackQuery) {
+    await ctx.answerCallbackQuery({ text, show_alert: true }).catch(() => undefined);
+  } else {
+    await ctx.reply(text).catch(() => undefined);
+  }
+  return false;
 }
 
 async function getNewMemberLimitSettings(chatId: string) {

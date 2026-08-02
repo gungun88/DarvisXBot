@@ -3,7 +3,7 @@ import type { ChatPermissions } from "grammy/types";
 import { ChatStatus, Prisma, type Chat as PrismaChat } from "@prisma/client";
 import type { AppConfig } from "../lib/config.js";
 import { prisma } from "../lib/prisma.js";
-import { isUserChatAdmin } from "./permissions.js";
+import { canConfigureChat, isUserChatAdmin } from "./permissions.js";
 
 type Locale = "zh-CN" | "en";
 
@@ -79,6 +79,12 @@ export async function handleOpenClosePrivateMessage(ctx: Context, _config: AppCo
     return true;
   }
 
+  const chat = await prisma.chat.findUnique({ where: { id: draft.chatId } });
+  if (!chat || !(await ensureCanConfigureChat(ctx, chat, locale))) {
+    drafts.delete(ctx.from.id);
+    return true;
+  }
+
   await saveSettings(draft.chatId, { [draft.field]: value });
   drafts.delete(ctx.from.id);
   const settings = await getSettings(draft.chatId);
@@ -123,7 +129,25 @@ async function selectedChat(ctx: Context, locale: Locale) {
     await renderMenu(ctx, locale === "zh-CN" ? "未找到这个已绑定群组。" : "That bound group was not found.", homeKeyboard(locale));
     return null;
   }
+  if (!(await ensureCanConfigureChat(ctx, chat, locale))) return null;
+
   return chat;
+}
+
+async function ensureCanConfigureChat(ctx: Context, chat: PrismaChat, locale: Locale) {
+  if (!ctx.from) return false;
+  const allowed = await canConfigureChat(ctx, chat, ctx.from.id).catch(() => false);
+  if (allowed) return true;
+
+  const text = locale === "zh-CN"
+    ? "只有符合控制权限的管理员可以设置机器人。"
+    : "Only permitted admins can configure the bot.";
+  if (ctx.callbackQuery) {
+    await ctx.answerCallbackQuery({ text, show_alert: true }).catch(() => undefined);
+  } else {
+    await ctx.reply(text).catch(() => undefined);
+  }
+  return false;
 }
 
 async function getSettings(chatId: string): Promise<OpenCloseSettings> {

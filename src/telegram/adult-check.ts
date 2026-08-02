@@ -1,7 +1,7 @@
 import { ChatStatus, Prisma, type Chat as PrismaChat } from "@prisma/client";
 import { InlineKeyboard, type Context } from "grammy";
 import { prisma } from "../lib/prisma.js";
-import { isUserChatAdmin } from "./permissions.js";
+import { canConfigureChat, isUserChatAdmin } from "./permissions.js";
 
 type Locale = "zh-CN" | "en";
 type AdultCheckSensitivity = "low" | "medium" | "high" | "extreme";
@@ -183,7 +183,25 @@ async function getSelectedChat(ctx: Context, locale: Locale) {
     return null;
   }
 
+  if (!(await ensureCanConfigureChat(ctx, chat, locale))) return null;
+
   return chat;
+}
+
+async function ensureCanConfigureChat(ctx: Context, chat: PrismaChat, locale: Locale) {
+  if (!ctx.from) return false;
+  const allowed = await canConfigureChat(ctx, chat, ctx.from.id).catch(() => false);
+  if (allowed) return true;
+
+  const text = locale === "zh-CN"
+    ? "只有符合控制权限的管理员可以设置机器人。"
+    : "Only permitted admins can configure the bot.";
+  if (ctx.callbackQuery) {
+    await ctx.answerCallbackQuery({ text, show_alert: true }).catch(() => undefined);
+  } else {
+    await ctx.reply(text).catch(() => undefined);
+  }
+  return false;
 }
 
 async function getAdultCheckSettings(chatId: string) {
