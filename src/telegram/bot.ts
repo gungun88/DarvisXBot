@@ -1221,6 +1221,10 @@ function autoReplyCancelKeyboard(_chatId: string, locale: Locale) {
   return new InlineKeyboard().text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "auto_reply:cancel");
 }
 
+function autoReplyDoneKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "\u{1F519} \u8FD4\u56DE" : "\u{1F519} Back", `chat_feature:auto_reply:${chatId}`);
+}
+
 function autoReplyButtonsKeyboard(_chatId: string, locale: Locale) {
   return new InlineKeyboard().text(
     locale === "zh-CN" ? "♻️ 不设置，跳过" : "♻️ Skip buttons",
@@ -2904,7 +2908,7 @@ async function handleAutoReplyInputMessage(ctx: Context, locale: Locale) {
     await saveAutoReplySettings(draft.chatId, settings);
     await ctx.reply(locale === "zh-CN" ? "✅ 删除成功，点击按钮返回。" : "✅ Deleted. Tap the button to return.", {
       parse_mode: "HTML",
-      reply_markup: autoReplyCancelKeyboard(draft.chatId, locale)
+      reply_markup: autoReplyDoneKeyboard(draft.chatId, locale)
     });
     return true;
   }
@@ -2964,7 +2968,7 @@ async function finalizeAutoReplyRule(
   await saveAutoReplySettings(draft.chatId, settings);
   await ctx.reply(locale === "zh-CN" ? "✅ 设置成功，点击按钮返回。" : "✅ Saved. Tap the button to return.", {
     parse_mode: "HTML",
-    reply_markup: autoReplyCancelKeyboard(draft.chatId, locale)
+    reply_markup: autoReplyDoneKeyboard(draft.chatId, locale)
   });
 }
 
