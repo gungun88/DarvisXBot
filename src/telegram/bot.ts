@@ -75,6 +75,14 @@ import {
   rememberSelectedOpenCloseChat
 } from "./open-close.js";
 import {
+  handleNightModeAction,
+  handleNightModeMessage,
+  handleNightModePrivateMessage,
+  openNightModeMenu,
+  rememberSelectedNightModeChat,
+  startNightModeScheduler
+} from "./night-mode.js";
+import {
   createJoinVerificationChallenge,
   isJoinVerifyMode,
   type JoinVerificationChallenge,
@@ -355,10 +363,12 @@ function rememberSelectedChatForModules(userId: number | undefined, chatId: stri
   rememberSelectedNewMemberLimitChat(userId, chatId);
   rememberSelectedOpenCloseChat(userId, chatId);
   rememberSelectedAdultCheckChat(userId, chatId);
+  rememberSelectedNightModeChat(userId, chatId);
 }
 
 export function createBot(config: AppConfig) {
   const bot = new Bot(config.botToken);
+  startNightModeScheduler(bot);
 
   bot.catch((error) => {
     console.error("Telegram bot error", {
@@ -511,6 +521,10 @@ export function createBot(config: AppConfig) {
     await handleAdultCheckCallback(ctx);
   });
 
+  bot.callbackQuery(/^night_mode:/, async (ctx) => {
+    await handleNightModeCallback(ctx);
+  });
+
   bot.callbackQuery(/^verify:/, async (ctx) => {
     await handleVerificationCallback(ctx);
   });
@@ -537,6 +551,8 @@ export function createBot(config: AppConfig) {
     if (await handlePublishInputMessage(ctx, locale)) return;
     if (await handleNewMemberLimitPrivateMessage(ctx, config, locale)) return;
     if (await handleOpenClosePrivateMessage(ctx, config, locale)) return;
+    if (await handleNightModePrivateMessage(ctx, locale)) return;
+    if (await handleNightModeMessage(ctx)) return;
     if (await handleOpenCloseGroupMessage(ctx)) return;
     if (await handleAdultCheckMessage(ctx, locale)) return;
     await handleIncomingMessage(ctx, config);
@@ -3981,6 +3997,11 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
     return;
   }
 
+  if (feature === "night_mode") {
+    await openNightModeMenu(ctx, locale);
+    return;
+  }
+
   if (feature === "scheduled") {
     await openScheduledMessagePanel(ctx, locale, chat);
     return;
@@ -4021,7 +4042,7 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
     return;
   }
 
-  if (feature === "schedule" || feature === "night_mode" || feature === "commands" || feature === "speech_check" || feature === "banned_words" || feature === "anti_spam" || feature === "import" || feature === "members" || feature === "sync") {
+  if (feature === "schedule" || feature === "commands" || feature === "speech_check" || feature === "banned_words" || feature === "anti_spam" || feature === "import" || feature === "members" || feature === "sync") {
     await editOrReply(
       ctx,
       locale === "zh-CN"
@@ -4057,6 +4078,14 @@ async function handleAdultCheckCallback(ctx: Context) {
   const key = ctx.callbackQuery?.data?.replace("adult_check:", "");
   if (!key) return;
   await handleAdultCheckAction(ctx, locale, key);
+}
+
+async function handleNightModeCallback(ctx: Context) {
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  const locale = await getLocale(ctx);
+  const key = ctx.callbackQuery?.data?.replace("night_mode:", "");
+  if (!key) return;
+  await handleNightModeAction(ctx, locale, key);
 }
 
 async function handleInviteLinkCallback(ctx: Context) {
