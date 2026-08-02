@@ -150,7 +150,7 @@ type ScheduledInputDraft = {
   field: ScheduledInputField;
 };
 
-type AutoReplyInputStage = "keyword" | "response" | "buttons";
+type AutoReplyInputStage = "keyword" | "response" | "buttons" | "trigger" | "delete";
 
 type AutoReplyInputDraft = {
   chatId: string;
@@ -160,6 +160,7 @@ type AutoReplyInputDraft = {
   response?: string;
   mediaKind?: AutoReplyMediaKind;
   mediaFileId?: string;
+  buttons?: AutoReplyButton[][];
 };
 
 type ScheduledMessageListItem = {
@@ -1225,6 +1226,12 @@ function autoReplyButtonsKeyboard(chatId: string, locale: Locale) {
     locale === "zh-CN" ? "♻️ 不设置，跳过" : "♻️ Skip buttons",
     `auto_reply:skip_buttons:${chatId}`
   );
+}
+
+function autoReplyTriggerKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "包含触发" : "Contains", `auto_reply:trigger:${chatId}:contains`)
+    .text(locale === "zh-CN" ? "精准触发" : "Exact", `auto_reply:trigger:${chatId}:exact`);
 }
 
 async function handleMenuCallback(ctx: Context, config: AppConfig) {
@@ -2836,7 +2843,6 @@ async function handleAutoReplyInputMessage(ctx: Context, locale: Locale) {
     }
 
     draft.keyword = parsed.keyword;
-    draft.matchType = parsed.matchType;
     draft.stage = "response";
     await ctx.reply(autoReplyResponsePromptText(parsed.keyword, locale), {
       parse_mode: "HTML",
@@ -2871,6 +2877,46 @@ async function handleAutoReplyInputMessage(ctx: Context, locale: Locale) {
     return true;
   }
 
+  if (draft.stage === "delete") {
+    const text = getMessageText(ctx.message);
+    const keyword = text ? normalizeAutoReplyKeywordName(text) : "";
+    if (!keyword) {
+      const settings = await getAutoReplySettings(draft.chatId);
+      await ctx.reply(autoReplyDeletePromptText(settings, locale), {
+        parse_mode: "HTML",
+        reply_markup: autoReplyCancelKeyboard(draft.chatId, locale)
+      });
+      return true;
+    }
+
+    const settings = await getAutoReplySettings(draft.chatId);
+    const index = settings.rules.findIndex((rule) => rule.keyword === keyword);
+    if (index < 0) {
+      await ctx.reply(locale === "zh-CN" ? "未找到这个关键词，请重新输入。" : "Keyword not found. Send it again.", {
+        parse_mode: "HTML",
+        reply_markup: autoReplyCancelKeyboard(draft.chatId, locale)
+      });
+      return true;
+    }
+
+    settings.rules.splice(index, 1);
+    autoReplyInputDrafts.delete(ctx.from.id);
+    await saveAutoReplySettings(draft.chatId, settings);
+    await ctx.reply(locale === "zh-CN" ? "✅ 删除成功，点击按钮返回。" : "✅ Deleted. Tap the button to return.", {
+      parse_mode: "HTML",
+      reply_markup: autoReplyCancelKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
+  if (draft.stage === "trigger") {
+    await ctx.reply(autoReplyTriggerPromptText(locale), {
+      parse_mode: "HTML",
+      reply_markup: autoReplyTriggerKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
   const text = getMessageText(ctx.message);
   const buttons = text ? parseAutoReplyButtonLayout(text) : null;
   if (!buttons) {
@@ -2883,15 +2929,19 @@ async function handleAutoReplyInputMessage(ctx: Context, locale: Locale) {
     return true;
   }
 
-  await finalizeAutoReplyRule(ctx, locale, draft, buttons);
+  draft.buttons = buttons;
+  draft.stage = "trigger";
+  await ctx.reply(autoReplyTriggerPromptText(locale), {
+    parse_mode: "HTML",
+    reply_markup: autoReplyTriggerKeyboard(draft.chatId, locale)
+  });
   return true;
 }
 
 async function finalizeAutoReplyRule(
   ctx: Context,
   locale: Locale,
-  draft: AutoReplyInputDraft,
-  buttons?: AutoReplyButton[][]
+  draft: AutoReplyInputDraft
 ) {
   if (!ctx.from || !draft.keyword || !draft.matchType || (!draft.response && !draft.mediaFileId)) return;
 
@@ -2907,7 +2957,7 @@ async function finalizeAutoReplyRule(
     rule.mediaKind = draft.mediaKind;
     rule.mediaFileId = draft.mediaFileId;
   }
-  if (buttons?.length) rule.buttons = buttons;
+  if (draft.buttons?.length) rule.buttons = draft.buttons;
 
   settings.rules.push(rule);
   autoReplyInputDrafts.delete(ctx.from.id);
@@ -2923,14 +2973,19 @@ function parseAutoReplyKeyword(input: string) {
   if (!value) return null;
 
   const prefix = value[0];
-  const matchType = prefix === "*" ? "contains" : "exact";
   const keyword = prefix === "-" || prefix === "*" ? value.slice(1).trim() : value;
   if (!keyword) return null;
 
   return {
-    keyword: keyword.slice(0, 80),
-    matchType
+    keyword: keyword.slice(0, 80)
   } as const;
+}
+
+function normalizeAutoReplyKeywordName(input: string) {
+  const value = input.trim();
+  if (!value) return "";
+  const prefix = value[0];
+  return (prefix === "-" || prefix === "*" ? value.slice(1) : value).trim().slice(0, 80);
 }
 
 function extractAutoReplyContent(message: Message | undefined) {
@@ -3705,6 +3760,17 @@ async function handleAutoReplyCallback(ctx: Context, config: AppConfig) {
     if (!ctx.from) return;
     const draft = autoReplyInputDrafts.get(ctx.from.id);
     if (!draft || draft.chatId !== chatId || draft.stage !== "buttons") return;
+    delete draft.buttons;
+    draft.stage = "trigger";
+    await editOrReply(ctx, autoReplyTriggerPromptText(locale), autoReplyTriggerKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "trigger" && (value === "exact" || value === "contains")) {
+    if (!ctx.from) return;
+    const draft = autoReplyInputDrafts.get(ctx.from.id);
+    if (!draft || draft.chatId !== chatId || draft.stage !== "trigger") return;
+    draft.matchType = value;
     await finalizeAutoReplyRule(ctx, locale, draft);
     return;
   }
@@ -3724,7 +3790,10 @@ async function handleAutoReplyCallback(ctx: Context, config: AppConfig) {
       }).catch(() => undefined);
       return;
     }
-    await editOrReply(ctx, autoReplyDeleteText(settings, locale), autoReplyDeleteKeyboard(chatId, settings, locale));
+    if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    autoReplyInputDrafts.set(ctx.from.id, { chatId, stage: "delete" });
+    await editOrReply(ctx, autoReplyDeletePromptText(settings, locale), autoReplyCancelKeyboard(chatId, locale));
     return;
   }
 
@@ -4658,6 +4727,26 @@ function autoReplyDeleteText(settings: AutoReplySettings, locale: Locale) {
     : ["🗑 <b>Delete keyword</b>", "", "Choose a keyword to delete:", ...lines].join("\n");
 }
 
+function autoReplyDeletePromptText(settings: AutoReplySettings, locale: Locale) {
+  const rules = settings.rules.length
+    ? settings.rules.map((rule) => `<code>${escapeHtml(rule.keyword)}</code>`)
+    : [locale === "zh-CN" ? "[空]" : "[None]"];
+
+  return locale === "zh-CN"
+    ? [
+        "请输入要删除的关键词，一次只能删除一个，回复关键词名:",
+        "",
+        "<strong>已添加的关键词:</strong>",
+        ...rules
+      ].join("\n")
+    : [
+        "Send the keyword name to delete. Only one keyword can be deleted at a time:",
+        "",
+        "<strong>Added keywords:</strong>",
+        ...rules
+      ].join("\n");
+}
+
 function autoReplyKeywordPromptText(settings: AutoReplySettings, locale: Locale) {
   const rules = settings.rules.length
     ? settings.rules.map((rule) => `${rule.matchType === "exact" ? "-" : "*"} ${escapeHtml(rule.keyword)}`)
@@ -4670,8 +4759,7 @@ function autoReplyKeywordPromptText(settings: AutoReplySettings, locale: Locale)
         "<strong>已添加的关键词:</strong>",
         ...rules,
         "",
-        "👉 第一步 请输入关键词:",
-        "<i>直接输入为精准匹配，使用 * 开头为包含匹配</i>"
+        "👉 第一步 请输入关键词:"
       ].join("\n")
     : [
         "💬 Keyword replies",
@@ -4679,8 +4767,7 @@ function autoReplyKeywordPromptText(settings: AutoReplySettings, locale: Locale)
         "<strong>Added keywords:</strong>",
         ...rules,
         "",
-        "👉 Step 1: Send a keyword:",
-        "<i>Plain text matches exactly; use * for contains matching.</i>"
+        "👉 Step 1: Send a keyword:"
       ].join("\n");
 }
 
@@ -4730,6 +4817,20 @@ function autoReplyButtonsPromptText(locale: Locale) {
         "https:// is optional.",
         "",
         "<strong>👉 Send button content:</strong>"
+      ].join("\n");
+}
+
+function autoReplyTriggerPromptText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "💬 关键词回复",
+        "",
+        "👉 最后，请选择回复触发方式:"
+      ].join("\n")
+    : [
+        "💬 Keyword replies",
+        "",
+        "👉 Finally, choose how this reply is triggered:"
       ].join("\n");
 }
 
