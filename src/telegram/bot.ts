@@ -1217,21 +1217,21 @@ function autoReplyDeleteKeyboard(chatId: string, settings: AutoReplySettings, lo
   return keyboard.text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `chat_feature:auto_reply:${chatId}`);
 }
 
-function autoReplyCancelKeyboard(chatId: string, locale: Locale) {
-  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `auto_reply:cancel:${chatId}`);
+function autoReplyCancelKeyboard(_chatId: string, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "auto_reply:cancel");
 }
 
-function autoReplyButtonsKeyboard(chatId: string, locale: Locale) {
+function autoReplyButtonsKeyboard(_chatId: string, locale: Locale) {
   return new InlineKeyboard().text(
     locale === "zh-CN" ? "♻️ 不设置，跳过" : "♻️ Skip buttons",
-    `auto_reply:skip_buttons:${chatId}`
+    "auto_reply:skip_buttons"
   );
 }
 
-function autoReplyTriggerKeyboard(chatId: string, locale: Locale) {
+function autoReplyTriggerKeyboard(_chatId: string, locale: Locale) {
   return new InlineKeyboard()
-    .text(locale === "zh-CN" ? "包含触发" : "Contains", `auto_reply:trigger:${chatId}:contains`)
-    .text(locale === "zh-CN" ? "精准触发" : "Exact", `auto_reply:trigger:${chatId}:exact`);
+    .text(locale === "zh-CN" ? "包含触发" : "Contains", "auto_reply:trigger:contains")
+    .text(locale === "zh-CN" ? "精准触发" : "Exact", "auto_reply:trigger:exact");
 }
 
 async function handleMenuCallback(ctx: Context, config: AppConfig) {
@@ -3721,8 +3721,28 @@ async function handleAutoReplyCallback(ctx: Context, config: AppConfig) {
   const data = ctx.callbackQuery?.data;
   if (!data) return;
 
-  const [, action, chatId, value] = data.split(":");
-  if (!action || !chatId) return;
+  const parts = data.split(":");
+  const action = parts[1];
+  if (!action) return;
+
+  const draft = ctx.from ? autoReplyInputDrafts.get(ctx.from.id) : undefined;
+  let chatId: string | undefined;
+  let value: string | undefined;
+  if (action === "cancel" || action === "skip_buttons") {
+    chatId = draft?.chatId ?? parts[2];
+  } else if (action === "trigger") {
+    if (parts[2] === "exact" || parts[2] === "contains") {
+      chatId = draft?.chatId;
+      value = parts[2];
+    } else {
+      chatId = parts[2];
+      value = parts[3];
+    }
+  } else {
+    chatId = parts[2];
+    value = parts[3];
+  }
+  if (!chatId) return;
 
   const locale = await getLocale(ctx);
   const settings = await getAutoReplySettings(chatId);
