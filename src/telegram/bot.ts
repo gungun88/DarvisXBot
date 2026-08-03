@@ -1,12 +1,15 @@
 import { Bot, InlineKeyboard, InputFile } from "grammy";
 import type { Context } from "grammy";
 import type { Chat, ChatInviteLink, ChatJoinRequest, ChatPermissions, InlineKeyboardMarkup, InlineQueryResult, Message, User } from "grammy/types";
+import { deflateSync } from "node:zlib";
 import {
   ChatStatsEventType,
   ChatStatus,
   GiveawayStatus,
   PointTransactionType,
   Prisma,
+  RuleAction,
+  RuleType,
   ScheduledMessageStatus,
   type Chat as PrismaChat,
   type User as PrismaUser
@@ -83,6 +86,14 @@ import {
   startNightModeScheduler
 } from "./night-mode.js";
 import {
+  clearSpeechCheckDraft,
+  handleSpeechCheckAction,
+  handleSpeechCheckMessage,
+  handleSpeechCheckPrivateMessage,
+  openSpeechCheckMenu,
+  rememberSelectedSpeechCheckChat
+} from "./speech-check.js";
+import {
   createJoinVerificationChallenge,
   isJoinVerifyMode,
   type JoinVerificationChallenge,
@@ -118,6 +129,8 @@ type WelcomeSettings = {
   mediaFileId: string | undefined;
   buttonText: string;
   buttonUrl: string;
+  buttons: AutoReplyButton[][] | undefined;
+  replyKeyboard: string[][] | undefined;
   lastMessageIds: number[];
 };
 
@@ -147,14 +160,16 @@ type InviteLinkSettings = {
   memberLimit: number;
 };
 
-type InviteLinkInputField = "expireDays" | "memberLimit";
+type InviteLinkInputField = "expireDays" | "memberLimit" | "resetUserId";
 
 type InviteLinkInputDraft = {
   chatId: string;
   field: InviteLinkInputField;
 };
 
-type AutoDeleteSettings = {
+type AutoDeleteEventKey = "join" | "leave" | "boost" | "pin" | "photo" | "title";
+
+type AutoDeleteSettings = Record<AutoDeleteEventKey, boolean> & {
   enabled: boolean;
   seconds: number;
 };
@@ -181,6 +196,29 @@ type AutoReplySettings = {
   deleteAfterMinutes: number;
   deletePreviousMessage: boolean;
   rules: AutoReplyRule[];
+};
+
+type BannedWordsPunishment = "warn_mute" | "mute" | "ban" | "delete_only";
+
+type BannedWordsSettings = {
+  enabled: boolean;
+  punishment: BannedWordsPunishment;
+  warningLimit: number;
+  muteMinutes: number;
+  deleteNotice: boolean;
+};
+
+type BannedWordsInputStage = "add" | "delete";
+
+type BannedWordsInputDraft = {
+  chatId: string;
+  stage: BannedWordsInputStage;
+};
+
+type GroupCommandKey = "link" | "sign_in" | "points_rank" | "points" | "stat" | "stat_week" | "stats" | "lottery";
+
+type GroupCommandSettings = {
+  commands: Record<GroupCommandKey, boolean>;
 };
 
 type MemberStatsSnapshot = {
@@ -274,6 +312,7 @@ const botCommands = [
   { command: "start", description: "开始菜单" },
   { command: "help", description: "帮助" },
   { command: "html", description: "HTML 格式提示" },
+  { command: "clear", description: "关闭底部键盘" },
   { command: "info", description: "查看信息" },
   { command: "link", description: "生成邀请链接并查看统计" },
   { command: "sign_in", description: "群组签到" },
@@ -298,6 +337,8 @@ const defaultWelcomeSettings: WelcomeSettings = {
   mediaFileId: undefined,
   buttonText: "",
   buttonUrl: "",
+  buttons: undefined,
+  replyKeyboard: undefined,
   lastMessageIds: []
 };
 
@@ -327,8 +368,20 @@ const defaultInviteLinkSettings: InviteLinkSettings = {
   memberLimit: 0
 };
 
+const autoDeleteEventKeys = ["join", "leave", "boost", "pin", "photo", "title"] as const satisfies readonly AutoDeleteEventKey[];
+
+function isAutoDeleteEventKey(value: string | undefined): value is AutoDeleteEventKey {
+  return autoDeleteEventKeys.includes(value as AutoDeleteEventKey);
+}
+
 const defaultAutoDeleteSettings: AutoDeleteSettings = {
-  enabled: false,
+  enabled: true,
+  join: false,
+  leave: false,
+  boost: false,
+  pin: true,
+  photo: true,
+  title: true,
   seconds: 0
 };
 
@@ -337,6 +390,29 @@ const defaultAutoReplySettings: AutoReplySettings = {
   deleteAfterMinutes: 0,
   deletePreviousMessage: true,
   rules: []
+};
+
+const defaultBannedWordsSettings: BannedWordsSettings = {
+  enabled: false,
+  punishment: "warn_mute",
+  warningLimit: 3,
+  muteMinutes: 60,
+  deleteNotice: true
+};
+
+const groupCommandDefinitions: Array<{ key: GroupCommandKey; command: string; zh: string; en: string }> = [
+  { key: "link", command: "/link", zh: "邀请链接", en: "Invite link" },
+  { key: "sign_in", command: "/sign_in", zh: "群组签到", en: "Sign in" },
+  { key: "points_rank", command: "/points_rank", zh: "积分排名", en: "Points ranking" },
+  { key: "points", command: "/points", zh: "增减积分", en: "Adjust points" },
+  { key: "stat", command: "/stat", zh: "今日活跃统计", en: "Today stats" },
+  { key: "stat_week", command: "/stat_week", zh: "周活跃统计", en: "Week stats" },
+  { key: "stats", command: "/stats", zh: "自定义活跃统计", en: "Custom stats" },
+  { key: "lottery", command: "/lottery", zh: "抽奖列表", en: "Giveaway list" }
+];
+
+const defaultGroupCommandSettings: GroupCommandSettings = {
+  commands: Object.fromEntries(groupCommandDefinitions.map((item) => [item.key, true])) as Record<GroupCommandKey, boolean>
 };
 
 const defaultMemberStatsSettings: MemberStatsSettings = {
@@ -349,13 +425,21 @@ const defaultMemberStatsSettings: MemberStatsSettings = {
 const pendingVerifications = new Map<string, PendingVerification>();
 const recentJoins = new Map<string, number>();
 const raidJoinEvents = new Map<string, number[]>();
+const bannedWordWarnings = new Map<string, { count: number; expiresAt: number }>();
 const timezoneInputUsers = new Set<number>();
 const publishDrafts = new Map<number, PublishDraft>();
 const scheduledInputDrafts = new Map<number, ScheduledInputDraft>();
 const autoReplyInputDrafts = new Map<number, AutoReplyInputDraft>();
 const autoReplySelectedChats = new Map<number, string>();
+const bannedWordsInputDrafts = new Map<number, BannedWordsInputDraft>();
 const welcomeInputDrafts = new Map<number, WelcomeInputDraft>();
 const inviteLinkInputDrafts = new Map<number, InviteLinkInputDraft>();
+const memberStatsShareCache = new Map<string, {
+  photoFileId: string;
+  caption: string;
+  title: string;
+  updatedAt: number;
+}>();
 
 function rememberSelectedChatForModules(userId: number | undefined, chatId: string) {
   if (typeof userId !== "number") return;
@@ -364,6 +448,7 @@ function rememberSelectedChatForModules(userId: number | undefined, chatId: stri
   rememberSelectedOpenCloseChat(userId, chatId);
   rememberSelectedAdultCheckChat(userId, chatId);
   rememberSelectedNightModeChat(userId, chatId);
+  rememberSelectedSpeechCheckChat(userId, chatId);
 }
 
 export function createBot(config: AppConfig) {
@@ -407,6 +492,13 @@ export function createBot(config: AppConfig) {
       ].join("\n"),
       { parse_mode: "HTML" }
     );
+  });
+
+  bot.command("clear", async (ctx) => {
+    const locale = await getLocale(ctx);
+    await ctx.reply(locale === "zh-CN" ? "已关闭底部键盘。" : "Reply keyboard cleared.", {
+      reply_markup: { remove_keyboard: true }
+    });
   });
 
   bot.command("info", async (ctx) => {
@@ -509,6 +601,14 @@ export function createBot(config: AppConfig) {
     await handleAutoReplyCallback(ctx, config);
   });
 
+  bot.callbackQuery(/^banned_words:/, async (ctx) => {
+    await handleBannedWordsCallback(ctx);
+  });
+
+  bot.callbackQuery(/^group_commands:/, async (ctx) => {
+    await handleGroupCommandsCallback(ctx);
+  });
+
   bot.callbackQuery(/^new_member_limit:/, async (ctx) => {
     await handleNewMemberLimitCallback(ctx, config);
   });
@@ -523,6 +623,10 @@ export function createBot(config: AppConfig) {
 
   bot.callbackQuery(/^night_mode:/, async (ctx) => {
     await handleNightModeCallback(ctx);
+  });
+
+  bot.callbackQuery(/^speech_check:/, async (ctx) => {
+    await handleSpeechCheckCallback(ctx);
   });
 
   bot.callbackQuery(/^verify:/, async (ctx) => {
@@ -543,6 +647,7 @@ export function createBot(config: AppConfig) {
 
   bot.on("message", async (ctx) => {
     const locale = await getLocale(ctx);
+    if (await handleBannedWordsInputMessage(ctx, locale)) return;
     if (await handleAutoReplyInputMessage(ctx, locale)) return;
     if (await handleWelcomeInputMessage(ctx, locale)) return;
     if (await handleInviteLinkInputMessage(ctx, locale)) return;
@@ -552,8 +657,10 @@ export function createBot(config: AppConfig) {
     if (await handleNewMemberLimitPrivateMessage(ctx, config, locale)) return;
     if (await handleOpenClosePrivateMessage(ctx, config, locale)) return;
     if (await handleNightModePrivateMessage(ctx, locale)) return;
+    if (await handleSpeechCheckPrivateMessage(ctx, locale)) return;
     if (await handleNightModeMessage(ctx)) return;
     if (await handleOpenCloseGroupMessage(ctx)) return;
+    if (await handleSpeechCheckMessage(ctx, locale)) return;
     if (await handleAdultCheckMessage(ctx, locale)) return;
     await handleIncomingMessage(ctx, config);
   });
@@ -664,8 +771,10 @@ function clearUserInputState(userId: number) {
   timezoneInputUsers.delete(userId);
   scheduledInputDrafts.delete(userId);
   autoReplyInputDrafts.delete(userId);
+  bannedWordsInputDrafts.delete(userId);
   welcomeInputDrafts.delete(userId);
   inviteLinkInputDrafts.delete(userId);
+  clearSpeechCheckDraft(userId);
   const publishDraft = publishDrafts.get(userId);
   if (publishDraft) publishDraft.waitingFor = undefined;
 }
@@ -1493,15 +1602,45 @@ function joinVerifyKeyboard(chatId: string, settings: JoinVerifySettings, locale
 }
 
 function autoDeleteKeyboard(chatId: string, settings: AutoDeleteSettings, locale: Locale) {
-  return new InlineKeyboard()
-    .text(settings.enabled ? "✅ On" : "⬜ Off", `auto_delete:toggle:${chatId}`)
-    .row()
-    .text(`${settings.seconds || 0}s`, "auto_delete:noop")
-    .text("30s", `auto_delete:seconds:30:${chatId}`)
-    .text("60s", `auto_delete:seconds:60:${chatId}`)
-    .text("300s", `auto_delete:seconds:300:${chatId}`)
-    .row()
-    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `menu:chat:group:${chatId}`);
+  const keyboard = new InlineKeyboard();
+  const labels = autoDeleteLabels(locale);
+  const mark = (active: boolean, label: string) => active ? `✅${label}` : label;
+
+  for (const key of autoDeleteEventKeys) {
+    keyboard
+      .text(labels[key], `auto_delete:noop:${chatId}`)
+      .text(mark(settings[key], labels.on), `auto_delete:set:${key}:on:${chatId}`)
+      .text(mark(!settings[key], labels.off), `auto_delete:set:${key}:off:${chatId}`)
+      .row();
+  }
+
+  return keyboard.text(labels.back, `menu:chat:group:${chatId}`);
+}
+
+function autoDeleteLabels(locale: Locale): Record<AutoDeleteEventKey | "on" | "off" | "back", string> {
+  return locale === "zh-CN"
+    ? {
+        join: "进群：",
+        leave: "退群：",
+        boost: "助推消息",
+        pin: "置顶：",
+        photo: "修改头像：",
+        title: "修改名称：",
+        on: "开启",
+        off: "关闭",
+        back: "🔙返回"
+      }
+    : {
+        join: "Join:",
+        leave: "Leave:",
+        boost: "Boost:",
+        pin: "Pin:",
+        photo: "Photo:",
+        title: "Title:",
+        on: "On",
+        off: "Off",
+        back: "🔙 Back"
+      };
 }
 
 function autoReplyKeyboard(chatId: string, settings: AutoReplySettings, locale: Locale) {
@@ -1522,6 +1661,68 @@ function autoReplyKeyboard(chatId: string, settings: AutoReplySettings, locale: 
     .text(locale === "zh-CN" ? "🗑 删除" : "🗑 Delete", `auto_reply:delete:${chatId}`)
     .row()
     .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `menu:chat:group:${chatId}`);
+}
+
+function bannedWordsKeyboard(chatId: string, settings: BannedWordsSettings, locale: Locale) {
+  const selected = (active: boolean, label: string) => active ? `✅${label}` : label;
+  const labels = locale === "zh-CN"
+    ? {
+        mode: "模式:",
+        on: "开启",
+        off: "关闭",
+        add: "➕添加",
+        list: "📋列表",
+        punishment: "🚷惩罚",
+        deleteNotice: "♻️删除提醒",
+        back: "🔙返回"
+      }
+    : {
+        mode: "Mode:",
+        on: "On",
+        off: "Off",
+        add: "➕ Add",
+        list: "📋 List",
+        punishment: "🚷 Punishment",
+        deleteNotice: "♻️ Delete notice",
+        back: "🔙 Back"
+      };
+
+  return new InlineKeyboard()
+    .text(labels.mode, `banned_words:noop:${chatId}`)
+    .text(selected(settings.enabled, labels.on), `banned_words:status:${chatId}:on`)
+    .text(selected(!settings.enabled, labels.off), `banned_words:status:${chatId}:off`)
+    .row()
+    .text(labels.add, `banned_words:add:${chatId}`)
+    .row()
+    .text(labels.list, `banned_words:list:${chatId}`)
+    .row()
+    .text(labels.punishment, `banned_words:punishment:${chatId}`)
+    .text(selected(settings.deleteNotice, labels.deleteNotice), `banned_words:toggle_notice:${chatId}`)
+    .row()
+    .text(labels.back, `menu:chat:group:${chatId}`);
+}
+
+function bannedWordsListKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "🗑删除" : "🗑 Delete", `banned_words:delete:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `chat_feature:banned_words:${chatId}`);
+}
+
+function bannedWordsDeleteKeyboard(chatId: string, rules: Awaited<ReturnType<typeof listBannedWordRules>>, locale: Locale) {
+  const keyboard = new InlineKeyboard();
+  rules.slice(0, 80).forEach((rule, index) => {
+    keyboard.text(`${index + 1}. ${rule.pattern}`.slice(0, 64), `banned_words:delete_rule:${chatId}:${rule.id}`).row();
+  });
+  return keyboard.text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `chat_feature:banned_words:${chatId}`);
+}
+
+function bannedWordsCancelKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `banned_words:cancel:${chatId}`);
+}
+
+function bannedWordsDoneKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `chat_feature:banned_words:${chatId}`);
 }
 
 function autoReplyDeleteKeyboard(chatId: string, settings: AutoReplySettings, locale: Locale) {
@@ -1554,64 +1755,115 @@ function autoReplyTriggerKeyboard(_chatId: string, locale: Locale) {
     .text(locale === "zh-CN" ? "精准触发" : "Exact", "auto_reply:trigger:exact");
 }
 
+function groupCommandsHomeKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "群组命令" : "Group commands", `group_commands:list:${chatId}`)
+    .text(locale === "zh-CN" ? "命令别名" : "Command aliases", `group_commands:aliases:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "返回首页" : "Home", "menu:home");
+}
+
+function groupCommandsKeyboard(chatId: string, settings: GroupCommandSettings, locale: Locale) {
+  const keyboard = new InlineKeyboard();
+  groupCommandDefinitions.forEach((item, index) => {
+    const label = groupCommandLabel(item.key, locale);
+    const enabled = settings.commands[item.key];
+    keyboard.text(`${enabled ? "✅" : "⬜"} ${label}`, `group_commands:toggle:${chatId}:${item.key}`);
+    if (index % 2 === 1) keyboard.row();
+  });
+  return keyboard
+    .row()
+    .text(locale === "zh-CN" ? "返回" : "Back", `group_commands:home:${chatId}`);
+}
+
+function groupCommandsAliasKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "返回" : "Back", `group_commands:home:${chatId}`);
+}
+
 function groupStatsKeyboard(chatId: string, locale: Locale) {
   if (locale !== "zh-CN") {
     return new InlineKeyboard()
-      .text("🔽 Message stats 🔽", `group_stats:noop:${chatId}`)
+      .text("🔽 Message stats 🔽", groupStatsCallbackData("noop", chatId))
       .row()
-      .text("Today message ranking", `group_stats:speech_today_rank:${chatId}`)
+      .text("Today message ranking", groupStatsCallbackData("speech_today_rank", chatId))
       .row()
-      .text("7-day message ranking", `group_stats:speech_7d_rank:${chatId}`)
-      .text("7-day message stats", `group_stats:speech_7d_stats:${chatId}`)
+      .text("7-day message ranking", groupStatsCallbackData("speech_7d_rank", chatId))
+      .text("7-day message stats", groupStatsCallbackData("speech_7d_stats", chatId))
       .row()
-      .text("Monthly message ranking", `group_stats:speech_month_rank:${chatId}`)
+      .text("Monthly message ranking", groupStatsCallbackData("speech_month_rank", chatId))
       .row()
-      .text("🔽 Invite stats 🔽", `group_stats:noop:${chatId}`)
+      .text("🔽 Invite stats 🔽", groupStatsCallbackData("noop", chatId))
       .row()
-      .text("Today invite ranking", `group_stats:invite_today_rank:${chatId}`)
-      .text("7-day invite stats", `group_stats:invite_7d_stats:${chatId}`)
+      .text("Today invite ranking", groupStatsCallbackData("invite_today_rank", chatId))
+      .text("7-day invite stats", groupStatsCallbackData("invite_7d_stats", chatId))
       .row()
-      .text("🔽 Join/leave stats 🔽", `group_stats:noop:${chatId}`)
+      .text("🔽 Join/leave stats 🔽", groupStatsCallbackData("noop", chatId))
       .row()
-      .text("Today join/leave data", `group_stats:member_today:${chatId}`)
-      .text("7-day join/leave stats", `group_stats:member_7d:${chatId}`)
+      .text("Today join/leave data", groupStatsCallbackData("member_today", chatId))
+      .text("7-day join/leave stats", groupStatsCallbackData("member_7d", chatId))
       .row()
       .text("🏠 Home", `menu:chat:group:${chatId}`);
   }
 
   return new InlineKeyboard()
-    .text("🔽发言统计🔽", `group_stats:noop:${chatId}`)
+    .text("🔽发言统计🔽", groupStatsCallbackData("noop", chatId))
     .row()
-    .text("今日发言排名", `group_stats:speech_today_rank:${chatId}`)
+    .text("今日发言排名", groupStatsCallbackData("speech_today_rank", chatId))
     .row()
-    .text("7日发言排名", `group_stats:speech_7d_rank:${chatId}`)
-    .text("7日发言统计", `group_stats:speech_7d_stats:${chatId}`)
+    .text("7日发言排名", groupStatsCallbackData("speech_7d_rank", chatId))
+    .text("7日发言统计", groupStatsCallbackData("speech_7d_stats", chatId))
     .row()
-    .text("月发言排名", `group_stats:speech_month_rank:${chatId}`)
+    .text("月发言排名", groupStatsCallbackData("speech_month_rank", chatId))
     .row()
-    .text("🔽邀请统计🔽", `group_stats:noop:${chatId}`)
+    .text("🔽邀请统计🔽", groupStatsCallbackData("noop", chatId))
     .row()
-    .text("今日邀请排名", `group_stats:invite_today_rank:${chatId}`)
-    .text("7日邀请统计", `group_stats:invite_7d_stats:${chatId}`)
+    .text("今日邀请排名", groupStatsCallbackData("invite_today_rank", chatId))
+    .text("7日邀请统计", groupStatsCallbackData("invite_7d_stats", chatId))
     .row()
-    .text("🔽进退群统计🔽", `group_stats:noop:${chatId}`)
+    .text("🔽进退群统计🔽", groupStatsCallbackData("noop", chatId))
     .row()
-    .text("今日进退群数据", `group_stats:member_today:${chatId}`)
-    .text("7日进退群统计", `group_stats:member_7d:${chatId}`)
+    .text("今日进退群数据", groupStatsCallbackData("member_today", chatId))
+    .text("7日进退群统计", groupStatsCallbackData("member_7d", chatId))
     .row()
     .text("🏠返回首页", `menu:chat:group:${chatId}`);
+}
+
+const groupStatsCallbackActions = {
+  noop: "n",
+  speech_today_rank: "st",
+  speech_7d_rank: "s7r",
+  speech_7d_stats: "s7s",
+  speech_month_rank: "sm",
+  invite_today_rank: "it",
+  invite_7d_stats: "i7",
+  member_today: "mt",
+  member_7d: "m7"
+} as const;
+
+type GroupStatsAction = keyof typeof groupStatsCallbackActions;
+
+function groupStatsCallbackData(action: GroupStatsAction, chatId: string) {
+  return `group_stats:${groupStatsCallbackActions[action]}:${chatId}`;
+}
+
+function normalizeGroupStatsAction(action: string) {
+  const entry = Object.entries(groupStatsCallbackActions)
+    .find(([, token]) => token === action);
+  return entry?.[0] ?? action;
 }
 
 function memberStatsKeyboard(chat: PrismaChat, settings: MemberStatsSettings, locale: Locale) {
   const scope = chat.type === "CHANNEL" ? "channel" : "group";
   const labels = locale === "zh-CN"
-    ? { status: "状态:", on: "开启", off: "关闭", back: "🔙返回" }
-    : { status: "Status:", on: "On", off: "Off", back: "🔙Back" };
+    ? { status: "状态:", on: "开启", off: "关闭", view: "查看统计", back: "🔙返回" }
+    : { status: "Status:", on: "On", off: "Off", view: "View stats", back: "🔙Back" };
 
   return new InlineKeyboard()
     .text(labels.status, `member_stats:noop:${chat.id}`)
     .text(settings.enabled ? `✅${labels.on}` : labels.on, `member_stats:toggle:${chat.id}:on`)
     .text(!settings.enabled ? `✅${labels.off}` : labels.off, `member_stats:toggle:${chat.id}:off`)
+    .row()
+    .text(labels.view, `member_stats:view:${chat.id}:7`)
     .row()
     .text(labels.back, `menu:chat:${scope}:${chat.id}`);
 }
@@ -2827,10 +3079,13 @@ function scheduledButtonPromptText(locale: Locale) {
     "<pre>链接名称-https://t.me/xxx</pre>",
     "• 在<b>一行两个按钮</b>：",
     "<pre>链接名称1-https://t.me/xxx && 链接名称2-https://t.me/xxx</pre>",
-    "• 插入<b>两行四个按钮</b>：",
+    "• 插入<b>两行四个按钮(带背景颜色)</b>：",
     "<pre>#p第1行链接名称1-https://t.me/xxx && #r第1行链接名称2-https://t.me/xxx\n#g第2行链接名称1-https://t.me/xxx && 第2行链接名称2-https://t.me/xxx</pre>",
     "",
-    "⚠️ #p-蓝色背景 #r-红色背景 #g-绿色背景，Telegram 消息按钮会忽略颜色前缀。"
+    "<b>二、底部键盘</b>：",
+    "<pre>导航 && 签到</pre>",
+    "⚠️ 消息按钮和底部键盘不能同时发送, <a href=\"tg://bot_command?command=clear\"><b>/clear</b></a><b> 命令可以关闭底部键盘</b>",
+    "⚠️ #p-蓝色背景 #r-红色背景 #g-绿色背景"
   ].join("\n");
 }
 
@@ -3350,6 +3605,45 @@ async function handleAutoReplyInputMessage(ctx: Context, locale: Locale) {
   return true;
 }
 
+async function handleBannedWordsInputMessage(ctx: Context, locale: Locale) {
+  if (!ctx.from) return false;
+  const draft = bannedWordsInputDrafts.get(ctx.from.id);
+  if (!draft) return false;
+
+  if (!(await ensureControlPermissionForChatId(ctx, draft.chatId, locale))) {
+    bannedWordsInputDrafts.delete(ctx.from.id);
+    return true;
+  }
+
+  const text = getMessageText(ctx.message);
+  const words = text ? parseBannedWordsInput(text) : [];
+  if (!words.length) {
+    const prompt = draft.stage === "add"
+      ? bannedWordsAddPromptText(locale)
+      : await bannedWordsDeletePromptText(draft.chatId, locale);
+    await ctx.reply(prompt, { parse_mode: "HTML", reply_markup: bannedWordsCancelKeyboard(draft.chatId, locale) });
+    return true;
+  }
+
+  if (draft.stage === "add") {
+    const added = await addBannedWords(draft.chatId, words);
+    bannedWordsInputDrafts.delete(ctx.from.id);
+    await ctx.reply(bannedWordsSavedText(added, locale), {
+      parse_mode: "HTML",
+      reply_markup: bannedWordsDoneKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
+  const deleted = await deleteBannedWordsByPattern(draft.chatId, words);
+  bannedWordsInputDrafts.delete(ctx.from.id);
+  await ctx.reply(bannedWordsDeletedText(deleted, locale), {
+    parse_mode: "HTML",
+    reply_markup: bannedWordsDoneKeyboard(draft.chatId, locale)
+  });
+  return true;
+}
+
 async function finalizeAutoReplyRule(
   ctx: Context,
   locale: Locale,
@@ -3502,16 +3796,19 @@ async function handleWelcomeInputMessage(ctx: Context, locale: Locale) {
   }
 
   if (draft.field === "button") {
-    const button = parsePublishButton(text);
-    if (!button) {
+    const buttons = parseScheduledButtonLayout(text);
+    const replyKeyboard = buttons.length ? undefined : parseReplyKeyboardLayout(text);
+    if (!buttons.length && !replyKeyboard?.length) {
       await ctx.reply(welcomeInputPromptText("button", settings, locale), {
         parse_mode: "HTML",
         reply_markup: welcomeInputKeyboard(draft.chatId, "button", locale)
       });
       return true;
     }
-    settings.buttonText = button.text;
-    settings.buttonUrl = button.url;
+    settings.buttons = buttons.length ? buttons : undefined;
+    settings.replyKeyboard = replyKeyboard;
+    settings.buttonText = buttons[0]?.[0]?.text ?? "";
+    settings.buttonUrl = buttons[0]?.[0]?.url ?? "";
   } else {
     settings.text = text.slice(0, 4000);
   }
@@ -3537,15 +3834,25 @@ async function handleInviteLinkInputMessage(ctx: Context, locale: Locale) {
 
   const text = getMessageText(ctx.message);
   const value = text ? parseNonNegativeInteger(text) : null;
-  const maxValue = draft.field === "expireDays" ? 365 : 99_999;
+  const maxValue = draft.field === "expireDays" ? 365 : draft.field === "memberLimit" ? 99_999 : Number.MAX_SAFE_INTEGER;
 
-  if (value === null || value > maxValue) {
+  if (value === null || value > maxValue || (draft.field === "resetUserId" && value <= 0)) {
     const retryText = locale === "zh-CN"
-      ? `请输入 0-${maxValue} 之间的整数。`
-      : `Send an integer from 0 to ${maxValue}.`;
+      ? (draft.field === "resetUserId" ? "请输入正确的用户 ID。" : `请输入 0-${maxValue} 之间的整数。`)
+      : (draft.field === "resetUserId" ? "Send a valid user ID." : `Send an integer from 0 to ${maxValue}.`);
     await ctx.reply(`${retryText}\n\n${inviteLinkInputPromptText(draft.field, locale)}`, {
       parse_mode: "HTML",
       reply_markup: inviteLinkInputKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
+  if (draft.field === "resetUserId") {
+    const result = await resetInviteLinksForTelegramUser(ctx, draft.chatId, value);
+    inviteLinkInputDrafts.delete(ctx.from.id);
+    await ctx.reply(inviteLinkResetResultText(result, value, locale), {
+      parse_mode: "HTML",
+      reply_markup: inviteLinkSavedKeyboard(draft.chatId, locale)
     });
     return true;
   }
@@ -3614,6 +3921,9 @@ function parsePublishButton(input: string) {
 }
 
 function parseScheduledButtonLayout(input: string) {
+  const sourceItems = input
+    .split(/\r?\n/)
+    .flatMap((line) => line.split("&&").map((item) => item.trim()).filter(Boolean));
   const rows = input
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -3626,7 +3936,7 @@ function parseScheduledButtonLayout(input: string) {
     )
     .filter((row) => row.length > 0);
 
-  return rows;
+  return rows.flat().length === sourceItems.length ? rows : [];
 }
 
 function parseScheduledButton(input: string) {
@@ -3646,6 +3956,20 @@ function parseScheduledButton(input: string) {
   } catch {
     return null;
   }
+}
+
+function parseReplyKeyboardLayout(input: string) {
+  const rows = input
+    .split(/\r?\n/)
+    .map((line) =>
+      line
+        .split("&&")
+        .map((item) => item.replace(/^#[prg]\s*/i, "").trim())
+        .filter(Boolean)
+    )
+    .filter((row) => row.length > 0);
+
+  return rows.length ? rows : undefined;
 }
 
 function publishDraftKeyboard(draft: PublishDraft) {
@@ -3705,6 +4029,11 @@ async function sendPublishPreview(ctx: Context, draft: PublishDraft, locale: Loc
 async function handlePublishInlineQuery(ctx: Context) {
   const query = ctx.inlineQuery;
   if (!query) return;
+  if (query.query.startsWith("member_stats:")) {
+    await handleMemberStatsInlineQuery(ctx);
+    return;
+  }
+
   const draft = getPublishDraft(query.from.id);
   const replyMarkup = publishDraftInlineMarkup(draft);
   const title = draft.name || "快捷发布";
@@ -3982,6 +4311,16 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
     return;
   }
 
+  if (feature === "banned_words") {
+    await openBannedWordsPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (feature === "commands") {
+    await openGroupCommandsHome(ctx, locale, chat);
+    return;
+  }
+
   if (feature === "new_member_limit") {
     await openNewMemberLimitMenu(ctx, config, locale);
     return;
@@ -3994,6 +4333,11 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
 
   if (feature === "adult_check") {
     await openAdultCheckMenu(ctx, locale);
+    return;
+  }
+
+  if (feature === "speech_check") {
+    await openSpeechCheckMenu(ctx, locale);
     return;
   }
 
@@ -4042,7 +4386,7 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
     return;
   }
 
-  if (feature === "schedule" || feature === "commands" || feature === "speech_check" || feature === "banned_words" || feature === "anti_spam" || feature === "import" || feature === "members" || feature === "sync") {
+  if (feature === "schedule" || feature === "anti_spam" || feature === "import" || feature === "members" || feature === "sync") {
     await editOrReply(
       ctx,
       locale === "zh-CN"
@@ -4088,8 +4432,15 @@ async function handleNightModeCallback(ctx: Context) {
   await handleNightModeAction(ctx, locale, key);
 }
 
-async function handleInviteLinkCallback(ctx: Context) {
+async function handleSpeechCheckCallback(ctx: Context) {
   await ctx.answerCallbackQuery().catch(() => undefined);
+  const locale = await getLocale(ctx);
+  const key = ctx.callbackQuery?.data?.replace("speech_check:", "");
+  if (!key) return;
+  await handleSpeechCheckAction(ctx, locale, key);
+}
+
+async function handleInviteLinkCallback(ctx: Context) {
   const locale = await getLocale(ctx);
   const data = ctx.callbackQuery?.data;
   if (!data) return;
@@ -4099,6 +4450,7 @@ async function handleInviteLinkCallback(ctx: Context) {
 
   const chat = await prisma.chat.findUnique({ where: { id: chatId } });
   if (!chat) {
+    await ctx.answerCallbackQuery().catch(() => undefined);
     await editOrReply(ctx, locale === "zh-CN" ? "找不到该群组。" : "Managed group not found.", homeKeyboard(locale));
     return;
   }
@@ -4112,12 +4464,14 @@ async function handleInviteLinkCallback(ctx: Context) {
   if (action === "approval") settings.createsJoinRequest = value === "on";
 
   if (["status", "notify", "approval"].includes(action)) {
+    await ctx.answerCallbackQuery().catch(() => undefined);
     await saveInviteLinkSettings(chatId, settings);
     await openInviteLinkPanel(ctx, locale, chat);
     return;
   }
 
   if ((action === "expire" || action === "limit") && ctx.from) {
+    await ctx.answerCallbackQuery().catch(() => undefined);
     clearUserInputState(ctx.from.id);
     const field: InviteLinkInputField = action === "expire" ? "expireDays" : "memberLimit";
     inviteLinkInputDrafts.set(ctx.from.id, { chatId, field });
@@ -4126,36 +4480,62 @@ async function handleInviteLinkCallback(ctx: Context) {
   }
 
   if (action === "cancel" && ctx.from) {
+    await ctx.answerCallbackQuery().catch(() => undefined);
     inviteLinkInputDrafts.delete(ctx.from.id);
     await openInviteLinkPanel(ctx, locale, chat);
     return;
   }
 
   if (action === "export") {
-    await exportInviteLinkData(ctx, locale, chat);
-    await openInviteLinkPanel(ctx, locale, chat);
+    if (await exportInviteLinkData(ctx, locale, chat)) {
+      await openInviteLinkPanel(ctx, locale, chat);
+    }
     return;
   }
 
   if (action === "clear") {
-    await prisma.inviteJoin.deleteMany({ where: { chatId } });
+    await ctx.answerCallbackQuery().catch(() => undefined);
+    await editOrReply(ctx, inviteLinkClearConfirmText(locale), inviteLinkClearConfirmKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "clear_confirm") {
+    await ctx.answerCallbackQuery().catch(() => undefined);
+    await clearInviteLinksAndData(ctx, chat);
     await openInviteLinkPanel(ctx, locale, chat);
     return;
   }
 
   if (action === "reset") {
-    await resetInviteLinks(ctx, chat);
-    await openInviteLinkPanel(ctx, locale, chat);
+    await ctx.answerCallbackQuery().catch(() => undefined);
+    if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    inviteLinkInputDrafts.set(ctx.from.id, { chatId, field: "resetUserId" });
+    await editOrReply(ctx, inviteLinkInputPromptText("resetUserId", locale), inviteLinkInputKeyboard(chatId, locale));
     return;
   }
+
+  await ctx.answerCallbackQuery().catch(() => undefined);
 
 }
 
 async function handleGroupStatsCallback(ctx: Context) {
-  await ctx.answerCallbackQuery().catch(() => undefined);
   const locale = await getLocale(ctx);
-  const [, action, chatId] = ctx.callbackQuery?.data?.split(":") ?? [];
-  if (!action || !chatId || action === "noop") return;
+  const [, actionToken, chatId] = ctx.callbackQuery?.data?.split(":") ?? [];
+  const action = actionToken ? normalizeGroupStatsAction(actionToken) : undefined;
+  if (!action || !chatId) {
+    await ctx.answerCallbackQuery().catch(() => undefined);
+    return;
+  }
+
+  if (action === "noop") {
+    await ctx.answerCallbackQuery({
+      text: locale === "zh-CN" ? "请选择下面的统计项" : "Choose a stats item below"
+    }).catch(() => undefined);
+    return;
+  }
+
+  await ctx.answerCallbackQuery().catch(() => undefined);
 
   const chat = await prisma.chat.findUnique({ where: { id: chatId } });
   if (!chat) {
@@ -4200,6 +4580,14 @@ async function handleMemberStatsCallback(ctx: Context) {
     settings.enabled = value === "on";
     await saveMemberStatsSettings(chat.id, settings);
     settings = await maybeRecordMemberCountSnapshot(ctx, chat, settings);
+  } else if (action === "view") {
+    const days = value === "31" ? 31 : 7;
+    settings = await maybeRecordMemberCountSnapshot(ctx, chat, settings);
+    await sendMemberStatsReport(ctx, chat, settings, days, locale);
+    return;
+  } else if (action === "close") {
+    await ctx.deleteMessage().catch(() => undefined);
+    return;
   }
 
   await editOrReply(ctx, memberStatsText(settings, locale), memberStatsKeyboard(chat, settings, locale));
@@ -4272,9 +4660,12 @@ function isConfigurationFeature(feature: string) {
     "join_verify",
     "auto_delete",
     "auto_reply",
+    "banned_words",
+    "commands",
     "new_member_limit",
     "open_close",
     "adult_check",
+    "speech_check",
     "scheduled",
     "invite",
     "member_stats"
@@ -4286,6 +4677,16 @@ async function openControlPermissionsPanel(ctx: Context, locale: Locale, chat: P
   const mode = await getControlPermissionMode(chat.id);
   const report = await getBotPermissionReport(ctx, Number(chat.telegramChatId)).catch(() => null);
   await editOrReply(ctx, controlPermissionsText(mode, report, locale), controlPermissionsKeyboard(chat.id, scope, mode, locale));
+}
+
+async function openGroupCommandsHome(ctx: Context, locale: Locale, chat: PrismaChat) {
+  await editOrReply(ctx, groupCommandsHomeText(locale), groupCommandsHomeKeyboard(chat.id, locale));
+}
+
+async function openBannedWordsPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  const settings = await getBannedWordsSettings(chat.id);
+  const count = await countBannedWords(chat.id);
+  await editOrReply(ctx, bannedWordsText(settings, count, locale), bannedWordsKeyboard(chat.id, settings, locale));
 }
 
 function controlPermissionsText(
@@ -4563,16 +4964,22 @@ async function handleAutoDeleteCallback(ctx: Context) {
   const data = ctx.callbackQuery?.data;
   const parts = data?.split(":") ?? [];
   const action = parts[1];
-  const value = parts[2];
-  const chatId = parts[3] ?? parts[2];
+  const chatId = action === "set" ? parts[4] : parts[3] ?? parts[2];
   if (!action || !chatId || action === "noop") return;
 
   const locale = await getLocale(ctx);
   if (!(await ensureControlPermissionForChatId(ctx, chatId, locale))) return;
 
   const settings = await getAutoDeleteSettings(chatId);
-  if (action === "toggle") settings.enabled = !settings.enabled;
-  if (action === "seconds" && value) settings.seconds = clampNumber(Number(value), 0, 86400);
+  if (action === "set" && isAutoDeleteEventKey(parts[2]) && (parts[3] === "on" || parts[3] === "off")) {
+    settings[parts[2]] = parts[3] === "on";
+  } else if (action === "toggle") {
+    const enabled = !autoDeleteEventKeys.some((key) => settings[key]);
+    for (const key of autoDeleteEventKeys) settings[key] = enabled;
+  } else if (action === "seconds" && parts[2]) {
+    settings.seconds = clampNumber(Number(parts[2]), 0, 86400);
+  }
+  settings.enabled = autoDeleteEventKeys.some((key) => settings[key]);
   await saveSetting(chatId, "auto_delete", settingsToJson(settings));
 
   await editOrReply(ctx, autoDeleteText(settings, locale), autoDeleteKeyboard(chatId, settings, locale));
@@ -4688,6 +5095,126 @@ async function handleAutoReplyCallback(ctx: Context, config: AppConfig) {
   }
 }
 
+async function handleBannedWordsCallback(ctx: Context) {
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  const parts = ctx.callbackQuery?.data?.split(":") ?? [];
+  const action = parts[1];
+  const chatId = parts[2];
+  const value = parts[3];
+  if (!action || !chatId) return;
+
+  const locale = await getLocale(ctx);
+  const chat = await ensureControlPermissionForChatId(ctx, chatId, locale);
+  if (!chat) return;
+
+  if (action === "cancel") {
+    if (ctx.from) bannedWordsInputDrafts.delete(ctx.from.id);
+    await openBannedWordsPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "noop") return;
+
+  const settings = await getBannedWordsSettings(chatId);
+
+  if (action === "status" && (value === "on" || value === "off")) {
+    settings.enabled = value === "on";
+    await saveBannedWordsSettings(chatId, settings);
+    await openBannedWordsPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "toggle_notice") {
+    settings.deleteNotice = !settings.deleteNotice;
+    await saveBannedWordsSettings(chatId, settings);
+    await openBannedWordsPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "punishment") {
+    settings.punishment = nextBannedWordsPunishment(settings.punishment);
+    await saveBannedWordsSettings(chatId, settings);
+    await openBannedWordsPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "add") {
+    if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    bannedWordsInputDrafts.set(ctx.from.id, { chatId, stage: "add" });
+    await editOrReply(ctx, bannedWordsAddPromptText(locale), bannedWordsCancelKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "list") {
+    await editOrReply(ctx, await bannedWordsListText(chatId, locale), bannedWordsListKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "delete") {
+    if (!ctx.from) return;
+    const rules = await listBannedWordRules(chatId, 100);
+    if (!rules.length) {
+      await ctx.answerCallbackQuery({ text: locale === "zh-CN" ? "暂无可删除的违禁词。" : "No banned words to delete." }).catch(() => undefined);
+      return;
+    }
+    clearUserInputState(ctx.from.id);
+    bannedWordsInputDrafts.set(ctx.from.id, { chatId, stage: "delete" });
+    await editOrReply(ctx, await bannedWordsDeletePromptText(chatId, locale), bannedWordsDeleteKeyboard(chatId, rules, locale));
+    return;
+  }
+
+  if (action === "delete_rule" && value) {
+    await prisma.moderationRule.deleteMany({
+      where: { id: value, chatId, ruleType: RuleType.KEYWORD }
+    });
+    await editOrReply(ctx, await bannedWordsListText(chatId, locale), bannedWordsListKeyboard(chatId, locale));
+  }
+}
+
+
+async function handleGroupCommandsCallback(ctx: Context) {
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  const locale = await getLocale(ctx);
+  const [, action, chatId, value] = ctx.callbackQuery?.data?.split(":") ?? [];
+  if (!action || !chatId) return;
+
+  const chat = await prisma.chat.findUnique({ where: { id: chatId } });
+  if (!chat) {
+    await editOrReply(ctx, locale === "zh-CN" ? "找不到该管理对象。" : "Managed chat not found.", homeKeyboard(locale));
+    return;
+  }
+
+  if (!(await ensureControlPermissionAccess(ctx, chat, locale))) return;
+
+  if (action === "home") {
+    await openGroupCommandsHome(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "list") {
+    const settings = await getGroupCommandSettings(chatId);
+    await editOrReply(ctx, groupCommandsText(settings, locale), groupCommandsKeyboard(chatId, settings, locale));
+    return;
+  }
+
+  if (action === "aliases") {
+    await editOrReply(
+      ctx,
+      locale === "zh-CN" ? "命令别名暂未接入。" : "Command aliases are not wired up yet.",
+      groupCommandsAliasKeyboard(chatId, locale)
+    );
+    return;
+  }
+
+  if (action === "toggle" && isGroupCommandKey(value)) {
+    const settings = await getGroupCommandSettings(chatId);
+    settings.commands[value] = !settings.commands[value];
+    await saveGroupCommandSettings(chatId, settings);
+    await editOrReply(ctx, groupCommandsText(settings, locale), groupCommandsKeyboard(chatId, settings, locale));
+  }
+}
+
 async function handleIncomingMessage(ctx: Context, config: AppConfig) {
   const message = ctx.message;
   if (!message || !ctx.chat) return;
@@ -4699,11 +5226,13 @@ async function handleIncomingMessage(ctx: Context, config: AppConfig) {
   }
 
   if ("new_chat_members" in message && message.new_chat_members?.length) {
+    if (chat) await maybeAutoDelete(ctx, chat.id, message);
     await handleNewChatMembers(ctx, config, message.new_chat_members);
     return;
   }
 
   if ("left_chat_member" in message && message.left_chat_member) {
+    if (chat) await maybeAutoDelete(ctx, chat.id, message);
     await handleBlocklistLeftChatMember(ctx, message.left_chat_member);
     if (chat) await recordStatsEvent(chat.id, ChatStatsEventType.LEAVE, ctx.from, message.left_chat_member, config.defaultTimezone);
     if (chat) await recordInviteLeave(chat.id, message.left_chat_member);
@@ -4711,6 +5240,7 @@ async function handleIncomingMessage(ctx: Context, config: AppConfig) {
   }
 
   if (chat) {
+    if (await maybeHandleBannedWords(ctx, chat, message)) return;
     await maybeSendAutoReply(ctx, chat.id, message);
     await maybeAutoDelete(ctx, chat.id, message);
   }
@@ -5184,7 +5714,7 @@ async function sendWelcomeMessages(
   settings: WelcomeSettings
 ): Promise<Message[]> {
   const text = renderWelcomeMessageText(chat, member, settings.text);
-  const replyMarkup = welcomeInlineKeyboard(settings);
+  const replyMarkup = welcomeReplyMarkup(settings);
   const sentMessages: Message[] = [];
 
   if (settings.mediaKind === "photo" && settings.mediaFileId) {
@@ -5246,9 +5776,17 @@ function renderWelcomeMessageText(chat: PrismaChat, member: User, template: stri
     .replaceAll("{chat}", groupName);
 }
 
-function welcomeInlineKeyboard(settings: WelcomeSettings) {
-  if (!settings.buttonText || !settings.buttonUrl) return undefined;
-  return new InlineKeyboard().url(settings.buttonText, settings.buttonUrl);
+function welcomeReplyMarkup(settings: WelcomeSettings) {
+  const buttonsKeyboard = autoReplyInlineKeyboard(settings.buttons);
+  if (buttonsKeyboard) return buttonsKeyboard;
+  if (settings.buttonText && settings.buttonUrl) return new InlineKeyboard().url(settings.buttonText, settings.buttonUrl);
+  if (settings.replyKeyboard?.length) {
+    return {
+      keyboard: settings.replyKeyboard,
+      resize_keyboard: true
+    };
+  }
+  return undefined;
 }
 
 function scheduleWelcomeMessageDeletion(ctx: Context, telegramChatId: number, settings: WelcomeSettings, messageIds: number[]) {
@@ -5325,6 +5863,19 @@ async function handlePermissionsCommand(ctx: Context) {
   );
 }
 
+async function ensureGroupCommandEnabled(ctx: Context, chat: PrismaChat, key: GroupCommandKey, locale: Locale) {
+  const settings = await getGroupCommandSettings(chat.id);
+  if (settings.commands[key]) return true;
+
+  const definition = groupCommandDefinitions.find((item) => item.key === key);
+  await ctx.reply(
+    locale === "zh-CN"
+      ? `该群组已关闭 ${definition?.command ?? `/${key}`} 命令。`
+      : `${definition?.command ?? `/${key}`} is disabled in this group.`
+  ).catch(() => undefined);
+  return false;
+}
+
 async function handleInviteLinkCommand(ctx: Context, config: AppConfig) {
   const locale = await getLocale(ctx);
   if (!ctx.chat || !ctx.from || !isGroupLike(ctx.chat)) {
@@ -5337,6 +5888,8 @@ async function handleInviteLinkCommand(ctx: Context, config: AppConfig) {
     await ctx.reply(locale === "zh-CN" ? "请先使用 /bind 绑定该群组。" : "Bind this group first with /bind.");
     return;
   }
+
+  if (!(await ensureGroupCommandEnabled(ctx, chat, "link", locale))) return;
 
   const settings = await getInviteLinkSettings(chat.id);
   if (!settings.enabled) {
@@ -5382,6 +5935,8 @@ async function handleSignInCommand(ctx: Context, config: AppConfig) {
     return;
   }
 
+  if (!(await ensureGroupCommandEnabled(ctx, chat, "sign_in", locale))) return;
+
   const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
   const statDate = formatDate(new Date());
   const referenceKey = `sign_in:${chat.id}:${user.id}:${statDate}`;
@@ -5397,6 +5952,8 @@ async function handlePointsRankCommand(ctx: Context) {
     await ctx.reply(locale === "zh-CN" ? "请先绑定该群组。" : "Bind this group first.");
     return;
   }
+
+  if (!(await ensureGroupCommandEnabled(ctx, chat, "points_rank", locale))) return;
 
   const rows = await prisma.chatPointBalance.findMany({
     where: { chatId: chat.id },
@@ -5417,6 +5974,8 @@ async function handlePointsCommand(ctx: Context, config: AppConfig) {
     await ctx.reply(locale === "zh-CN" ? "请先绑定该群组。" : "Bind this group first.");
     return;
   }
+
+  if (!(await ensureGroupCommandEnabled(ctx, chat, "points", locale))) return;
 
   const isAdmin = await isUserChatAdmin(ctx, ctx.chat.id, ctx.from.id).catch(() => false);
   if (!isAdmin) {
@@ -5447,6 +6006,9 @@ async function handleStatsCommand(ctx: Context, config: AppConfig, days: number)
     return;
   }
 
+  const commandKey: GroupCommandKey = days === 1 ? "stat" : days === 7 ? "stat_week" : "stats";
+  if (!(await ensureGroupCommandEnabled(ctx, chat, commandKey, locale))) return;
+
   const stats = await getStats(chat.id, formatDate(new Date()), days);
   await ctx.reply(statsText(stats, days, locale));
 }
@@ -5459,6 +6021,8 @@ async function handleLotteryCommand(ctx: Context) {
     await ctx.reply(locale === "zh-CN" ? "请先绑定该群组。" : "Bind this group first.");
     return;
   }
+
+  if (!(await ensureGroupCommandEnabled(ctx, chat, "lottery", locale))) return;
 
   const giveaways = await prisma.giveaway.findMany({
     where: { chatId: chat.id, status: GiveawayStatus.ACTIVE },
@@ -5519,6 +6083,8 @@ async function showManagedChats(ctx: Context, scope: "group" | "channel", locale
 async function getWelcomeSettings(chatId: string) {
   const raw = await getSettingRecord(chatId, "welcome");
   const rawText = typeof raw.text === "string" ? raw.text : undefined;
+  const buttons = parseAutoReplyButtons(raw.buttons);
+  const replyKeyboard = parseSavedReplyKeyboard(raw.replyKeyboard);
   return {
     ...defaultWelcomeSettings,
     enabled: typeof raw.enabled === "boolean" ? raw.enabled : defaultWelcomeSettings.enabled,
@@ -5528,6 +6094,8 @@ async function getWelcomeSettings(chatId: string) {
     mediaFileId: typeof raw.mediaFileId === "string" ? raw.mediaFileId : undefined,
     buttonText: typeof raw.buttonText === "string" ? raw.buttonText : "",
     buttonUrl: typeof raw.buttonUrl === "string" ? raw.buttonUrl : "",
+    buttons,
+    replyKeyboard,
     lastMessageIds: Array.isArray(raw.lastMessageIds)
       ? raw.lastMessageIds.map((item) => Number(item)).filter((item) => Number.isInteger(item) && item > 0)
       : []
@@ -5645,7 +6213,7 @@ function inviteLinkCreateData(chatId: string, creatorUserId: string, link: ChatI
 }
 
 async function exportInviteLinkData(ctx: Context, locale: Locale, chat: PrismaChat) {
-  if (!ctx.chat) return;
+  if (!ctx.chat) return false;
 
   const [links, joins] = await Promise.all([
     prisma.inviteLink.findMany({
@@ -5659,6 +6227,16 @@ async function exportInviteLinkData(ctx: Context, locale: Locale, chat: PrismaCh
       orderBy: { joinedAt: "desc" }
     })
   ]);
+
+  if (!links.length && !joins.length) {
+    await ctx.answerCallbackQuery({
+      text: locale === "zh-CN" ? "暂无邀请数据" : "No invite data yet.",
+      show_alert: true
+    }).catch(() => undefined);
+    return false;
+  }
+
+  await ctx.answerCallbackQuery().catch(() => undefined);
 
   const rows = [
     [
@@ -5712,6 +6290,7 @@ async function exportInviteLinkData(ctx: Context, locale: Locale, chat: PrismaCh
     new InputFile(Buffer.from(csv, "utf8"), fileName),
     { caption: locale === "zh-CN" ? "邀请链接数据导出" : "Invite link data export" }
   );
+  return true;
 }
 
 async function resetInviteLinks(ctx: Context, chat: PrismaChat) {
@@ -5728,6 +6307,54 @@ async function resetInviteLinks(ctx: Context, chat: PrismaChat) {
       data: { revokedAt }
     });
   }
+}
+
+async function resetInviteLinksForTelegramUser(ctx: Context, chatId: string, telegramUserId: number) {
+  const chat = await prisma.chat.findUnique({ where: { id: chatId } });
+  if (!chat) return { foundUser: false, revokedLinks: 0, deletedInvites: 0 };
+
+  const user = await prisma.user.findUnique({ where: { telegramUserId: BigInt(telegramUserId) } });
+  if (!user) return { foundUser: false, revokedLinks: 0, deletedInvites: 0 };
+
+  const links = await prisma.inviteLink.findMany({
+    where: { chatId, creatorUserId: user.id },
+    select: { id: true, inviteLink: true, revokedAt: true }
+  });
+  const linkIds = links.map((link) => link.id);
+  if (!linkIds.length) return { foundUser: true, revokedLinks: 0, deletedInvites: 0 };
+
+  let revokedLinks = 0;
+  for (const link of links) {
+    if (!link.revokedAt) {
+      await ctx.api.revokeChatInviteLink(Number(chat.telegramChatId), link.inviteLink).catch(() => undefined);
+      revokedLinks += 1;
+    }
+  }
+
+  const deleted = await prisma.inviteJoin.deleteMany({
+    where: { chatId, inviteLinkId: { in: linkIds } }
+  });
+  await prisma.inviteLink.deleteMany({
+    where: { id: { in: linkIds } }
+  });
+
+  return { foundUser: true, revokedLinks, deletedInvites: deleted.count };
+}
+
+async function clearInviteLinksAndData(ctx: Context, chat: PrismaChat) {
+  const links = await prisma.inviteLink.findMany({
+    where: { chatId: chat.id },
+    select: { inviteLink: true, revokedAt: true }
+  });
+
+  for (const link of links) {
+    if (!link.revokedAt) {
+      await ctx.api.revokeChatInviteLink(Number(chat.telegramChatId), link.inviteLink).catch(() => undefined);
+    }
+  }
+
+  await prisma.inviteJoin.deleteMany({ where: { chatId: chat.id } });
+  await prisma.inviteLink.deleteMany({ where: { chatId: chat.id } });
 }
 
 async function maybeSendInviteNotice(ctx: Context, chat: PrismaChat, member: User, creatorUserId: string) {
@@ -5805,6 +6432,24 @@ function formatInviteExpire(seconds: number, locale: Locale) {
 }
 
 function inviteLinkInputPromptText(field: InviteLinkInputField, locale: Locale) {
+  if (field === "resetUserId") {
+    return locale === "zh-CN"
+      ? [
+          "<strong>重置链接</strong>",
+          "",
+          "重置某人的邀请链接和邀请数据",
+          "",
+          '<strong>请输入要重置链接的用户id(群里回复该用户 </strong><a href="tg://bot_command?command=info"><strong>/info</strong></a><strong> 可以查看):</strong>'
+        ].join("\n")
+      : [
+          "<strong>Reset link</strong>",
+          "",
+          "Reset a user's invite links and invite data.",
+          "",
+          '<strong>Send the user ID to reset. Reply to that user with </strong><a href="tg://bot_command?command=info"><strong>/info</strong></a><strong> in the group to view it.</strong>'
+        ].join("\n");
+  }
+
   if (field === "expireDays") {
     return locale === "zh-CN"
       ? [
@@ -5844,17 +6489,69 @@ function inviteLinkInputSavedText(locale: Locale) {
   return locale === "zh-CN" ? "✅ 设置成功，点击按钮返回。" : "✅ Saved. Tap the button to return.";
 }
 
+function inviteLinkResetResultText(
+  result: Awaited<ReturnType<typeof resetInviteLinksForTelegramUser>>,
+  telegramUserId: number,
+  locale: Locale
+) {
+  if (!result.foundUser) {
+    return locale === "zh-CN"
+      ? `未找到用户 ID <code>${telegramUserId}</code>，请确认后重新操作。`
+      : `User ID <code>${telegramUserId}</code> was not found. Check it and try again.`;
+  }
+
+  if (result.revokedLinks === 0 && result.deletedInvites === 0) {
+    return locale === "zh-CN"
+      ? `用户 ID <code>${telegramUserId}</code> 暂无可重置的邀请链接和邀请数据。`
+      : `User ID <code>${telegramUserId}</code> has no invite links or invite data to reset.`;
+  }
+
+  return locale === "zh-CN"
+    ? [
+        "✅ 重置成功，点击按钮返回。",
+        "",
+        `用户 ID: <code>${telegramUserId}</code>`,
+        `已重置链接: ${result.revokedLinks}`,
+        `已清理邀请数据: ${result.deletedInvites}`
+      ].join("\n")
+    : [
+        "✅ Reset complete. Tap the button to return.",
+        "",
+        `User ID: <code>${telegramUserId}</code>`,
+        `Reset links: ${result.revokedLinks}`,
+        `Cleared invite records: ${result.deletedInvites}`
+      ].join("\n");
+}
+
+function inviteLinkClearConfirmText(locale: Locale) {
+  return locale === "zh-CN"
+    ? "🚨🚨 请注意，即将清空所有邀请链接和邀请数据，操作不可恢复，是否继续"
+    : "🚨🚨 This will clear all invite links and invite data. This cannot be undone. Continue?";
+}
+
+function inviteLinkClearConfirmKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `invite:cancel:${chatId}`)
+    .text(locale === "zh-CN" ? "❗️确认删除" : "❗️Confirm delete", `invite:clear_confirm:${chatId}`);
+}
+
 function csvCell(value: string) {
   return `"${value.replaceAll("\"", "\"\"")}"`;
 }
 
 async function getAutoDeleteSettings(chatId: string) {
   const raw = await getSettingRecord(chatId, "auto_delete");
+  const legacyEnabled = typeof raw.enabled === "boolean" ? raw.enabled : undefined;
+  const settings = { ...defaultAutoDeleteSettings };
+  for (const key of autoDeleteEventKeys) {
+    const rawValue = raw[key];
+    settings[key] = typeof rawValue === "boolean" ? rawValue : legacyEnabled ?? defaultAutoDeleteSettings[key];
+  }
+  settings.seconds = clampNumber(Number(raw.seconds ?? defaultAutoDeleteSettings.seconds), 0, 86400);
+  settings.enabled = autoDeleteEventKeys.some((key) => settings[key]);
   return {
-    ...defaultAutoDeleteSettings,
-    ...raw,
-    seconds: clampNumber(Number(raw.seconds ?? defaultAutoDeleteSettings.seconds), 0, 86400)
-  } as AutoDeleteSettings;
+    ...settings
+  };
 }
 
 async function getAutoReplySettings(chatId: string) {
@@ -5890,6 +6587,108 @@ async function saveAutoReplySettings(chatId: string, settings: AutoReplySettings
       ...(rule.buttons?.length ? { buttons: rule.buttons } : {})
     }))
   }));
+}
+
+async function getBannedWordsSettings(chatId: string): Promise<BannedWordsSettings> {
+  const raw = await getSettingRecord(chatId, "banned_words");
+  return {
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : defaultBannedWordsSettings.enabled,
+    punishment: isBannedWordsPunishment(raw.punishment) ? raw.punishment : defaultBannedWordsSettings.punishment,
+    warningLimit: clampNumber(Number(raw.warningLimit ?? defaultBannedWordsSettings.warningLimit), 1, 20),
+    muteMinutes: clampNumber(Number(raw.muteMinutes ?? defaultBannedWordsSettings.muteMinutes), 1, 24 * 60),
+    deleteNotice: typeof raw.deleteNotice === "boolean" ? raw.deleteNotice : defaultBannedWordsSettings.deleteNotice
+  };
+}
+
+async function saveBannedWordsSettings(chatId: string, settings: BannedWordsSettings) {
+  await saveSetting(chatId, "banned_words", settingsToJson({
+    enabled: settings.enabled,
+    punishment: settings.punishment,
+    warningLimit: settings.warningLimit,
+    muteMinutes: settings.muteMinutes,
+    deleteNotice: settings.deleteNotice
+  }));
+}
+
+async function listBannedWordRules(chatId: string, take = 100) {
+  return prisma.moderationRule.findMany({
+    where: { chatId, ruleType: RuleType.KEYWORD, enabled: true },
+    orderBy: { createdAt: "asc" },
+    take,
+    select: { id: true, pattern: true }
+  });
+}
+
+async function countBannedWords(chatId: string) {
+  return prisma.moderationRule.count({
+    where: { chatId, ruleType: RuleType.KEYWORD, enabled: true }
+  });
+}
+
+async function addBannedWords(chatId: string, inputWords: string[]) {
+  const words = uniqueBannedWords(inputWords);
+  if (!words.length) return 0;
+
+  const existing = await prisma.moderationRule.findMany({
+    where: { chatId, ruleType: RuleType.KEYWORD },
+    select: { pattern: true }
+  });
+  const existingSet = new Set(existing.map((rule) => normalizeBannedWordForMatch(rule.pattern)));
+  const nextWords = words.filter((word) => !existingSet.has(normalizeBannedWordForMatch(word)));
+  if (!nextWords.length) return 0;
+
+  await prisma.moderationRule.createMany({
+    data: nextWords.map((word) => ({
+      chatId,
+      ruleType: RuleType.KEYWORD,
+      pattern: word,
+      action: RuleAction.DELETE_MESSAGE,
+      enabled: true
+    }))
+  });
+  return nextWords.length;
+}
+
+async function deleteBannedWordsByPattern(chatId: string, inputWords: string[]) {
+  const targets = new Set(uniqueBannedWords(inputWords).map(normalizeBannedWordForMatch));
+  if (!targets.size) return 0;
+
+  const existing = await prisma.moderationRule.findMany({
+    where: { chatId, ruleType: RuleType.KEYWORD },
+    select: { id: true, pattern: true }
+  });
+  const ids = existing
+    .filter((rule) => targets.has(normalizeBannedWordForMatch(rule.pattern)))
+    .map((rule) => rule.id);
+  if (!ids.length) return 0;
+
+  const result = await prisma.moderationRule.deleteMany({
+    where: { id: { in: ids }, chatId, ruleType: RuleType.KEYWORD }
+  });
+  return result.count;
+}
+
+async function getGroupCommandSettings(chatId: string): Promise<GroupCommandSettings> {
+  const raw = await getSettingRecord(chatId, "group_commands");
+  const rawCommands = isRecord(raw.commands) ? raw.commands : {};
+  const commands = { ...defaultGroupCommandSettings.commands };
+  for (const item of groupCommandDefinitions) {
+    const rawValue = rawCommands[item.key];
+    if (typeof rawValue === "boolean") {
+      commands[item.key] = rawValue;
+    }
+  }
+  return { commands };
+}
+
+async function saveGroupCommandSettings(chatId: string, settings: GroupCommandSettings) {
+  await saveSetting(chatId, "group_commands", settingsToJson({
+    commands: settings.commands
+  }));
+}
+
+function isGroupCommandKey(value: unknown): value is GroupCommandKey {
+  return typeof value === "string" && groupCommandDefinitions.some((item) => item.key === value);
 }
 
 async function getMemberStatsSettings(chatId: string): Promise<MemberStatsSettings> {
@@ -5967,6 +6766,18 @@ function parseAutoReplyButtons(value: unknown): AutoReplyButton[][] | undefined 
           return { text: item.text.slice(0, 64), url: item.url } as AutoReplyButton;
         })
         .filter((item): item is AutoReplyButton => Boolean(item))
+      : [])
+    .filter((row) => row.length > 0);
+  return rows.length ? rows : undefined;
+}
+
+function parseSavedReplyKeyboard(value: unknown): string[][] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const rows = value
+    .map((row) => Array.isArray(row)
+      ? row
+        .map((item) => typeof item === "string" ? item.trim().slice(0, 64) : "")
+        .filter(Boolean)
       : [])
     .filter((row) => row.length > 0);
   return rows.length ? rows : undefined;
@@ -6130,10 +6941,145 @@ async function maybeRecordMemberCountSnapshot(ctx: Context, chat: PrismaChat, cu
 
 async function maybeAutoDelete(ctx: Context, chatId: string, message: Message) {
   const settings = await getAutoDeleteSettings(chatId);
-  if (!settings.enabled || settings.seconds <= 0 || !ctx.chat) return;
+  const eventKey = autoDeleteEventKey(message);
+  if (!eventKey || !settings[eventKey] || !ctx.chat) return;
+
+  const deleteMessage = () => ctx.api.deleteMessage(ctx.chat!.id, message.message_id).catch(() => undefined);
+  if (settings.seconds <= 0) {
+    await deleteMessage();
+    return;
+  }
+
   setTimeout(() => {
-    void ctx.api.deleteMessage(ctx.chat!.id, message.message_id).catch(() => undefined);
+    void deleteMessage();
   }, settings.seconds * 1000);
+}
+
+async function maybeHandleBannedWords(ctx: Context, chat: PrismaChat, message: Message) {
+  if (!ctx.chat || !ctx.from || !isGroupLike(ctx.chat) || ctx.from.is_bot) return false;
+  const text = getMessageText(message);
+  if (!text) return false;
+
+  const settings = await getBannedWordsSettings(chat.id);
+  if (!settings.enabled) return false;
+
+  const isAdmin = await isUserChatAdmin(ctx, Number(chat.telegramChatId), ctx.from.id).catch(() => false);
+  if (isAdmin) return false;
+
+  const rules = await listBannedWordRules(chat.id, 500);
+  const matched = findMatchedBannedWord(text, rules.map((rule) => rule.pattern));
+  if (!matched) return false;
+
+  await ctx.api.deleteMessage(ctx.chat.id, message.message_id).catch((error) => {
+    console.error("Failed to delete banned-word message", {
+      chatId: chat.id,
+      telegramChatId: ctx.chat?.id,
+      messageId: message.message_id,
+      error
+    });
+  });
+
+  await applyBannedWordsPunishment(ctx, chat, ctx.from, matched, settings);
+  return true;
+}
+
+async function applyBannedWordsPunishment(
+  ctx: Context,
+  chat: PrismaChat,
+  user: User,
+  matchedWord: string,
+  settings: BannedWordsSettings
+) {
+  const telegramChatId = Number(chat.telegramChatId);
+  const name = displayName(user);
+  const matched = escapeHtml(matchedWord);
+
+  if (settings.punishment === "delete_only") {
+    await sendBannedWordsNotice(ctx, telegramChatId, `${name} 触发违禁词 <code>${matched}</code>，消息已删除。`, settings);
+    return;
+  }
+
+  if (settings.punishment === "ban") {
+    await banUser(ctx, telegramChatId, user.id);
+    await sendBannedWordsNotice(ctx, telegramChatId, `${name} 触发违禁词 <code>${matched}</code>，已封禁。`, settings);
+    clearBannedWordWarning(chat.id, user.id);
+    return;
+  }
+
+  if (settings.punishment === "mute") {
+    await muteUser(ctx, telegramChatId, user.id, settings.muteMinutes);
+    await sendBannedWordsNotice(ctx, telegramChatId, `${name} 触发违禁词 <code>${matched}</code>，已禁言 ${settings.muteMinutes} 分钟。`, settings);
+    clearBannedWordWarning(chat.id, user.id);
+    return;
+  }
+
+  const warningCount = incrementBannedWordWarning(chat.id, user.id);
+  if (warningCount >= settings.warningLimit) {
+    await muteUser(ctx, telegramChatId, user.id, settings.muteMinutes);
+    clearBannedWordWarning(chat.id, user.id);
+    await sendBannedWordsNotice(
+      ctx,
+      telegramChatId,
+      `${name} 触发违禁词 <code>${matched}</code>，警告已达 ${settings.warningLimit} 次，禁言 ${settings.muteMinutes} 分钟。`,
+      settings
+    );
+    return;
+  }
+
+  await sendBannedWordsNotice(
+    ctx,
+    telegramChatId,
+    `${name} 触发违禁词 <code>${matched}</code>，警告 ${warningCount}/${settings.warningLimit}。`,
+    settings
+  );
+}
+
+async function sendBannedWordsNotice(ctx: Context, telegramChatId: number, text: string, settings: BannedWordsSettings) {
+  const sent = await ctx.api.sendMessage(telegramChatId, text, { parse_mode: "HTML" }).catch(() => null);
+  if (!sent || !settings.deleteNotice) return;
+  setTimeout(() => {
+    void ctx.api.deleteMessage(telegramChatId, sent.message_id).catch(() => undefined);
+  }, 30_000);
+}
+
+async function muteUser(ctx: Context, chatId: number, userId: number, minutes: number) {
+  const untilDate = Math.floor((Date.now() + minutes * 60 * 1000) / 1000);
+  await ctx.api.restrictChatMember(chatId, userId, noChatPermissions(), { until_date: untilDate }).catch((error) => {
+    console.error("Failed to mute member", { chatId, userId, minutes, error });
+  });
+}
+
+function incrementBannedWordWarning(chatId: string, userId: number) {
+  const key = userChatKey(chatId, userId);
+  const now = Date.now();
+  const existing = bannedWordWarnings.get(key);
+  if (!existing || existing.expiresAt <= now) {
+    bannedWordWarnings.set(key, { count: 1, expiresAt: now + 24 * 60 * 60 * 1000 });
+    return 1;
+  }
+  const count = existing.count + 1;
+  bannedWordWarnings.set(key, { count, expiresAt: existing.expiresAt });
+  return count;
+}
+
+function clearBannedWordWarning(chatId: string, userId: number) {
+  bannedWordWarnings.delete(userChatKey(chatId, userId));
+}
+
+function findMatchedBannedWord(text: string, patterns: string[]) {
+  const normalizedText = normalizeBannedWordForMatch(text);
+  return patterns.find((pattern) => normalizedText.includes(normalizeBannedWordForMatch(pattern)));
+}
+
+function autoDeleteEventKey(message: Message): AutoDeleteEventKey | undefined {
+  if ("new_chat_members" in message && message.new_chat_members?.length) return "join";
+  if ("left_chat_member" in message && message.left_chat_member) return "leave";
+  if ("boost_added" in message && message.boost_added) return "boost";
+  if ("pinned_message" in message && message.pinned_message) return "pin";
+  if ("new_chat_photo" in message && message.new_chat_photo?.length) return "photo";
+  if ("delete_chat_photo" in message && message.delete_chat_photo) return "photo";
+  if ("new_chat_title" in message && message.new_chat_title) return "title";
+  return undefined;
 }
 
 function autoReplyInlineKeyboard(buttons: AutoReplyButton[][] | undefined) {
@@ -6282,6 +7228,266 @@ async function openGroupStatsPanel(ctx: Context, locale: Locale, chat: PrismaCha
 async function openMemberStatsPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
   const settings = await maybeRecordMemberCountSnapshot(ctx, chat);
   await editOrReply(ctx, memberStatsText(settings, locale), memberStatsKeyboard(chat, settings, locale));
+}
+
+async function sendMemberStatsReport(
+  ctx: Context,
+  chat: PrismaChat,
+  settings: MemberStatsSettings,
+  days: 7 | 31,
+  locale: Locale
+) {
+  if (ctx.callbackQuery?.message && "photo" in ctx.callbackQuery.message) {
+    await ctx.deleteMessage().catch(() => undefined);
+  }
+
+  const report = buildMemberStatsReport(chat, settings, days, locale);
+  const image = renderMemberStatsChartPng(report.rows);
+  const sent = await ctx.replyWithPhoto(new InputFile(image, `member-stats-${chat.telegramChatId}-${days}d.png`), {
+    caption: report.caption,
+    parse_mode: "HTML",
+    reply_markup: memberStatsReportKeyboard(chat.id, days, locale)
+  });
+  const photoFileId = "photo" in sent ? sent.photo.at(-1)?.file_id : undefined;
+  if (photoFileId) {
+    memberStatsShareCache.set(memberStatsInlineQuery(chat.id, days), {
+      photoFileId,
+      caption: report.caption,
+      title: chat.title ?? chat.username ?? String(chat.telegramChatId),
+      updatedAt: Date.now()
+    });
+  }
+}
+
+async function handleMemberStatsInlineQuery(ctx: Context) {
+  const query = ctx.inlineQuery;
+  if (!query) return;
+
+  const [, chatId = "", daysValue = "7"] = query.query.split(":");
+  const days: 7 | 31 = daysValue === "31" ? 31 : 7;
+  const locale = await getLocale(ctx);
+  const chat = chatId ? await prisma.chat.findUnique({ where: { id: chatId } }) : null;
+  if (!chat) {
+    await ctx.answerInlineQuery([], { cache_time: 0, is_personal: true });
+    return;
+  }
+
+  const settings = await getMemberStatsSettings(chat.id);
+  const report = buildMemberStatsReport(chat, settings, days, locale);
+  const cache = memberStatsShareCache.get(memberStatsInlineQuery(chat.id, days));
+  const title = locale === "zh-CN" ? `人数统计 ${days}天` : `Member stats ${days}d`;
+  const description = chat.title ?? chat.username ?? String(chat.telegramChatId);
+  const result: InlineQueryResult = cache
+    ? {
+        type: "photo",
+        id: `member-stats-photo-${chat.id}-${days}-${cache.updatedAt}`,
+        photo_file_id: cache.photoFileId,
+        title,
+        description,
+        caption: cache.caption,
+        parse_mode: "HTML"
+      }
+    : {
+        type: "article",
+        id: `member-stats-text-${chat.id}-${days}`,
+        title,
+        description,
+        input_message_content: {
+          message_text: report.caption,
+          parse_mode: "HTML"
+        }
+      };
+
+  await ctx.answerInlineQuery([result], {
+    cache_time: 0,
+    is_personal: true
+  });
+}
+
+function memberStatsReportKeyboard(chatId: string, days: 7 | 31, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "一周" : "Week", `member_stats:view:${chatId}:7`)
+    .text(locale === "zh-CN" ? "一月" : "Month", `member_stats:view:${chatId}:31`)
+    .row()
+    .text(locale === "zh-CN" ? "❌关闭" : "❌Close", `member_stats:close:${chatId}`)
+    .switchInline(locale === "zh-CN" ? "分享" : "Share", memberStatsInlineQuery(chatId, days));
+}
+
+function memberStatsInlineQuery(chatId: string, days: 7 | 31) {
+  return `member_stats:${chatId}:${days}`;
+}
+
+function buildMemberStatsReport(chat: PrismaChat, settings: MemberStatsSettings, days: 7 | 31, locale: Locale) {
+  const end = new Date();
+  end.setUTCDate(end.getUTCDate() - 1);
+  const dateKeys = recentDateKeys(days, end);
+  const snapshotsByDate = new Map(settings.snapshots.map((item) => [item.date, item]));
+  const priorSnapshots = settings.snapshots
+    .filter((item) => item.date < (dateKeys[0] ?? ""))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  let previousCount = priorSnapshots[priorSnapshots.length - 1]?.count ?? 0;
+  const rows = dateKeys.map((date) => {
+    const count = snapshotsByDate.get(date)?.count ?? 0;
+    const delta = count - previousCount;
+    const percent = previousCount > 0 ? (delta / previousCount) * 100 : 0;
+    previousCount = count;
+    return { date, count, delta, percent };
+  });
+  const title = escapeHtml(chat.title ?? chat.username ?? String(chat.telegramChatId));
+  const caption = locale === "zh-CN"
+    ? [
+        `【${title}】 的统计数据 过去${days}天.`,
+        "",
+        `<pre>${escapeHtml(rows.map(formatMemberStatsReportRow).join("\n"))}</pre>`
+      ].join("\n")
+    : [
+        `<b>${title}</b> member stats for the last ${days} days.`,
+        "",
+        `<pre>${escapeHtml(rows.map(formatMemberStatsReportRow).join("\n"))}</pre>`
+      ].join("\n");
+  return { rows, caption };
+}
+
+function formatMemberStatsReportRow(row: { date: string; count: number; delta: number; percent: number }) {
+  const sign = row.delta >= 0 ? "+" : "";
+  return `${row.date} ${row.count}${sign}${row.delta} ${row.percent.toFixed(1)}%`;
+}
+
+function renderMemberStatsChartPng(rows: Array<{ count: number; delta: number }>) {
+  const width = 840;
+  const height = 420;
+  const pixels = new Uint8Array(width * height * 4);
+  const setPixel = (x: number, y: number, color: [number, number, number, number]) => {
+    if (x < 0 || y < 0 || x >= width || y >= height) return;
+    const offset = (Math.floor(y) * width + Math.floor(x)) * 4;
+    pixels[offset] = color[0];
+    pixels[offset + 1] = color[1];
+    pixels[offset + 2] = color[2];
+    pixels[offset + 3] = color[3];
+  };
+  const fillRect = (x: number, y: number, w: number, h: number, color: [number, number, number, number]) => {
+    for (let yy = Math.max(0, Math.floor(y)); yy < Math.min(height, Math.ceil(y + h)); yy += 1) {
+      for (let xx = Math.max(0, Math.floor(x)); xx < Math.min(width, Math.ceil(x + w)); xx += 1) {
+        setPixel(xx, yy, color);
+      }
+    }
+  };
+  const drawLine = (x0: number, y0: number, x1: number, y1: number, color: [number, number, number, number]) => {
+    let x = Math.round(x0);
+    let y = Math.round(y0);
+    const endX = Math.round(x1);
+    const endY = Math.round(y1);
+    const dx = Math.abs(endX - x);
+    const sx = x < endX ? 1 : -1;
+    const dy = -Math.abs(endY - y);
+    const sy = y < endY ? 1 : -1;
+    let error = dx + dy;
+    while (true) {
+      fillRect(x - 1, y - 1, 3, 3, color);
+      if (x === endX && y === endY) break;
+      const e2 = 2 * error;
+      if (e2 >= dy) {
+        error += dy;
+        x += sx;
+      }
+      if (e2 <= dx) {
+        error += dx;
+        y += sy;
+      }
+    }
+  };
+  const fillCircle = (cx: number, cy: number, radius: number, color: [number, number, number, number]) => {
+    for (let y = -radius; y <= radius; y += 1) {
+      for (let x = -radius; x <= radius; x += 1) {
+        if (x * x + y * y <= radius * radius) setPixel(cx + x, cy + y, color);
+      }
+    }
+  };
+
+  fillRect(0, 0, width, height, [255, 255, 255, 255]);
+  const margin = { left: 64, right: 36, top: 36, bottom: 58 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const axis = [145, 156, 175, 255] as [number, number, number, number];
+  const grid = [226, 232, 240, 255] as [number, number, number, number];
+  const blue = [37, 99, 235, 255] as [number, number, number, number];
+  const green = [22, 163, 74, 255] as [number, number, number, number];
+
+  for (let index = 0; index <= 4; index += 1) {
+    const y = margin.top + (plotHeight / 4) * index;
+    drawLine(margin.left, y, width - margin.right, y, grid);
+  }
+  drawLine(margin.left, margin.top, margin.left, height - margin.bottom, axis);
+  drawLine(margin.left, height - margin.bottom, width - margin.right, height - margin.bottom, axis);
+
+  const counts = rows.map((row) => row.count);
+  const maxCount = Math.max(1, ...counts);
+  const minCount = Math.min(0, ...counts);
+  const range = Math.max(1, maxCount - minCount);
+  const points = rows.map((row, index) => {
+    const x = margin.left + (rows.length <= 1 ? plotWidth / 2 : (plotWidth / (rows.length - 1)) * index);
+    const y = height - margin.bottom - ((row.count - minCount) / range) * plotHeight;
+    return { x, y, row };
+  });
+
+  for (let index = 1; index < points.length; index += 1) {
+    const prev = points[index - 1];
+    const next = points[index];
+    if (prev && next) drawLine(prev.x, prev.y, next.x, next.y, blue);
+  }
+  for (const point of points) {
+    fillCircle(Math.round(point.x), Math.round(point.y), 7, point.row.delta >= 0 ? green : blue);
+    fillCircle(Math.round(point.x), Math.round(point.y), 3, [255, 255, 255, 255]);
+  }
+
+  return encodePng(width, height, pixels);
+}
+
+function encodePng(width: number, height: number, rgba: Uint8Array) {
+  const stride = width * 4;
+  const raw = Buffer.alloc((stride + 1) * height);
+  for (let y = 0; y < height; y += 1) {
+    raw[y * (stride + 1)] = 0;
+    Buffer.from(rgba.subarray(y * stride, (y + 1) * stride)).copy(raw, y * (stride + 1) + 1);
+  }
+
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", Buffer.concat([
+      uint32be(width),
+      uint32be(height),
+      Buffer.from([8, 6, 0, 0, 0])
+    ])),
+    pngChunk("IDAT", deflateSync(raw)),
+    pngChunk("IEND", Buffer.alloc(0))
+  ]);
+}
+
+function pngChunk(type: string, data: Buffer) {
+  const typeBuffer = Buffer.from(type, "ascii");
+  const payload = Buffer.concat([typeBuffer, data]);
+  return Buffer.concat([
+    uint32be(data.length),
+    payload,
+    uint32be(crc32(payload))
+  ]);
+}
+
+function uint32be(value: number) {
+  const buffer = Buffer.alloc(4);
+  buffer.writeUInt32BE(value >>> 0, 0);
+  return buffer;
+}
+
+function crc32(buffer: Buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc ^= byte;
+    for (let index = 0; index < 8; index += 1) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 async function renderGroupStatsActionText(chatId: string, action: string, locale: Locale) {
@@ -6631,7 +7837,7 @@ function blocklistText(settings: BlocklistSettings, locale: Locale) {
 
 function welcomeText(settings: WelcomeSettings, locale: Locale) {
   const hasMedia = Boolean(settings.mediaKind && settings.mediaFileId);
-  const hasButton = Boolean(settings.buttonText && settings.buttonUrl);
+  const hasButton = Boolean(settings.buttons?.length || settings.replyKeyboard?.length || (settings.buttonText && settings.buttonUrl));
   const hasText = Boolean(settings.text.trim());
   if (locale !== "zh-CN") {
     return [
@@ -6668,20 +7874,7 @@ function welcomeInputPromptText(field: WelcomeInputField, settings: WelcomeSetti
   }
 
   if (field === "button") {
-    const current = settings.buttonText && settings.buttonUrl ? `${settings.buttonText} | ${settings.buttonUrl}` : "-";
-    return locale === "zh-CN"
-      ? [
-          "请输入链接按钮，格式：",
-          "<code>按钮文字 | https://example.com</code>",
-          "",
-          `当前按钮：<code>${escapeHtml(current)}</code>`
-        ].join("\n")
-      : [
-          "Send a link button in this format:",
-          "<code>Button text | https://example.com</code>",
-          "",
-          `Current button: <code>${escapeHtml(current)}</code>`
-        ].join("\n");
+    return scheduledButtonPromptText(locale);
   }
 
   return locale === "zh-CN"
@@ -6721,6 +7914,8 @@ function clearWelcomeField(settings: WelcomeSettings, field: WelcomeInputField) 
   }
   settings.buttonText = "";
   settings.buttonUrl = "";
+  settings.buttons = undefined;
+  settings.replyKeyboard = undefined;
 }
 
 function joinVerifyText(settings: JoinVerifySettings, locale: Locale) {
@@ -6760,9 +7955,38 @@ function joinVerifyText(settings: JoinVerifySettings, locale: Locale) {
 }
 
 function autoDeleteText(settings: AutoDeleteSettings, locale: Locale) {
-  return locale === "zh-CN"
-    ? `<b>🧹 自动删除</b>\n状态：${onOffZh(settings.enabled)}\n延迟：${settings.seconds} 秒`
-    : `<b>🧹 Auto delete</b>\nStatus: ${onOff(settings.enabled)}\nDelay: ${settings.seconds}s`;
+  const labels = autoDeleteLabels(locale);
+  const status = (enabled: boolean) => locale === "zh-CN"
+    ? `${enabled ? "开启✅" : "关闭❌"}`
+    : `${enabled ? "On ✅" : "Off ❌"}`;
+
+  if (locale === "zh-CN") {
+    return [
+      "🧹 <b>自动删除</b>",
+      "",
+      "帮助您自动清理群组中的系统消息",
+      "",
+      `<b>${labels.join}</b> ${status(settings.join)}`,
+      `<b>${labels.leave}</b> ${status(settings.leave)}`,
+      `<b>${labels.boost}</b> ${status(settings.boost)}`,
+      `<b>${labels.pin}</b> ${status(settings.pin)}`,
+      `<b>${labels.photo}</b> ${status(settings.photo)}`,
+      `<b>${labels.title}</b> ${status(settings.title)}`
+    ].join("\n");
+  }
+
+  return [
+    "🧹 <b>Auto delete</b>",
+    "",
+    "Automatically cleans service messages in this group.",
+    "",
+    `<b>${labels.join}</b> ${status(settings.join)}`,
+    `<b>${labels.leave}</b> ${status(settings.leave)}`,
+    `<b>${labels.boost}</b> ${status(settings.boost)}`,
+    `<b>${labels.pin}</b> ${status(settings.pin)}`,
+    `<b>${labels.photo}</b> ${status(settings.photo)}`,
+    `<b>${labels.title}</b> ${status(settings.title)}`
+  ].join("\n");
 }
 
 function autoReplyText(settings: AutoReplySettings, locale: Locale, botUsername: string) {
@@ -6791,6 +8015,124 @@ function autoReplyText(settings: AutoReplySettings, locale: Locale, botUsername:
     "- 表示精准触发",
     " * 表示包含触发"
   ].join("\n");
+}
+
+function bannedWordsText(settings: BannedWordsSettings, count: number, locale: Locale) {
+  if (locale !== "zh-CN") {
+    return [
+      "🔇 <b>Banned words</b>",
+      "",
+      `<b>Status</b>: ${settings.enabled ? "On✅" : "Off❌"}`,
+      `<b>Punishment</b>: ${bannedWordsPunishmentLabel(settings, locale)}`,
+      `<b>Words</b>: ${count}`,
+      `<b>Auto-delete notices</b>: ${settings.deleteNotice ? "On" : "Off"}`
+    ].join("\n");
+  }
+
+  return [
+    "🔇 <b>违禁词</b>",
+    "",
+    `<b>状态</b>: ${settings.enabled ? "开启✅" : "关闭❌"}`,
+    `<b>惩罚</b>: ${bannedWordsPunishmentLabel(settings, locale)}`,
+    `<b>词库</b>: ${count} 个`,
+    `<b>提醒自动删除</b>: ${settings.deleteNotice ? "开启" : "关闭"}`
+  ].join("\n");
+}
+
+async function bannedWordsListText(chatId: string, locale: Locale) {
+  const rules = await listBannedWordRules(chatId, 100);
+  if (!rules.length) {
+    return locale === "zh-CN" ? "📋 <b>违禁词列表</b>\n\n[空]" : "📋 <b>Banned words</b>\n\n[None]";
+  }
+
+  const lines = rules.map((rule, index) => `${index + 1}. ${escapeHtml(rule.pattern)}`);
+  return locale === "zh-CN"
+    ? ["📋 <b>违禁词列表</b>", "", ...lines].join("\n")
+    : ["📋 <b>Banned words</b>", "", ...lines].join("\n");
+}
+
+function bannedWordsAddPromptText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "👉 <strong>请发送要添加的违禁词</strong>",
+        "",
+        "支持一次发送多个词，每行一个，或用逗号分隔。"
+      ].join("\n")
+    : [
+        "👉 <strong>Send banned words to add</strong>",
+        "",
+        "You can send multiple words, one per line, or separate them with commas."
+      ].join("\n");
+}
+
+async function bannedWordsDeletePromptText(chatId: string, locale: Locale) {
+  const rules = await listBannedWordRules(chatId, 100);
+  const lines = rules.length
+    ? rules.map((rule) => `<code>${escapeHtml(rule.pattern)}</code>`)
+    : [locale === "zh-CN" ? "[空]" : "[None]"];
+
+  return locale === "zh-CN"
+    ? [
+        "请输入要删除的违禁词，可一次发送多个：",
+        "",
+        "<strong>已添加的违禁词:</strong>",
+        ...lines
+      ].join("\n")
+    : [
+        "Send banned words to delete. Multiple words are supported:",
+        "",
+        "<strong>Added banned words:</strong>",
+        ...lines
+      ].join("\n");
+}
+
+function bannedWordsSavedText(count: number, locale: Locale) {
+  return locale === "zh-CN"
+    ? `✅ 已添加 ${count} 个违禁词，点击按钮返回。`
+    : `✅ Added ${count} banned word(s). Tap the button to return.`;
+}
+
+function bannedWordsDeletedText(count: number, locale: Locale) {
+  return locale === "zh-CN"
+    ? `✅ 已删除 ${count} 个违禁词，点击按钮返回。`
+    : `✅ Deleted ${count} banned word(s). Tap the button to return.`;
+}
+
+function bannedWordsPunishmentLabel(settings: BannedWordsSettings, locale: Locale) {
+  if (locale === "zh-CN") {
+    if (settings.punishment === "warn_mute") return `警告${settings.warningLimit}次后禁言${settings.muteMinutes}分钟`;
+    if (settings.punishment === "mute") return `直接禁言${settings.muteMinutes}分钟`;
+    if (settings.punishment === "ban") return "直接封禁";
+    return "仅删除消息";
+  }
+
+  if (settings.punishment === "warn_mute") return `${settings.warningLimit} warnings, then mute ${settings.muteMinutes}m`;
+  if (settings.punishment === "mute") return `Mute ${settings.muteMinutes}m`;
+  if (settings.punishment === "ban") return "Ban";
+  return "Delete message only";
+}
+
+function groupCommandsHomeText(locale: Locale) {
+  return locale === "zh-CN" ? "请选择设置类型：" : "Choose a setting type:";
+}
+
+function groupCommandsText(settings: GroupCommandSettings, locale: Locale) {
+  const lines = groupCommandDefinitions.map((item) => {
+    const status = settings.commands[item.key]
+      ? (locale === "zh-CN" ? "开启" : "On")
+      : (locale === "zh-CN" ? "关闭" : "Off");
+    return `${item.command} - ${groupCommandLabel(item.key, locale)}: ${status}`;
+  });
+
+  return locale === "zh-CN"
+    ? ["<b>群组命令</b>", "", "关闭后，群内成员将无法使用对应命令。", "", ...lines].join("\n")
+    : ["<b>Group commands</b>", "", "When disabled, members cannot use the matching command in this group.", "", ...lines].join("\n");
+}
+
+function groupCommandLabel(key: GroupCommandKey, locale: Locale) {
+  const item = groupCommandDefinitions.find((definition) => definition.key === key);
+  if (!item) return key;
+  return locale === "zh-CN" ? item.zh : item.en;
 }
 
 function autoReplyDeleteText(settings: AutoReplySettings, locale: Locale) {
@@ -6953,6 +8295,45 @@ function noChatPermissions() {
 function extractInviteLink(message: Message | undefined): ChatInviteLink | null {
   if (!message || !("invite_link" in message)) return null;
   return (message as Message & { invite_link?: ChatInviteLink | null }).invite_link ?? null;
+}
+
+function parseBannedWordsInput(input: string) {
+  return input
+    .split(/[\n,，;；]+/)
+    .map(normalizeBannedWord)
+    .filter(Boolean)
+    .map((word) => word.slice(0, 128));
+}
+
+function uniqueBannedWords(words: string[]) {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const word of words.map(normalizeBannedWord).filter(Boolean)) {
+    const key = normalizeBannedWordForMatch(word);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(word.slice(0, 128));
+  }
+  return result;
+}
+
+function normalizeBannedWord(value: string) {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function normalizeBannedWordForMatch(value: string) {
+  return normalizeBannedWord(value).toLocaleLowerCase();
+}
+
+function isBannedWordsPunishment(value: unknown): value is BannedWordsPunishment {
+  return value === "warn_mute" || value === "mute" || value === "ban" || value === "delete_only";
+}
+
+function nextBannedWordsPunishment(value: BannedWordsPunishment): BannedWordsPunishment {
+  if (value === "warn_mute") return "mute";
+  if (value === "mute") return "ban";
+  if (value === "ban") return "delete_only";
+  return "warn_mute";
 }
 
 function userChatKey(chatId: string, userId: number) {
