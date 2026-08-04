@@ -52,7 +52,18 @@ export async function handleOpenCloseAction(ctx: Context, _config: AppConfig, lo
   if (key === "noop") return;
 
   if (key === "toggle:on" || key === "toggle:off") {
-    await saveSettings(chat.id, { enabled: key.endsWith(":on") });
+    const enabled = key.endsWith(":on");
+    const settings = await getSettings(chat.id);
+    const ok = await applyOpenCloseState(ctx, chat.telegramChatId, enabled).catch(() => false);
+    if (!ok) {
+      await ctx.answerCallbackQuery({
+        text: locale === "zh-CN" ? "切换失败，请确认机器人有修改群权限。" : "Failed to switch. Make sure the bot can manage group permissions.",
+        show_alert: true
+      }).catch(() => undefined);
+      return;
+    }
+    await saveSettings(chat.id, { enabled });
+    await ctx.api.sendMessage(Number(chat.telegramChatId), enabled ? settings.openPrompt : settings.closePrompt).catch(() => undefined);
     await renderMenu(ctx, menuText(await getSettings(chat.id)), menuKeyboard(await getSettings(chat.id), chat.id), "HTML");
     return;
   }
@@ -109,7 +120,8 @@ export async function handleOpenCloseGroupMessage(ctx: Context) {
   const admin = await isUserChatAdmin(ctx, ctx.chat.id, ctx.from.id).catch(() => false);
   if (!admin) return false;
 
-  await ctx.api.setChatPermissions(ctx.chat.id, enabled ? openPermissions() : closedPermissions());
+  const ok = await applyOpenCloseState(ctx, chat.telegramChatId, enabled).catch(() => false);
+  if (!ok) return false;
   await saveSettings(chat.id, { enabled });
   await ctx.reply(enabled ? settings.openPrompt : settings.closePrompt);
   return true;
@@ -238,6 +250,12 @@ function closedPermissions(): ChatPermissions {
     can_pin_messages: false,
     can_manage_topics: false
   };
+}
+
+async function applyOpenCloseState(ctx: Context, chatId: PrismaChat["telegramChatId"], enabled: boolean) {
+  const permissions = enabled ? openPermissions() : closedPermissions();
+  await ctx.api.setChatPermissions(Number(chatId), permissions);
+  return true;
 }
 
 async function renderMenu(ctx: Context, text: string, replyMarkup: InlineKeyboard, parseMode?: "HTML") {

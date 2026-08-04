@@ -42,6 +42,11 @@ export async function handleNewMemberLimitAction(ctx: Context, _config: AppConfi
 
   if (key === "noop") return;
 
+  if (key === "back") {
+    await renderNewMemberLimitMenu(ctx, locale, chat);
+    return;
+  }
+
   if (key === "toggle:on") {
     await saveNewMemberLimitSettings(chat.id, { enabled: true });
     await renderNewMemberLimitMenu(ctx, locale, chat);
@@ -71,7 +76,7 @@ export async function handleNewMemberLimitAction(ctx: Context, _config: AppConfi
             "Supported: 1m, 10m, 2h, 1d, 1 minute, 2 hours",
             "Range: 1 minute - 30 days"
           ].join("\n"),
-      new InlineKeyboard().text(locale === "zh-CN" ? "返回" : "Back", "new_member_limit:noop"),
+      new InlineKeyboard().text(locale === "zh-CN" ? "返回" : "Back", "new_member_limit:back"),
       "HTML"
     );
     return;
@@ -203,7 +208,7 @@ async function saveNewMemberLimitSettings(chatId: string, patch: Partial<NewMemb
   return next;
 }
 
-function parseNewMemberLimitSettings(value: unknown): NewMemberLimitSettings {
+export function parseNewMemberLimitSettings(value: unknown): NewMemberLimitSettings {
   if (!isRecord(value)) return defaultNewMemberLimitSettings();
   return {
     enabled: typeof value.enabled === "boolean" ? value.enabled : false,
@@ -266,7 +271,7 @@ function mutedChatPermissions(): ChatPermissions {
   };
 }
 
-function parseDurationMinutes(input: string) {
+export function parseDurationMinutes(input: string) {
   const text = input.trim().toLowerCase().replace(/\s+/g, "");
   const match = text.match(/^(\d+)(分钟|分|小时|时|天|日|minute|minutes|min|m|hour|hours|h|day|days|d)$/i);
   if (!match) return null;
@@ -293,7 +298,7 @@ function normalizeDurationMinutes(value: unknown) {
   return Math.min(maxDurationMinutes, Math.max(minDurationMinutes, minutes));
 }
 
-function formatDuration(locale: Locale, minutes: number) {
+export function formatDuration(locale: Locale, minutes: number) {
   if (minutes % (24 * 60) === 0) {
     const days = minutes / (24 * 60);
     return locale === "zh-CN" ? `${days} 天` : `${days} day${days === 1 ? "" : "s"}`;

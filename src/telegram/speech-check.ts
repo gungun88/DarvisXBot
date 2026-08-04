@@ -1,4 +1,4 @@
-import { ChatStatus, Prisma, type Chat as PrismaChat } from "@prisma/client";
+import { ChatStatus, MembershipStatus, Prisma, type Chat as PrismaChat } from "@prisma/client";
 import { InlineKeyboard, type Context } from "grammy";
 import type { ChatPermissions, User } from "grammy/types";
 import { prisma } from "../lib/prisma.js";
@@ -6,16 +6,19 @@ import { canConfigureChat, isUserChatAdmin } from "./permissions.js";
 
 type Locale = "zh-CN" | "en";
 
-type SpeechCheckInputField = "forbidden_names" | "punishment" | "notice_delete" | "required_channel";
+type SpeechCheckInputField = "forbidden_names" | "punishment_minutes" | "required_channel";
+type SpeechCheckPunishment = "warn" | "mute" | "kick" | "ban" | "delete_only";
 
 type SpeechCheckSettings = {
   requireLastName: boolean;
   requireUsername: boolean;
   requireAvatar: boolean;
   requireChannelSubscription: boolean;
-  requiredChannel: string;
+  requiredChannels: string[];
   forbiddenNameKeywords: string[];
+  punishment: SpeechCheckPunishment;
   punishmentMinutes: number;
+  permanentMute: boolean;
   noticeDeleteSeconds: number;
 };
 
@@ -29,8 +32,7 @@ const defaultPunishmentMinutes = 10;
 const minPunishmentMinutes = 1;
 const maxPunishmentMinutes = 30 * 24 * 60;
 const defaultNoticeDeleteSeconds = 600;
-const minNoticeDeleteSeconds = 0;
-const maxNoticeDeleteSeconds = 24 * 60 * 60;
+const noticeDeleteOptions = [10, 30, 60, 300, 600, 1800, 3600, 21600, 43200, 0] as const;
 const selectedChatIds = new Map<number, string>();
 const inputDrafts = new Map<number, SpeechCheckDraft>();
 const avatarCache = new Map<number, { hasAvatar: boolean; expiresAt: number }>();
@@ -60,7 +62,8 @@ export async function handleSpeechCheckAction(ctx: Context, locale: Locale, key:
 
   const settings = await getSpeechCheckSettings(chat.id);
 
-  if (key === "back") {
+  if (key === "back" || key === "cancel") {
+    inputDrafts.delete(ctx.from.id);
     await renderSpeechCheckMenu(ctx, locale, chat);
     return;
   }
@@ -84,38 +87,65 @@ export async function handleSpeechCheckAction(ctx: Context, locale: Locale, key:
   }
 
   if (key === "channel") {
-    if (settings.requiredChannel) {
-      await saveSpeechCheckSettings(chat.id, { requireChannelSubscription: !settings.requireChannelSubscription });
-      await renderSpeechCheckMenu(ctx, locale, chat);
-      return;
-    }
-
+    await renderMenu(ctx, buildRequiredChannelPrompt(locale), inputBackKeyboard(locale), "HTML");
     inputDrafts.set(ctx.from.id, { chatId: chat.id, field: "required_channel" });
-    await renderMenu(ctx, speechCheckInputPrompt("required_channel", settings, locale), inputBackKeyboard(locale), "HTML");
     return;
   }
 
-  if (key === "channel:set") {
-    inputDrafts.set(ctx.from.id, { chatId: chat.id, field: "required_channel" });
-    await renderMenu(ctx, speechCheckInputPrompt("required_channel", settings, locale), inputBackKeyboard(locale), "HTML");
+  if (key === "toggle:channel") {
+    await saveSpeechCheckSettings(chat.id, { requireChannelSubscription: !settings.requireChannelSubscription });
+    await renderSpeechCheckMenu(ctx, locale, chat);
     return;
   }
 
-  if (key === "forbidden_names") {
+  if (key === "names") {
+    await renderMenu(ctx, buildForbiddenNamesMenu(locale, settings), forbiddenNamesKeyboard(locale), "HTML");
+    return;
+  }
+
+  if (key === "names:add") {
+    await renderMenu(ctx, buildForbiddenNameInputPrompt(locale), cancelKeyboard(locale), "HTML");
     inputDrafts.set(ctx.from.id, { chatId: chat.id, field: "forbidden_names" });
-    await renderMenu(ctx, speechCheckInputPrompt("forbidden_names", settings, locale), inputBackKeyboard(locale), "HTML");
     return;
   }
 
   if (key === "punishment") {
-    inputDrafts.set(ctx.from.id, { chatId: chat.id, field: "punishment" });
-    await renderMenu(ctx, speechCheckInputPrompt("punishment", settings, locale), inputBackKeyboard(locale), "HTML");
+    await renderMenu(ctx, buildPunishmentMenu(locale, settings), punishmentKeyboard(locale, settings), "HTML");
+    return;
+  }
+
+  if (key.startsWith("punishment:set:")) {
+    const punishment = key.replace("punishment:set:", "");
+    if (isSpeechCheckPunishment(punishment)) {
+      await saveSpeechCheckSettings(chat.id, { punishment });
+    }
+    await renderMenu(ctx, buildPunishmentMenu(locale, await getSpeechCheckSettings(chat.id)), punishmentKeyboard(locale, await getSpeechCheckSettings(chat.id)), "HTML");
+    return;
+  }
+
+  if (key === "punishment:duration") {
+    await renderMenu(ctx, buildPunishmentDurationPrompt(locale, settings), punishmentDurationKeyboard(locale, settings), "HTML");
+    inputDrafts.set(ctx.from.id, { chatId: chat.id, field: "punishment_minutes" });
+    return;
+  }
+
+  if (key === "punishment:permanent") {
+    await saveSpeechCheckSettings(chat.id, { punishment: "mute", permanentMute: true });
+    await renderMenu(ctx, buildPunishmentMenu(locale, await getSpeechCheckSettings(chat.id)), punishmentKeyboard(locale, await getSpeechCheckSettings(chat.id)), "HTML");
     return;
   }
 
   if (key === "notice_delete") {
-    inputDrafts.set(ctx.from.id, { chatId: chat.id, field: "notice_delete" });
-    await renderMenu(ctx, speechCheckInputPrompt("notice_delete", settings, locale), inputBackKeyboard(locale), "HTML");
+    await renderMenu(ctx, buildNoticeDeleteMenu(locale), noticeDeleteKeyboard(locale, settings), "HTML");
+    return;
+  }
+
+  if (key.startsWith("notice:set:")) {
+    const seconds = Number(key.replace("notice:set:", ""));
+    if (noticeDeleteOptions.includes(seconds as (typeof noticeDeleteOptions)[number])) {
+      await saveSpeechCheckSettings(chat.id, { noticeDeleteSeconds: seconds });
+    }
+    await renderMenu(ctx, buildNoticeDeleteMenu(locale), noticeDeleteKeyboard(locale, await getSpeechCheckSettings(chat.id)), "HTML");
     return;
   }
 
@@ -145,17 +175,18 @@ export async function handleSpeechCheckPrivateMessage(ctx: Context, locale: Loca
     return true;
   }
 
-  const patch = parseSpeechCheckInput(draft.field, text, locale);
+  const settings = await getSpeechCheckSettings(chat.id);
+  const patch = await parseSpeechCheckInput(ctx, chat.id, draft.field, text, settings, locale);
   if (!patch.ok) {
-    await ctx.reply(patch.message);
+    await ctx.reply(patch.message, { parse_mode: "HTML" });
     return true;
   }
 
   inputDrafts.delete(ctx.from.id);
-  await saveSpeechCheckSettings(chat.id, patch.value);
-  await ctx.reply(buildSpeechCheckMessage(locale, await getSpeechCheckSettings(chat.id)), {
+  const next = await saveSpeechCheckSettings(chat.id, patch.value);
+  await ctx.reply(buildSpeechCheckMessage(locale, next), {
     parse_mode: "HTML",
-    reply_markup: speechCheckKeyboard(locale, chat, await getSpeechCheckSettings(chat.id))
+    reply_markup: speechCheckKeyboard(locale, chat, next)
   });
   return true;
 }
@@ -255,14 +286,18 @@ async function saveSpeechCheckSettings(chatId: string, patch: Partial<SpeechChec
 
 function parseSpeechCheckSettings(value: unknown): SpeechCheckSettings {
   if (!isRecord(value)) return defaultSpeechCheckSettings();
+  const requiredChannels = normalizeRequiredChannels(value.requiredChannels);
+  const legacyRequiredChannel = typeof value.requiredChannel === "string" ? normalizeRequiredChannel(value.requiredChannel) : "";
   return {
     requireLastName: typeof value.requireLastName === "boolean" ? value.requireLastName : false,
     requireUsername: typeof value.requireUsername === "boolean" ? value.requireUsername : false,
     requireAvatar: typeof value.requireAvatar === "boolean" ? value.requireAvatar : false,
     requireChannelSubscription: typeof value.requireChannelSubscription === "boolean" ? value.requireChannelSubscription : false,
-    requiredChannel: typeof value.requiredChannel === "string" ? value.requiredChannel.trim() : "",
+    requiredChannels: requiredChannels.length ? requiredChannels : (legacyRequiredChannel ? [legacyRequiredChannel] : []),
     forbiddenNameKeywords: normalizeForbiddenNameKeywords(value.forbiddenNameKeywords),
+    punishment: isSpeechCheckPunishment(value.punishment) ? value.punishment : "mute",
     punishmentMinutes: normalizePunishmentMinutes(value.punishmentMinutes),
+    permanentMute: typeof value.permanentMute === "boolean" ? value.permanentMute : false,
     noticeDeleteSeconds: normalizeNoticeDeleteSeconds(value.noticeDeleteSeconds)
   };
 }
@@ -273,9 +308,11 @@ function defaultSpeechCheckSettings(): SpeechCheckSettings {
     requireUsername: false,
     requireAvatar: false,
     requireChannelSubscription: false,
-    requiredChannel: "",
+    requiredChannels: [],
     forbiddenNameKeywords: [],
+    punishment: "mute",
     punishmentMinutes: defaultPunishmentMinutes,
+    permanentMute: false,
     noticeDeleteSeconds: defaultNoticeDeleteSeconds
   };
 }
@@ -286,9 +323,11 @@ function speechCheckSettingsToJson(settings: SpeechCheckSettings): Prisma.InputJ
     requireUsername: settings.requireUsername,
     requireAvatar: settings.requireAvatar,
     requireChannelSubscription: settings.requireChannelSubscription,
-    requiredChannel: settings.requiredChannel,
+    requiredChannels: settings.requiredChannels,
     forbiddenNameKeywords: settings.forbiddenNameKeywords,
+    punishment: settings.punishment,
     punishmentMinutes: settings.punishmentMinutes,
+    permanentMute: settings.permanentMute,
     noticeDeleteSeconds: settings.noticeDeleteSeconds
   };
 }
@@ -300,9 +339,9 @@ function buildSpeechCheckMessage(locale: Locale, settings: SpeechCheckSettings) 
       "",
       "Checks and blocks messages when users send them.",
       "",
-      `<b>Punishment:</b> Mute ${formatDuration(locale, settings.punishmentMinutes)}`,
-      `<b>Delete notice:</b> ${settings.noticeDeleteSeconds} seconds`,
-      settings.requireChannelSubscription && settings.requiredChannel ? `<b>Required channel:</b> <code>${escapeHtml(settings.requiredChannel)}</code>` : "",
+      `<b>Punishment:</b> ${formatPunishment(locale, settings)}`,
+      `<b>Delete notice:</b> ${formatNoticeDelete(locale, settings.noticeDeleteSeconds)}`,
+      settings.requiredChannels.length ? `<b>Required channels:</b> ${settings.requiredChannels.map((item) => `<code>${escapeHtml(item)}</code>`).join(", ")}` : "",
       settings.forbiddenNameKeywords.length ? `<b>Name forbidden contains:</b> ${settings.forbiddenNameKeywords.map(escapeHtml).join(", ")}` : ""
     ].filter(Boolean).join("\n");
   }
@@ -312,9 +351,9 @@ function buildSpeechCheckMessage(locale: Locale, settings: SpeechCheckSettings) 
     "",
     "在用户发送消息时进行检查和屏蔽。",
     "",
-    `<b>惩罚:</b> 禁言${formatDuration(locale, settings.punishmentMinutes)}`,
-    `<b>删除提醒:</b> ${settings.noticeDeleteSeconds} 秒`,
-    settings.requireChannelSubscription && settings.requiredChannel ? `<b>订阅频道:</b> <code>${escapeHtml(settings.requiredChannel)}</code>` : "",
+    `<b>惩罚:</b> ${formatPunishment(locale, settings)}`,
+    `<b>删除提醒:</b> ${formatNoticeDelete(locale, settings.noticeDeleteSeconds)}`,
+    settings.requiredChannels.length ? `<b>订阅频道/群组:</b> ${settings.requiredChannels.map((item) => `<code>${escapeHtml(item)}</code>`).join("、")}` : "",
     settings.forbiddenNameKeywords.length ? `<b>昵称禁止包含:</b> ${settings.forbiddenNameKeywords.map(escapeHtml).join("、")}` : ""
   ].filter(Boolean).join("\n");
 }
@@ -329,9 +368,11 @@ function speechCheckKeyboard(locale: Locale, chat: PrismaChat, settings: SpeechC
     .row()
     .text(mark(settings.requireAvatar, locale === "zh-CN" ? "必须设置头像" : "Require avatar"), "speech_check:toggle:avatar")
     .row()
-    .text(mark(settings.requireChannelSubscription, locale === "zh-CN" ? "必须订阅频道" : "Require channel subscription"), "speech_check:channel")
+    .text(mark(settings.requireChannelSubscription, locale === "zh-CN" ? "必须订阅频道" : "Require channel subscription"), "speech_check:toggle:channel")
     .row()
-    .text(locale === "zh-CN" ? "🈲昵称禁止包含" : "🈲Name forbidden contains", "speech_check:forbidden_names")
+    .text(locale === "zh-CN" ? "📢设置订阅频道" : "📢Set required channel", "speech_check:channel")
+    .row()
+    .text(locale === "zh-CN" ? "🈲昵称禁止包含" : "🈲Name forbidden contains", "speech_check:names")
     .row()
     .text(locale === "zh-CN" ? "🚷惩罚" : "🚷Punishment", "speech_check:punishment")
     .text(locale === "zh-CN" ? "♻️删除提醒" : "♻️Delete notice", "speech_check:notice_delete")
@@ -339,92 +380,185 @@ function speechCheckKeyboard(locale: Locale, chat: PrismaChat, settings: SpeechC
     .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `menu:chat:${scope}:${chat.id}`);
 }
 
-function speechCheckInputPrompt(field: SpeechCheckInputField, settings: SpeechCheckSettings, locale: Locale) {
-  if (field === "required_channel") {
-    return locale === "zh-CN"
-      ? [
-          "<b>请发送必须订阅的频道</b>",
-          "",
-          "支持格式：<code>@channel_username</code> 或 <code>-1001234567890</code>",
-          "Bot 需要能读取该频道/群组成员状态。",
-          "",
-          `当前：<code>${escapeHtml(settings.requiredChannel || "-")}</code>`
-        ].join("\n")
-      : [
-          "<b>Send the required channel</b>",
-          "",
-          "Supported: <code>@channel_username</code> or <code>-1001234567890</code>.",
-          "The bot must be able to read membership in that channel/group.",
-          "",
-          `Current: <code>${escapeHtml(settings.requiredChannel || "-")}</code>`
-        ].join("\n");
+function buildRequiredChannelPrompt(locale: Locale) {
+  if (locale !== "zh-CN") {
+    return [
+      "📢 <b>Speech Check</b>",
+      "",
+      "Require ordinary group members to join public channels/groups before speaking.",
+      "",
+      "⚠️ <i>Currently only public channels/groups are supported. Make sure the bot is added to the target chat and has admin permissions.</i>",
+      "",
+      "<b>Quota:</b>",
+      "• <b>Normal users:</b> up to <b>1</b> channel/group",
+      "• <b>Members:</b> up to <b>3</b> channels/groups",
+      "",
+      "👉 <b>Send a public channel or group address:</b>",
+      "",
+      "<b>Examples:</b>",
+      "• <code>https://t.me/example</code>",
+      "• <code>t.me/example</code>",
+      "• <code>@example_channel</code>"
+    ].join("\n");
   }
 
-  if (field === "forbidden_names") {
-    return locale === "zh-CN"
-      ? [
-          "<b>请发送昵称禁止包含的关键词</b>",
-          "",
-          "多个关键词用换行、逗号或空格分隔。发送 <code>clear</code> 清空。",
-          "",
-          `当前：<code>${escapeHtml(settings.forbiddenNameKeywords.join(", ") || "-")}</code>`
-        ].join("\n")
-      : [
-          "<b>Send forbidden name keywords</b>",
-          "",
-          "Separate multiple keywords with new lines, commas, or spaces. Send <code>clear</code> to clear.",
-          "",
-          `Current: <code>${escapeHtml(settings.forbiddenNameKeywords.join(", ") || "-")}</code>`
-        ].join("\n");
+  return [
+    "📢 <b>发言检查</b>",
+    "",
+    "用户发言的时候，强制要求普通群成员必须先加入指定的频道或群组。",
+    "",
+    "⚠️ <i>提示：当前仅支持<b>公开</b>频道/群组，且请确保机器人已被添加至目标频道/群组中并赋予管理权限。</i>",
+    "",
+    "<b>👥 检测额度：</b>",
+    "• <b>普通用户：</b> 最多支持检测 <b>1 个</b> 频道/群组",
+    "• <b>会员用户：</b> 最多支持检测 <b>3 个</b> 频道/群组",
+    "",
+    "👉 <b>请输入公开频道或群组地址：</b>",
+    "",
+    "<b>💡 格式示例：</b>",
+    "• <code>https://t.me/example</code>",
+    "• <code>t.me/example</code>",
+    "• <code>@example_channel</code>"
+  ].join("\n");
+}
+
+function buildForbiddenNamesMenu(locale: Locale, settings: SpeechCheckSettings) {
+  if (locale !== "zh-CN") {
+    return [
+      "🔦 <b>Speech Check</b>",
+      "",
+      "⛔ Names containing these keywords will be punished.",
+      "",
+      `Added forbidden names: ${settings.forbiddenNameKeywords.length}`
+    ].join("\n");
   }
 
-  if (field === "punishment") {
-    return locale === "zh-CN"
-      ? [
-          "<b>请发送禁言时长</b>",
-          "",
-          "支持格式：<code>10分钟</code>、<code>1小时</code>、<code>1天</code>、<code>10m</code>、<code>1h</code>、<code>1d</code>",
-          "范围：1 分钟 - 30 天。",
-          "",
-          `当前：禁言${formatDuration(locale, settings.punishmentMinutes)}`
-        ].join("\n")
-      : [
-          "<b>Send the mute duration</b>",
-          "",
-          "Supported: <code>10m</code>, <code>1h</code>, <code>1d</code>, <code>10 minutes</code>.",
-          "Range: 1 minute - 30 days.",
-          "",
-          `Current: mute ${formatDuration(locale, settings.punishmentMinutes)}`
-        ].join("\n");
-  }
+  return [
+    "🔦 <b>发言检查</b>",
+    "",
+    "⛔️ 昵称中包含关键词将惩罚",
+    "",
+    `已添加禁止名单: ${settings.forbiddenNameKeywords.length} 条`
+  ].join("\n");
+}
 
+function forbiddenNamesKeyboard(locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "➕添加" : "➕Add", "speech_check:names:add")
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", "speech_check:back");
+}
+
+function buildForbiddenNameInputPrompt(locale: Locale) {
+  return locale === "zh-CN"
+    ? ["🔦 <b>发言检查</b>", "", "👉 输入你想要禁止的名字:"].join("\n")
+    : ["🔦 <b>Speech Check</b>", "", "👉 Send the name keyword to block:"].join("\n");
+}
+
+function buildPunishmentMenu(locale: Locale, settings: SpeechCheckSettings) {
+  return locale === "zh-CN"
+    ? ["<b>🔦 发言检查</b>", "", `<b>惩罚：</b>${formatPunishment(locale, settings)}`].join("\n")
+    : ["<b>🔦 Speech Check</b>", "", `<b>Punishment:</b> ${formatPunishment(locale, settings)}`].join("\n");
+}
+
+function punishmentKeyboard(locale: Locale, settings: SpeechCheckSettings) {
+  const selected = (value: SpeechCheckPunishment, label: string) => settings.punishment === value ? `✅${label}` : label;
+  return new InlineKeyboard()
+    .text(selected("warn", locale === "zh-CN" ? "警告" : "Warn"), "speech_check:punishment:set:warn")
+    .text(selected("mute", locale === "zh-CN" ? "禁言" : "Mute"), "speech_check:punishment:set:mute")
+    .text(selected("kick", locale === "zh-CN" ? "踢出" : "Kick"), "speech_check:punishment:set:kick")
+    .row()
+    .text(selected("ban", locale === "zh-CN" ? "封禁" : "Ban"), "speech_check:punishment:set:ban")
+    .text(selected("delete_only", locale === "zh-CN" ? "仅删除" : "Delete only"), "speech_check:punishment:set:delete_only")
+    .row()
+    .text(locale === "zh-CN" ? "🔇🕙设置禁言时长" : "🔇🕙Set mute duration", "speech_check:punishment:duration")
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", "speech_check:back");
+}
+
+function buildPunishmentDurationPrompt(locale: Locale, settings: SpeechCheckSettings) {
   return locale === "zh-CN"
     ? [
-        "<b>请发送提醒删除时间</b>",
+        "<b>🔦 发言检查</b>",
         "",
-        "单位为秒，也支持 <code>10分钟</code>、<code>1小时</code>、<code>10m</code>、<code>1h</code>。",
-        "发送 <code>0</code> 表示不自动删除提醒。",
+        `当前设置: ${settings.permanentMute ? "永久禁言" : `禁言${formatDuration(locale, settings.punishmentMinutes)}`}`,
         "",
-        `当前：${settings.noticeDeleteSeconds} 秒`
+        "👉 输入处罚禁言的时长 如 <b>60</b> 单位/分钟:"
       ].join("\n")
     : [
-        "<b>Send notice deletion time</b>",
+        "<b>🔦 Speech Check</b>",
         "",
-        "Use seconds, or duration like <code>10m</code>, <code>1h</code>. Send <code>0</code> to keep notices.",
+        `Current: ${settings.permanentMute ? "permanent mute" : `mute ${formatDuration(locale, settings.punishmentMinutes)}`}`,
         "",
-        `Current: ${settings.noticeDeleteSeconds} seconds`
+        "👉 Send mute duration in minutes, for example <b>60</b>:"
       ].join("\n");
 }
 
-function parseSpeechCheckInput(field: SpeechCheckInputField, text: string, locale: Locale):
-  | { ok: true; value: Partial<SpeechCheckSettings> }
-  | { ok: false; message: string } {
+function punishmentDurationKeyboard(locale: Locale, settings: SpeechCheckSettings) {
+  return new InlineKeyboard()
+    .text(settings.permanentMute ? (locale === "zh-CN" ? "✅永久禁言" : "✅Permanent mute") : (locale === "zh-CN" ? "⛔永久禁言" : "⛔Permanent mute"), "speech_check:punishment:permanent")
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", "speech_check:punishment");
+}
+
+function buildNoticeDeleteMenu(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "<b>🔦 发言检查</b>",
+        "",
+        "群成员触发🔦检查时，机器人发出的提醒消息在多少时间后自动删除"
+      ].join("\n")
+    : [
+        "<b>🔦 Speech Check</b>",
+        "",
+        "Choose when bot notice messages should be deleted after a member triggers speech check."
+      ].join("\n");
+}
+
+function noticeDeleteKeyboard(locale: Locale, settings: SpeechCheckSettings) {
+  const label = (seconds: number, text: string) => settings.noticeDeleteSeconds === seconds ? `✅${text}` : text;
+  return new InlineKeyboard()
+    .text(label(10, locale === "zh-CN" ? "10秒" : "10s"), "speech_check:notice:set:10")
+    .text(label(30, locale === "zh-CN" ? "30秒" : "30s"), "speech_check:notice:set:30")
+    .text(label(60, locale === "zh-CN" ? "60秒" : "60s"), "speech_check:notice:set:60")
+    .row()
+    .text(label(300, locale === "zh-CN" ? "5分钟" : "5m"), "speech_check:notice:set:300")
+    .text(label(600, locale === "zh-CN" ? "10分钟" : "10m"), "speech_check:notice:set:600")
+    .text(label(1800, locale === "zh-CN" ? "30分钟" : "30m"), "speech_check:notice:set:1800")
+    .row()
+    .text(label(3600, locale === "zh-CN" ? "1小时" : "1h"), "speech_check:notice:set:3600")
+    .text(label(21600, locale === "zh-CN" ? "6小时" : "6h"), "speech_check:notice:set:21600")
+    .text(label(43200, locale === "zh-CN" ? "12小时" : "12h"), "speech_check:notice:set:43200")
+    .row()
+    .text(label(0, locale === "zh-CN" ? "不删除" : "Do not delete"), "speech_check:notice:set:0")
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", "speech_check:back");
+}
+
+async function parseSpeechCheckInput(
+  ctx: Context,
+  chatId: string,
+  field: SpeechCheckInputField,
+  text: string,
+  settings: SpeechCheckSettings,
+  locale: Locale
+): Promise<{ ok: true; value: Partial<SpeechCheckSettings> } | { ok: false; message: string }> {
   if (field === "required_channel") {
     const channel = normalizeRequiredChannel(text);
     if (!channel) {
-      return { ok: false, message: locale === "zh-CN" ? "频道格式不正确，请发送 @username 或 -100 开头的频道 ID。" : "Invalid channel. Send @username or a -100 channel ID." };
+      return { ok: false, message: locale === "zh-CN" ? "频道/群组格式不正确，请发送 <code>https://t.me/example</code>、<code>t.me/example</code> 或 <code>@example</code>。" : "Invalid channel/group. Send https://t.me/example, t.me/example, or @example." };
     }
-    return { ok: true, value: { requiredChannel: channel, requireChannelSubscription: true } };
+
+    const limit = await requiredChannelLimit(ctx.from?.id);
+    const nextChannels = [...settings.requiredChannels.filter((item) => item !== channel), channel];
+    if (nextChannels.length > limit) {
+      return { ok: false, message: locale === "zh-CN" ? `当前账号最多支持检测 ${limit} 个频道/群组。` : `This account can check up to ${limit} channel/group(s).` };
+    }
+
+    const botCanRead = await canBotReadRequiredChannel(ctx, channel);
+    if (!botCanRead) {
+      return { ok: false, message: locale === "zh-CN" ? "无法读取该频道/群组成员状态。请确认它是公开频道/群组，且机器人已加入并拥有管理权限。" : "Could not read membership for that channel/group. Make sure it is public and the bot is added as an admin." };
+    }
+
+    return { ok: true, value: { requiredChannels: nextChannels, requireChannelSubscription: true } };
   }
 
   if (field === "forbidden_names") {
@@ -433,22 +567,36 @@ function parseSpeechCheckInput(field: SpeechCheckInputField, text: string, local
     if (!keywords.length) {
       return { ok: false, message: locale === "zh-CN" ? "请至少发送一个关键词，或发送 clear 清空。" : "Send at least one keyword, or send clear." };
     }
-    return { ok: true, value: { forbiddenNameKeywords: keywords } };
+    return { ok: true, value: { forbiddenNameKeywords: [...new Set([...settings.forbiddenNameKeywords, ...keywords])].slice(0, 50) } };
   }
 
-  if (field === "punishment") {
-    const minutes = parseDurationMinutes(text);
-    if (!minutes) {
-      return { ok: false, message: locale === "zh-CN" ? "时长格式不正确，请发送 10分钟、1小时、1天、10m、1h 或 1d。" : "Invalid duration. Send 10m, 1h, or 1d." };
-    }
-    return { ok: true, value: { punishmentMinutes: minutes } };
+  const minutes = parseDurationMinutes(text);
+  if (!minutes) {
+    return { ok: false, message: locale === "zh-CN" ? "时长格式不正确，请发送分钟数，例如 60。" : "Invalid duration. Send minutes, for example 60." };
   }
+  return { ok: true, value: { punishment: "mute", punishmentMinutes: minutes, permanentMute: false } };
+}
 
-  const seconds = parseNoticeDeleteSeconds(text);
-  if (seconds === null) {
-    return { ok: false, message: locale === "zh-CN" ? "时间格式不正确，请发送秒数、10分钟、1小时、10m 或 1h。" : "Invalid time. Send seconds, 10m, or 1h." };
-  }
-  return { ok: true, value: { noticeDeleteSeconds: seconds } };
+async function requiredChannelLimit(telegramUserId: number | undefined) {
+  if (!telegramUserId) return 1;
+  const user = await prisma.user.findUnique({ where: { telegramUserId: BigInt(telegramUserId) } });
+  if (!user) return 1;
+  const activeMembership = await prisma.membership.findFirst({
+    where: {
+      userId: user.id,
+      status: MembershipStatus.ACTIVE,
+      expiresAt: { gt: new Date() }
+    },
+    select: { id: true }
+  });
+  return activeMembership ? 3 : 1;
+}
+
+async function canBotReadRequiredChannel(ctx: Context, channel: string) {
+  const me = await ctx.api.getMe().catch(() => null);
+  if (!me) return false;
+  const member = await ctx.api.getChatMember(channel, me.id).catch(() => null);
+  return Boolean(member && (member.status === "creator" || member.status === "administrator" || member.status === "member"));
 }
 
 async function findSpeechCheckFailures(ctx: Context, user: User, settings: SpeechCheckSettings) {
@@ -459,7 +607,7 @@ async function findSpeechCheckFailures(ctx: Context, user: User, settings: Speec
   if (settings.requireLastName && !user.last_name?.trim()) reasons.push("last_name");
   if (settings.requireUsername && !user.username?.trim()) reasons.push("username");
   if (settings.requireAvatar && !(await userHasAvatar(ctx, user.id))) reasons.push("avatar");
-  if (settings.requireChannelSubscription && settings.requiredChannel && !(await userSubscribedToRequiredChannel(ctx, settings.requiredChannel, user.id))) {
+  if (settings.requireChannelSubscription && settings.requiredChannels.length && !(await userSubscribedToAllRequiredChannels(ctx, settings.requiredChannels, user.id))) {
     reasons.push("channel");
   }
   if (settings.forbiddenNameKeywords.some((keyword) => keyword && nameTarget.includes(keyword.toLowerCase()))) reasons.push("forbidden_name");
@@ -477,6 +625,13 @@ async function userHasAvatar(ctx: Context, userId: number) {
   return hasAvatar;
 }
 
+async function userSubscribedToAllRequiredChannels(ctx: Context, channels: string[], userId: number) {
+  for (const channel of channels) {
+    if (!(await userSubscribedToRequiredChannel(ctx, channel, userId))) return false;
+  }
+  return true;
+}
+
 async function userSubscribedToRequiredChannel(ctx: Context, channel: string, userId: number) {
   const key = `${channel}:${userId}`;
   const cached = subscriptionCache.get(key);
@@ -489,7 +644,20 @@ async function userSubscribedToRequiredChannel(ctx: Context, channel: string, us
 }
 
 async function applySpeechCheckPunishment(ctx: Context, chatId: number, userId: number, settings: SpeechCheckSettings) {
-  const untilDate = Math.floor((Date.now() + settings.punishmentMinutes * 60_000) / 1000);
+  if (settings.punishment === "warn" || settings.punishment === "delete_only") return;
+  if (settings.punishment === "kick") {
+    await ctx.api.banChatMember(chatId, userId).catch(() => undefined);
+    await ctx.api.unbanChatMember(chatId, userId, { only_if_banned: true }).catch(() => undefined);
+    return;
+  }
+  if (settings.punishment === "ban") {
+    await ctx.api.banChatMember(chatId, userId).catch(() => undefined);
+    return;
+  }
+
+  const untilDate = settings.permanentMute
+    ? Math.floor((Date.now() + 367 * 24 * 60 * 60 * 1000) / 1000)
+    : Math.floor((Date.now() + settings.punishmentMinutes * 60_000) / 1000);
   await ctx.api.restrictChatMember(chatId, userId, mutedChatPermissions(), { until_date: untilDate }).catch(() => undefined);
 }
 
@@ -500,14 +668,14 @@ function buildViolationNotice(user: User, reasons: string[], settings: SpeechChe
     return [
       `<b>${name}</b> message blocked.`,
       `Reason: ${labels.join(", ")}`,
-      `Punishment: muted ${formatDuration(locale, settings.punishmentMinutes)}`
+      `Punishment: ${formatPunishment(locale, settings)}`
     ].join("\n");
   }
 
   return [
     `<b>${name}</b> 的发言已被屏蔽。`,
     `原因：${labels.join("、")}`,
-    `惩罚：禁言${formatDuration(locale, settings.punishmentMinutes)}`
+    `惩罚：${formatPunishment(locale, settings)}`
   ].join("\n");
 }
 
@@ -516,14 +684,14 @@ function violationReasonLabel(reason: string, locale: Locale) {
     last_name: "未设置姓氏",
     username: "未设置用户名",
     avatar: "未设置头像",
-    channel: "未订阅指定频道",
+    channel: "未订阅指定频道/群组",
     forbidden_name: "昵称包含禁用词"
   };
   const en: Record<string, string> = {
     last_name: "missing last name",
     username: "missing username",
     avatar: "missing avatar",
-    channel: "not subscribed to required channel",
+    channel: "not subscribed to required channel/group",
     forbidden_name: "name contains forbidden keyword"
   };
   return locale === "zh-CN" ? zh[reason] ?? reason : en[reason] ?? reason;
@@ -533,7 +701,7 @@ function hasEnabledSpeechCheckRule(settings: SpeechCheckSettings) {
   return settings.requireLastName
     || settings.requireUsername
     || settings.requireAvatar
-    || (settings.requireChannelSubscription && Boolean(settings.requiredChannel))
+    || (settings.requireChannelSubscription && settings.requiredChannels.length > 0)
     || settings.forbiddenNameKeywords.length > 0;
 }
 
@@ -546,37 +714,33 @@ function normalizeForbiddenNameKeywords(value: unknown) {
     .slice(0, 50);
 }
 
+function normalizeRequiredChannels(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value
+    .filter((item): item is string => typeof item === "string")
+    .map(normalizeRequiredChannel)
+    .filter(Boolean))]
+    .slice(0, 3);
+}
+
 function normalizeRequiredChannel(text: string) {
   const value = text.trim();
-  if (/^@[A-Za-z0-9_]{5,32}$/.test(value)) return value;
-  if (/^-100\d{5,}$/.test(value)) return value;
+  const username = value
+    .replace(/^https?:\/\/t\.me\//i, "@")
+    .replace(/^t\.me\//i, "@")
+    .replace(/^telegram\.me\//i, "@");
+  if (/^@[A-Za-z0-9_]{5,32}$/.test(username)) return username;
   return "";
 }
 
 function parseDurationMinutes(input: string) {
   const text = input.trim().toLowerCase().replace(/\s+/g, "");
-  const match = text.match(/^(\d+)(分钟|分|小时|时|天|日|minute|minutes|min|m|hour|hours|h|day|days|d)$/i);
+  const match = text.match(/^(\d+)(分钟|分|min|m|)?$/i);
   if (!match) return null;
 
   const amount = Number(match[1]);
-  const unit = match[2]?.toLowerCase();
-  if (!Number.isSafeInteger(amount) || amount <= 0 || !unit) return null;
-
-  const multiplier = unit === "天" || unit === "日" || unit === "day" || unit === "days" || unit === "d"
-    ? 24 * 60
-    : unit === "小时" || unit === "时" || unit === "hour" || unit === "hours" || unit === "h"
-      ? 60
-      : 1;
-
-  return normalizePunishmentMinutes(amount * multiplier);
-}
-
-function parseNoticeDeleteSeconds(input: string) {
-  const text = input.trim().toLowerCase().replace(/\s+/g, "");
-  if (/^\d+$/.test(text)) return normalizeNoticeDeleteSeconds(Number(text));
-
-  const minutes = parseDurationMinutes(text);
-  return minutes ? normalizeNoticeDeleteSeconds(minutes * 60) : null;
+  if (!Number.isSafeInteger(amount) || amount <= 0) return null;
+  return normalizePunishmentMinutes(amount);
 }
 
 function normalizePunishmentMinutes(value: unknown) {
@@ -588,7 +752,25 @@ function normalizePunishmentMinutes(value: unknown) {
 function normalizeNoticeDeleteSeconds(value: unknown) {
   if (typeof value !== "number" || !Number.isFinite(value)) return defaultNoticeDeleteSeconds;
   const seconds = Math.round(value);
-  return Math.min(maxNoticeDeleteSeconds, Math.max(minNoticeDeleteSeconds, seconds));
+  return noticeDeleteOptions.includes(seconds as (typeof noticeDeleteOptions)[number])
+    ? seconds
+    : defaultNoticeDeleteSeconds;
+}
+
+function formatPunishment(locale: Locale, settings: SpeechCheckSettings) {
+  if (locale === "zh-CN") {
+    if (settings.punishment === "warn") return "警告";
+    if (settings.punishment === "kick") return "踢出";
+    if (settings.punishment === "ban") return "封禁";
+    if (settings.punishment === "delete_only") return "仅删除";
+    return settings.permanentMute ? "永久禁言" : `禁言${formatDuration(locale, settings.punishmentMinutes)}`;
+  }
+
+  if (settings.punishment === "warn") return "Warn";
+  if (settings.punishment === "kick") return "Kick";
+  if (settings.punishment === "ban") return "Ban";
+  if (settings.punishment === "delete_only") return "Delete only";
+  return settings.permanentMute ? "Permanent mute" : `Mute ${formatDuration(locale, settings.punishmentMinutes)}`;
 }
 
 function formatDuration(locale: Locale, minutes: number) {
@@ -601,6 +783,16 @@ function formatDuration(locale: Locale, minutes: number) {
     return locale === "zh-CN" ? `${hours}小时` : `${hours} hour${hours === 1 ? "" : "s"}`;
   }
   return locale === "zh-CN" ? `${minutes}分钟` : `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
+function formatNoticeDelete(locale: Locale, seconds: number) {
+  if (seconds === 0) return locale === "zh-CN" ? "不删除" : "Do not delete";
+  if (seconds < 60) return locale === "zh-CN" ? `${seconds} 秒` : `${seconds}s`;
+  return formatDuration(locale, seconds / 60);
+}
+
+function isSpeechCheckPunishment(value: unknown): value is SpeechCheckPunishment {
+  return value === "warn" || value === "mute" || value === "kick" || value === "ban" || value === "delete_only";
 }
 
 function mutedChatPermissions(): ChatPermissions {
@@ -619,7 +811,11 @@ function mutedChatPermissions(): ChatPermissions {
 }
 
 function inputBackKeyboard(locale: Locale) {
-  return new InlineKeyboard().text(locale === "zh-CN" ? "返回" : "Back", "speech_check:back");
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", "speech_check:back");
+}
+
+function cancelKeyboard(locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "❌取消" : "❌ Cancel", "speech_check:cancel");
 }
 
 function homeKeyboard(locale: Locale) {

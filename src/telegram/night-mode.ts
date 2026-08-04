@@ -55,6 +55,16 @@ export async function openNightModeMenu(ctx: Context, locale: Locale) {
 export async function handleNightModeAction(ctx: Context, locale: Locale, key: string) {
   if (!ctx.from) return;
 
+  if (key.startsWith("example:")) {
+    await ctx.answerCallbackQuery({
+      text: key.endsWith(":2") ? "0-6" : "0:00-6:30",
+      show_alert: true
+    }).catch(() => undefined);
+    return;
+  }
+
+  await ctx.answerCallbackQuery().catch(() => undefined);
+
   const chat = await getSelectedGroupChat(ctx, locale);
   if (!chat) return;
 
@@ -91,14 +101,7 @@ export async function handleNightModeAction(ctx: Context, locale: Locale, key: s
 
   if (key === "time") {
     drafts.set(ctx.from.id, { chatId: chat.id, field: "time" });
-    await renderMenu(
-      ctx,
-      locale === "zh-CN"
-        ? ["<b>请发送夜间模式时间段</b>", "", "格式示例：<code>00:00-06:00</code>"].join("\n")
-        : ["<b>Send the night mode time window</b>", "", "Example: <code>00:00-06:00</code>"].join("\n"),
-      new InlineKeyboard().text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "night_mode:noop"),
-      "HTML"
-    );
+    await renderMenu(ctx, nightModeTimePromptText(locale), nightModeTimePromptKeyboard(locale), "HTML");
     return;
   }
 
@@ -133,7 +136,7 @@ export async function handleNightModePrivateMessage(ctx: Context, locale: Locale
     const text = "text" in ctx.message ? ctx.message.text?.trim() : undefined;
     const parsed = text ? parseTimeWindow(text) : null;
     if (!parsed) {
-      await ctx.reply(locale === "zh-CN" ? "时间段格式不正确，请发送 00:00-06:00。" : "Invalid time window. Send 00:00-06:00.");
+      await ctx.reply(locale === "zh-CN" ? "时间段格式不正确，请发送 0:00-6:30 或 0-6。" : "Invalid time window. Send 0:00-6:30 or 0-6.");
       return true;
     }
 
@@ -332,6 +335,40 @@ function nightModeKeyboard(locale: Locale, chat: PrismaChat, settings: NightMode
     .text(locale === "zh-CN" ? "🌍 设置时区" : "🌍 Timezone", "night_mode:timezone");
 }
 
+function nightModeTimePromptText(locale: Locale) {
+  if (locale !== "zh-CN") {
+    return [
+      "🌙<b>Night mode</b>",
+      "",
+      "Set a daily time window. Night mode is enabled during this window. Tap a template below to copy it⬇️",
+      "",
+      "<b>Template 1</b>: <code>0:00-6:30</code>",
+      "<b>Template 2</b>: <code>0-6</code>",
+      "",
+      "<b>Send the time window:</b>"
+    ].join("\n");
+  }
+
+  return [
+    "🌙<b>夜间模式</b>",
+    "",
+    "设置一个时段，每天这个时间段内启用夜间模式,点击复制模板⬇️",
+    "",
+    "<b>模板1</b>: <code>0:00-6:30</code>",
+    "<b>模板2</b>: <code>0-6</code>",
+    "",
+    "<b>请发送时段:</b>"
+  ].join("\n");
+}
+
+function nightModeTimePromptKeyboard(locale: Locale) {
+  return new InlineKeyboard()
+    .text("Copy1", "night_mode:example:1")
+    .text("Copy2", "night_mode:example:2")
+    .row()
+    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "night_mode:noop");
+}
+
 async function getNightModeSettings(chat: PrismaChat): Promise<NightModeSettings> {
   const row = await prisma.setting.findUnique({ where: { chatId_key: { chatId: chat.id, key: settingKey } } });
   return parseNightModeSettings(row?.value, chat.timezone);
@@ -391,10 +428,10 @@ function nightModeSettingsToJson(settings: NightModeSettings): Prisma.InputJsonO
 }
 
 function parseTimeWindow(input: string) {
-  const match = input.match(/(\d{1,2}):(\d{2}).*?(\d{1,2}):(\d{2})/);
+  const match = input.trim().match(/^(\d{1,2})(?::(\d{1,2}))?\s*[-~到至]\s*(\d{1,2})(?::(\d{1,2}))?$/u);
   if (!match) return null;
-  const startTime = normalizeTime(Number(match[1]), Number(match[2]));
-  const endTime = normalizeTime(Number(match[3]), Number(match[4]));
+  const startTime = normalizeTime(Number(match[1]), Number(match[2] ?? 0));
+  const endTime = normalizeTime(Number(match[3]), Number(match[4] ?? 0));
   if (!startTime || !endTime || startTime === endTime) return null;
   return { startTime, endTime };
 }

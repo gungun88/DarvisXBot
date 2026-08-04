@@ -94,6 +94,14 @@ import {
   rememberSelectedSpeechCheckChat
 } from "./speech-check.js";
 import {
+  clearAntiSpamDraft,
+  handleAntiSpamCallback,
+  handleAntiSpamEditedMessage,
+  handleAntiSpamInputMessage,
+  handleAntiSpamMessage,
+  openAntiSpamMenu
+} from "./anti-spam.js";
+import {
   createJoinVerificationChallenge,
   isJoinVerifyMode,
   type JoinVerificationChallenge,
@@ -142,8 +150,11 @@ type JoinVerifySettings = {
   punishment: "kick" | "ban" | "mute";
 };
 
+type BlocklistBotPunishment = "off" | "warn" | "mute" | "kick" | "ban";
+
 type BlocklistSettings = {
   blockBots: boolean;
+  blockBotPunishment: BlocklistBotPunishment;
   banAfterLeave: boolean;
   blockFlashJoinLeave: boolean;
   blockFollowerRaid: boolean;
@@ -198,17 +209,20 @@ type AutoReplySettings = {
   rules: AutoReplyRule[];
 };
 
-type BannedWordsPunishment = "warn_mute" | "mute" | "ban" | "delete_only";
+type BannedWordsPunishment = "warn" | "mute" | "kick" | "ban" | "delete_only";
+type BannedWordsFinalPunishment = "mute" | "kick" | "ban";
 
 type BannedWordsSettings = {
   enabled: boolean;
   punishment: BannedWordsPunishment;
+  warningPunishment: BannedWordsFinalPunishment;
   warningLimit: number;
   muteMinutes: number;
   deleteNotice: boolean;
+  noticeDeleteSeconds: number;
 };
 
-type BannedWordsInputStage = "add" | "delete";
+type BannedWordsInputStage = "add" | "delete" | "mute_duration";
 
 type BannedWordsInputDraft = {
   chatId: string;
@@ -219,6 +233,96 @@ type GroupCommandKey = "link" | "sign_in" | "points_rank" | "points" | "stat" | 
 
 type GroupCommandSettings = {
   commands: Record<GroupCommandKey, boolean>;
+  aliases: Record<GroupCommandKey, string[]>;
+};
+
+type GroupCommandAliasInputDraft = {
+  chatId: string;
+  command: GroupCommandKey;
+  mode: "add" | "delete";
+};
+
+type PointsRuleField =
+  | "signInPoints"
+  | "deleteSignInSeconds"
+  | "speechPoints"
+  | "speechDailyLimit"
+  | "speechMinLength"
+  | "invitePoints"
+  | "inviteDailyLimit";
+
+type PointsSettings = {
+  enabled: boolean;
+  deleteSignInMessage: boolean;
+  deleteSignInSeconds: number;
+  signInPoints: number;
+  speechPoints: number;
+  speechDailyLimit: number;
+  speechMinLength: number;
+  invitePoints: number;
+  inviteDailyLimit: number;
+};
+
+type PointProduct = {
+  id: string;
+  name: string;
+  cost: number;
+  listed: boolean;
+  codes: string[];
+  soldCount: number;
+  dailyLimit: number;
+};
+
+type PointExchangeSettings = {
+  enabled: boolean;
+  keyword: string;
+  products: PointProduct[];
+};
+
+type PointsInputDraft =
+  | {
+      chatId: string;
+      kind: "alias";
+      command: Extract<GroupCommandKey, "points" | "points_rank">;
+    }
+  | {
+      chatId: string;
+      kind: "exchange_keyword";
+    }
+  | {
+      chatId: string;
+      kind: "product_name" | "product_cost" | "product_codes" | "product_daily_limit";
+      productId: string;
+    }
+  | {
+      chatId: string;
+      kind: "adjust_user";
+    }
+  | {
+      chatId: string;
+      kind: "adjust_amount";
+      targetUserId: string;
+    };
+
+type GiveawayCreateType = "common" | "points" | "active" | "invite" | "report" | "fun";
+type GiveawayDrawMode = "full" | "timed";
+type GiveawayInputStage = "target_count" | "draw_at" | "details";
+
+type GiveawayInputDraft = {
+  chatId: string;
+  type: GiveawayCreateType;
+  drawMode?: GiveawayDrawMode;
+  stage: GiveawayInputStage;
+  targetCount?: number;
+  drawAt?: Date;
+};
+
+type CommonGiveawayRequirements = {
+  type: "common";
+  entry: "keyword";
+  keyword: string;
+  drawMode: GiveawayDrawMode;
+  targetCount?: number;
 };
 
 type MemberStatsSnapshot = {
@@ -232,6 +336,26 @@ type MemberStatsSettings = {
   lastCollectedDate: string | undefined;
   lastCount: number | undefined;
   snapshots: MemberStatsSnapshot[];
+};
+
+type GroupMembersSettings = {
+  watchNicknameChange: boolean;
+  watchUsernameChange: boolean;
+  unpinLinkedChannelMessages: boolean;
+};
+
+type StoredUserProfile = {
+  telegramUserId: bigint;
+  username: string | null;
+  firstName: string | null;
+  lastName: string | null;
+};
+
+type UserProfileChange = {
+  previous: StoredUserProfile;
+  current: StoredUserProfile;
+  nicknameChanged: boolean;
+  usernameChanged: boolean;
 };
 
 type PendingVerification = {
@@ -295,6 +419,10 @@ type WelcomeInputDraft = {
   field: WelcomeInputField;
 };
 
+type ImportConfigDraft = {
+  targetChatId: string;
+};
+
 type ScheduledMessageListItem = {
   id: string;
   content: Prisma.JsonValue;
@@ -313,6 +441,7 @@ const botCommands = [
   { command: "help", description: "帮助" },
   { command: "html", description: "HTML 格式提示" },
   { command: "clear", description: "关闭底部键盘" },
+  { command: "cancel", description: "取消当前操作" },
   { command: "info", description: "查看信息" },
   { command: "link", description: "生成邀请链接并查看统计" },
   { command: "sign_in", description: "群组签到" },
@@ -352,6 +481,7 @@ const defaultJoinVerifySettings: JoinVerifySettings = {
 
 const defaultBlocklistSettings: BlocklistSettings = {
   blockBots: false,
+  blockBotPunishment: "off",
   banAfterLeave: false,
   blockFlashJoinLeave: false,
   blockFollowerRaid: false,
@@ -394,10 +524,12 @@ const defaultAutoReplySettings: AutoReplySettings = {
 
 const defaultBannedWordsSettings: BannedWordsSettings = {
   enabled: false,
-  punishment: "warn_mute",
+  punishment: "warn",
+  warningPunishment: "mute",
   warningLimit: 3,
   muteMinutes: 60,
-  deleteNotice: true
+  deleteNotice: true,
+  noticeDeleteSeconds: 60
 };
 
 const groupCommandDefinitions: Array<{ key: GroupCommandKey; command: string; zh: string; en: string }> = [
@@ -412,7 +544,35 @@ const groupCommandDefinitions: Array<{ key: GroupCommandKey; command: string; zh
 ];
 
 const defaultGroupCommandSettings: GroupCommandSettings = {
-  commands: Object.fromEntries(groupCommandDefinitions.map((item) => [item.key, true])) as Record<GroupCommandKey, boolean>
+  commands: Object.fromEntries(groupCommandDefinitions.map((item) => [item.key, true])) as Record<GroupCommandKey, boolean>,
+  aliases: {
+    link: [],
+    sign_in: [],
+    points_rank: ["积分排名"],
+    points: ["积分"],
+    stat: [],
+    stat_week: [],
+    stats: [],
+    lottery: []
+  }
+};
+
+const defaultPointsSettings: PointsSettings = {
+  enabled: false,
+  deleteSignInMessage: false,
+  deleteSignInSeconds: 60,
+  signInPoints: 1,
+  speechPoints: 1,
+  speechDailyLimit: 50,
+  speechMinLength: 5,
+  invitePoints: 1,
+  inviteDailyLimit: 0
+};
+
+const defaultPointExchangeSettings: PointExchangeSettings = {
+  enabled: false,
+  keyword: "积分兑换",
+  products: []
 };
 
 const defaultMemberStatsSettings: MemberStatsSettings = {
@@ -421,6 +581,35 @@ const defaultMemberStatsSettings: MemberStatsSettings = {
   lastCount: undefined,
   snapshots: []
 };
+
+const defaultGroupMembersSettings: GroupMembersSettings = {
+  watchNicknameChange: false,
+  watchUsernameChange: false,
+  unpinLinkedChannelMessages: false
+};
+
+const importableSettingKeys = [
+  "welcome",
+  "blocklist",
+  "invite_links",
+  "join_verify",
+  "auto_delete",
+  "auto_reply",
+  "banned_words",
+  "group_commands",
+  "points",
+  "point_exchange",
+  "member_stats",
+  "group_members",
+  "new_member_limit",
+  "open_close",
+  "adult_check",
+  "speech_check",
+  "anti_spam",
+  "control_permissions"
+] as const;
+
+const importableSettingKeySet = new Set<string>(importableSettingKeys);
 
 const pendingVerifications = new Map<string, PendingVerification>();
 const recentJoins = new Map<string, number>();
@@ -432,8 +621,13 @@ const scheduledInputDrafts = new Map<number, ScheduledInputDraft>();
 const autoReplyInputDrafts = new Map<number, AutoReplyInputDraft>();
 const autoReplySelectedChats = new Map<number, string>();
 const bannedWordsInputDrafts = new Map<number, BannedWordsInputDraft>();
+const groupCommandAliasInputDrafts = new Map<number, GroupCommandAliasInputDraft>();
+const pointsInputDrafts = new Map<number, PointsInputDraft>();
 const welcomeInputDrafts = new Map<number, WelcomeInputDraft>();
 const inviteLinkInputDrafts = new Map<number, InviteLinkInputDraft>();
+const giveawayInputDrafts = new Map<number, GiveawayInputDraft>();
+const importConfigDrafts = new Map<number, ImportConfigDraft>();
+const userProfileChanges = new Map<number, UserProfileChange>();
 const memberStatsShareCache = new Map<string, {
   photoFileId: string;
   caption: string;
@@ -469,9 +663,26 @@ export function createBot(config: AppConfig) {
 
   bot.use(async (ctx, next) => {
     if (ctx.from) {
-      await upsertTelegramUser(ctx.from, config.defaultTimezone).catch((error) => {
+      try {
+        const previousUser = await prisma.user.findUnique({
+          where: { telegramUserId: BigInt(ctx.from.id) },
+          select: {
+            telegramUserId: true,
+            username: true,
+            firstName: true,
+            lastName: true
+          }
+        });
+        const currentUser = await upsertTelegramUser(ctx.from, config.defaultTimezone);
+        if (previousUser) {
+          const profileChange = buildUserProfileChange(previousUser, currentUser);
+          if (profileChange.nicknameChanged || profileChange.usernameChanged) {
+            userProfileChanges.set(ctx.from.id, profileChange);
+          }
+        }
+      } catch (error) {
         console.error("Failed to upsert Telegram user", error);
-      });
+      }
     }
     await next();
   });
@@ -499,6 +710,10 @@ export function createBot(config: AppConfig) {
     await ctx.reply(locale === "zh-CN" ? "已关闭底部键盘。" : "Reply keyboard cleared.", {
       reply_markup: { remove_keyboard: true }
     });
+  });
+
+  bot.command("cancel", async (ctx) => {
+    await handleCancelCommand(ctx, config);
   });
 
   bot.command("info", async (ctx) => {
@@ -565,6 +780,10 @@ export function createBot(config: AppConfig) {
     await handleChatFeatureCallback(ctx, config);
   });
 
+  bot.callbackQuery(/^import_config:/, async (ctx) => {
+    await handleImportConfigCallback(ctx);
+  });
+
   bot.callbackQuery(/^invite:/, async (ctx) => {
     await handleInviteLinkCallback(ctx);
   });
@@ -575,6 +794,10 @@ export function createBot(config: AppConfig) {
 
   bot.callbackQuery(/^member_stats:/, async (ctx) => {
     await handleMemberStatsCallback(ctx);
+  });
+
+  bot.callbackQuery(/^group_members:/, async (ctx) => {
+    await handleGroupMembersCallback(ctx);
   });
 
   bot.callbackQuery(/^blocklist:/, async (ctx) => {
@@ -609,6 +832,10 @@ export function createBot(config: AppConfig) {
     await handleGroupCommandsCallback(ctx);
   });
 
+  bot.callbackQuery(/^points:/, async (ctx) => {
+    await handlePointsCallback(ctx);
+  });
+
   bot.callbackQuery(/^new_member_limit:/, async (ctx) => {
     await handleNewMemberLimitCallback(ctx, config);
   });
@@ -629,12 +856,20 @@ export function createBot(config: AppConfig) {
     await handleSpeechCheckCallback(ctx);
   });
 
+  bot.callbackQuery(/^anti_spam:/, async (ctx) => {
+    await handleAntiSpamCallback(ctx);
+  });
+
   bot.callbackQuery(/^verify:/, async (ctx) => {
     await handleVerificationCallback(ctx);
   });
 
   bot.callbackQuery(/^giveaway:join:/, async (ctx) => {
     await handleGiveawayJoinCallback(ctx, config);
+  });
+
+  bot.callbackQuery(/^giveaway:/, async (ctx) => {
+    await handleGiveawayCallback(ctx, config);
   });
 
   bot.inlineQuery(/.*/, async (ctx) => {
@@ -647,10 +882,15 @@ export function createBot(config: AppConfig) {
 
   bot.on("message", async (ctx) => {
     const locale = await getLocale(ctx);
+    if (await handleAntiSpamInputMessage(ctx, locale)) return;
     if (await handleBannedWordsInputMessage(ctx, locale)) return;
+    if (await handlePointsInputMessage(ctx, config, locale)) return;
+    if (await handleGroupCommandAliasInputMessage(ctx, locale)) return;
     if (await handleAutoReplyInputMessage(ctx, locale)) return;
     if (await handleWelcomeInputMessage(ctx, locale)) return;
     if (await handleInviteLinkInputMessage(ctx, locale)) return;
+    if (await handleGiveawayInputMessage(ctx, config, locale)) return;
+    if (await handleImportConfigInputMessage(ctx, locale)) return;
     if (await handleTimezoneInputMessage(ctx, config, locale)) return;
     if (await handleScheduledInputMessage(ctx, locale)) return;
     if (await handlePublishInputMessage(ctx, locale)) return;
@@ -662,7 +902,13 @@ export function createBot(config: AppConfig) {
     if (await handleOpenCloseGroupMessage(ctx)) return;
     if (await handleSpeechCheckMessage(ctx, locale)) return;
     if (await handleAdultCheckMessage(ctx, locale)) return;
+    if (await handleGiveawayKeywordEntry(ctx, config, locale)) return;
     await handleIncomingMessage(ctx, config);
+  });
+
+  bot.on("edited_message", async (ctx) => {
+    const locale = await getLocale(ctx);
+    await handleAntiSpamEditedMessage(ctx, locale);
   });
 
   bot.on("my_chat_member", async (ctx) => {
@@ -772,8 +1018,13 @@ function clearUserInputState(userId: number) {
   scheduledInputDrafts.delete(userId);
   autoReplyInputDrafts.delete(userId);
   bannedWordsInputDrafts.delete(userId);
+  groupCommandAliasInputDrafts.delete(userId);
+  pointsInputDrafts.delete(userId);
   welcomeInputDrafts.delete(userId);
   inviteLinkInputDrafts.delete(userId);
+  giveawayInputDrafts.delete(userId);
+  importConfigDrafts.delete(userId);
+  clearAntiSpamDraft(userId);
   clearSpeechCheckDraft(userId);
   const publishDraft = publishDrafts.get(userId);
   if (publishDraft) publishDraft.waitingFor = undefined;
@@ -1406,18 +1657,45 @@ function chatPanelKeyboard(chatId: string, scope: "group" | "channel", locale: L
     .text("🇨🇳 Languages", "menu:languages");
 }
 
-function blocklistKeyboard(chatId: string, settings: BlocklistSettings, locale: Locale) {
-  const mark = (enabled: boolean, text: string) => `${enabled ? "✅" : "⬜"} ${text}`;
+function blocklistKeyboard(chatId: string, locale: Locale) {
   return new InlineKeyboard()
-    .text(mark(settings.blockBots, locale === "zh-CN" ? "🤖 屏蔽机器人" : "🤖 Block bots"), `blocklist:toggle:blockBots:${chatId}`)
-    .text(mark(settings.banAfterLeave, locale === "zh-CN" ? "🚪 退群封禁" : "🚪 Ban leavers"), `blocklist:toggle:banAfterLeave:${chatId}`)
+    .text(locale === "zh-CN" ? "🤖 屏蔽机器人" : "🤖 Block bots", `blocklist:menu:bots:${chatId}`)
+    .text(locale === "zh-CN" ? "🚪 退群封禁" : "🚪 Ban leavers", `blocklist:menu:leave:${chatId}`)
     .row()
-    .text(mark(settings.blockFlashJoinLeave, locale === "zh-CN" ? "🏃 屏蔽闪进闪退" : "🏃 Block flash join/leave"), `blocklist:toggle:blockFlashJoinLeave:${chatId}`)
+    .text(locale === "zh-CN" ? "🏃 屏蔽闪进闪退" : "🏃 Block flash join/leave", `blocklist:menu:flash:${chatId}`)
     .row()
-    .text(mark(settings.blockFollowerRaid, locale === "zh-CN" ? "👨‍👩‍👧‍👦 屏蔽刷粉攻击" : "👨‍👩‍👧‍👦 Block join raids"), `blocklist:toggle:blockFollowerRaid:${chatId}`)
+    .text(locale === "zh-CN" ? "👨‍👩‍👧‍👦 屏蔽刷粉攻击" : "👨‍👩‍👧‍👦 Block join raids", `blocklist:menu:raid:${chatId}`)
     .row()
-    .text(locale === "zh-CN" ? "🏠 返回首页" : "🏠 Home", "menu:home")
-    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `menu:chat:group:${chatId}`);
+    .text(locale === "zh-CN" ? "🏠 返回首页" : "🏠 Home", "menu:home");
+}
+
+function blocklistBotKeyboard(chatId: string, settings: BlocklistSettings, locale: Locale) {
+  const selected = (value: BlocklistBotPunishment, label: string) => settings.blockBotPunishment === value ? `✅${label}` : label;
+  return new InlineKeyboard()
+    .text(selected("off", locale === "zh-CN" ? "关闭" : "Off"), `blocklist:bot:${chatId}:off`)
+    .text(selected("warn", locale === "zh-CN" ? "警告" : "Warn"), `blocklist:bot:${chatId}:warn`)
+    .text(selected("mute", locale === "zh-CN" ? "禁言" : "Mute"), `blocklist:bot:${chatId}:mute`)
+    .row()
+    .text(selected("kick", locale === "zh-CN" ? "踢出" : "Kick"), `blocklist:bot:${chatId}:kick`)
+    .text(selected("ban", locale === "zh-CN" ? "封禁" : "Ban"), `blocklist:bot:${chatId}:ban`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `blocklist:back:${chatId}`);
+}
+
+function blocklistLeaveKeyboard(chatId: string, settings: BlocklistSettings, locale: Locale) {
+  const selected = (active: boolean, label: string) => active ? `✅${label}` : label;
+  return new InlineKeyboard()
+    .text(selected(!settings.banAfterLeave, locale === "zh-CN" ? "关闭" : "Off"), `blocklist:leave:${chatId}:off`)
+    .text(selected(settings.banAfterLeave, locale === "zh-CN" ? "🚷封禁" : "🚷 Ban"), `blocklist:leave:${chatId}:ban`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `blocklist:back:${chatId}`);
+}
+
+function blocklistPremiumKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "💎订阅会员" : "💎 Memberships", "menu:memberships")
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `blocklist:back:${chatId}`);
 }
 
 function inviteLinkKeyboard(chatId: string, settings: InviteLinkSettings, locale: Locale) {
@@ -1697,7 +1975,7 @@ function bannedWordsKeyboard(chatId: string, settings: BannedWordsSettings, loca
     .text(labels.list, `banned_words:list:${chatId}`)
     .row()
     .text(labels.punishment, `banned_words:punishment:${chatId}`)
-    .text(selected(settings.deleteNotice, labels.deleteNotice), `banned_words:toggle_notice:${chatId}`)
+    .text(bannedWordsNoticeStatusLabel(settings, labels.deleteNotice), `banned_words:notice:${chatId}`)
     .row()
     .text(labels.back, `menu:chat:group:${chatId}`);
 }
@@ -1723,6 +2001,87 @@ function bannedWordsCancelKeyboard(chatId: string, locale: Locale) {
 
 function bannedWordsDoneKeyboard(chatId: string, locale: Locale) {
   return new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `chat_feature:banned_words:${chatId}`);
+}
+
+function bannedWordsPunishmentKeyboard(chatId: string, settings: BannedWordsSettings, locale: Locale) {
+  const selected = (active: boolean, label: string) => active ? `✅${label}` : label;
+  const labels = locale === "zh-CN"
+    ? {
+        warn: "警告",
+        mute: "禁言",
+        kick: "踢出",
+        ban: "踢出+封禁",
+        deleteOnly: "仅删除",
+        warningLimit: "警告次数",
+        warnAfter: `警告${settings.warningLimit}次后⬇️`,
+        muteDuration: "🔇🕘设置禁言时长",
+        back: "🔙返回"
+      }
+    : {
+        warn: "Warn",
+        mute: "Mute",
+        kick: "Kick",
+        ban: "Kick+ban",
+        deleteOnly: "Delete only",
+        warningLimit: "Warning count",
+        warnAfter: `After ${settings.warningLimit} warnings⬇️`,
+        muteDuration: "🔇🕘Set mute duration",
+        back: "🔙 Back"
+      };
+
+  return new InlineKeyboard()
+    .text(selected(settings.punishment === "warn", labels.warn), `banned_words:punishment:${chatId}:warn`)
+    .text(selected(settings.punishment === "mute", labels.mute), `banned_words:punishment:${chatId}:mute`)
+    .text(selected(settings.punishment === "kick", labels.kick), `banned_words:punishment:${chatId}:kick`)
+    .row()
+    .text(selected(settings.punishment === "ban", labels.ban), `banned_words:punishment:${chatId}:ban`)
+    .text(selected(settings.punishment === "delete_only", labels.deleteOnly), `banned_words:punishment:${chatId}:delete_only`)
+    .row()
+    .text(labels.warningLimit, `banned_words:noop:${chatId}`)
+    .row()
+    .text(selected(settings.warningLimit === 1, "1"), `banned_words:warning_limit:${chatId}:1`)
+    .text(selected(settings.warningLimit === 2, "2"), `banned_words:warning_limit:${chatId}:2`)
+    .text(selected(settings.warningLimit === 3, "3"), `banned_words:warning_limit:${chatId}:3`)
+    .text(selected(settings.warningLimit === 4, "4"), `banned_words:warning_limit:${chatId}:4`)
+    .text(selected(settings.warningLimit === 5, "5"), `banned_words:warning_limit:${chatId}:5`)
+    .row()
+    .text(labels.warnAfter, `banned_words:noop:${chatId}`)
+    .row()
+    .text(selected(settings.warningPunishment === "mute", labels.mute), `banned_words:warn_action:${chatId}:mute`)
+    .text(selected(settings.warningPunishment === "kick", labels.kick), `banned_words:warn_action:${chatId}:kick`)
+    .text(selected(settings.warningPunishment === "ban", labels.ban), `banned_words:warn_action:${chatId}:ban`)
+    .row()
+    .text(labels.muteDuration, `banned_words:mute_duration:${chatId}`)
+    .row()
+    .text(labels.back, `chat_feature:banned_words:${chatId}`);
+}
+
+function bannedWordsMuteDurationKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "⛔永久禁言" : "⛔ Permanent mute", `banned_words:mute_forever:${chatId}`)
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `banned_words:punishment:${chatId}`);
+}
+
+function bannedWordsNoticeKeyboard(chatId: string, settings: BannedWordsSettings, locale: Locale) {
+  const selected = (active: boolean, label: string) => active ? `✅${label}` : label;
+  const option = (seconds: number, label: string) => selected(settings.noticeDeleteSeconds === seconds, label);
+  return new InlineKeyboard()
+    .text(option(10, locale === "zh-CN" ? "10秒" : "10s"), `banned_words:notice_delay:${chatId}:10`)
+    .text(option(30, locale === "zh-CN" ? "30秒" : "30s"), `banned_words:notice_delay:${chatId}:30`)
+    .text(option(60, locale === "zh-CN" ? "60秒" : "60s"), `banned_words:notice_delay:${chatId}:60`)
+    .row()
+    .text(option(300, locale === "zh-CN" ? "5分钟" : "5m"), `banned_words:notice_delay:${chatId}:300`)
+    .text(option(600, locale === "zh-CN" ? "10分钟" : "10m"), `banned_words:notice_delay:${chatId}:600`)
+    .text(option(1800, locale === "zh-CN" ? "30分钟" : "30m"), `banned_words:notice_delay:${chatId}:1800`)
+    .row()
+    .text(option(3600, locale === "zh-CN" ? "1小时" : "1h"), `banned_words:notice_delay:${chatId}:3600`)
+    .text(option(21600, locale === "zh-CN" ? "6小时" : "6h"), `banned_words:notice_delay:${chatId}:21600`)
+    .text(option(43200, locale === "zh-CN" ? "12小时" : "12h"), `banned_words:notice_delay:${chatId}:43200`)
+    .row()
+    .text(selected(settings.noticeDeleteSeconds === 0, locale === "zh-CN" ? "不删除" : "Do not delete"), `banned_words:notice_delay:${chatId}:0`)
+    .text(selected(settings.noticeDeleteSeconds < 0, locale === "zh-CN" ? "不提醒" : "Do not notify"), `banned_words:notice_delay:${chatId}:-1`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `chat_feature:banned_words:${chatId}`);
 }
 
 function autoReplyDeleteKeyboard(chatId: string, settings: AutoReplySettings, locale: Locale) {
@@ -1776,8 +2135,203 @@ function groupCommandsKeyboard(chatId: string, settings: GroupCommandSettings, l
     .text(locale === "zh-CN" ? "返回" : "Back", `group_commands:home:${chatId}`);
 }
 
-function groupCommandsAliasKeyboard(chatId: string, locale: Locale) {
-  return new InlineKeyboard().text(locale === "zh-CN" ? "返回" : "Back", `group_commands:home:${chatId}`);
+function groupCommandsAliasKeyboard(chatId: string, settings: GroupCommandSettings, locale: Locale) {
+  const keyboard = new InlineKeyboard();
+  groupCommandDefinitions.forEach((item, index) => {
+    const count = settings.aliases[item.key].length;
+    keyboard.text(`${groupCommandLabel(item.key, locale)} (${count})`, `group_commands:alias:${chatId}:${item.key}`);
+    if (index % 2 === 1) keyboard.row();
+  });
+  return keyboard
+    .row()
+    .text(locale === "zh-CN" ? "返回" : "Back", `group_commands:home:${chatId}`);
+}
+
+function groupCommandAliasDetailKeyboard(chatId: string, command: GroupCommandKey, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "添加别名" : "Add aliases", `group_commands:alias_add:${chatId}:${command}`)
+    .text(locale === "zh-CN" ? "删除别名" : "Delete aliases", `group_commands:alias_delete:${chatId}:${command}`)
+    .row()
+    .text(locale === "zh-CN" ? "返回" : "Back", `group_commands:aliases:${chatId}`);
+}
+
+function groupCommandAliasInputKeyboard(chatId: string, command: GroupCommandKey, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "取消" : "Cancel", `group_commands:alias:${chatId}:${command}`);
+}
+
+function pointsKeyboard(chatId: string, settings: PointsSettings, locale: Locale) {
+  const selected = (active: boolean, label: string) => active ? `✅${label}` : label;
+  if (locale !== "zh-CN") {
+    return new InlineKeyboard()
+      .text("Status:", `points:noop:${chatId}`)
+      .text(selected(settings.enabled, "On"), `points:status:${chatId}:on`)
+      .text(selected(!settings.enabled, "Off"), `points:status:${chatId}:off`)
+      .row()
+      .text("Delete sign-in reply:", `points:noop:${chatId}`)
+      .text(selected(settings.deleteSignInMessage, "On"), `points:delete_sign:${chatId}:on`)
+      .text(selected(!settings.deleteSignInMessage, "Off"), `points:delete_sign:${chatId}:off`)
+      .row()
+      .text("⚙ Sign-in rule", `points:rule:${chatId}:sign`)
+      .text("⚙ Speech rule", `points:rule:${chatId}:speech`)
+      .row()
+      .text("⚙ Invite rule", `points:rule:${chatId}:invite`)
+      .row()
+      .text("⚙ Points alias", `points:alias:${chatId}:points`)
+      .text("⚙ Ranking alias", `points:alias:${chatId}:points_rank`)
+      .row()
+      .text("➕➖ Adjust points", `points:adjust:${chatId}`)
+      .row()
+      .text("🎁 Point giveaway", `chat_feature:giveaway:${chatId}`)
+      .text("🗑 Clear data", `points:clear:${chatId}`)
+      .row()
+      .text("🛒 Product exchange", `points:exchange:${chatId}`)
+      .row()
+      .text("🔙 Back", `menu:chat:group:${chatId}`);
+  }
+
+  return new InlineKeyboard()
+    .text("状态:", `points:noop:${chatId}`)
+    .text(selected(settings.enabled, "开启"), `points:status:${chatId}:on`)
+    .text(selected(!settings.enabled, "关闭"), `points:status:${chatId}:off`)
+    .row()
+    .text("删除签到信息:", `points:noop:${chatId}`)
+    .text(selected(settings.deleteSignInMessage, "开启"), `points:delete_sign:${chatId}:on`)
+    .text(selected(!settings.deleteSignInMessage, "关闭"), `points:delete_sign:${chatId}:off`)
+    .row()
+    .text("⚙️签到规则", `points:rule:${chatId}:sign`)
+    .text("⚙️发言规则", `points:rule:${chatId}:speech`)
+    .row()
+    .text("⚙️邀请规则", `points:rule:${chatId}:invite`)
+    .row()
+    .text("⚙️积分别名", `points:alias:${chatId}:points`)
+    .text("⚙️排名别名", `points:alias:${chatId}:points_rank`)
+    .row()
+    .text("➕➖增减积分", `points:adjust:${chatId}`)
+    .row()
+    .text("🎁积分抽奖", `chat_feature:giveaway:${chatId}`)
+    .text("🗑清空数据", `points:clear:${chatId}`)
+    .row()
+    .text("🛒商品兑换", `points:exchange:${chatId}`)
+    .row()
+    .text("🔙返回", `menu:chat:group:${chatId}`);
+}
+
+function pointsRuleKeyboard(chatId: string, settings: PointsSettings, rule: "sign" | "speech" | "invite", locale: Locale) {
+  const keyboard = new InlineKeyboard();
+  const option = (field: PointsRuleField, value: number, label: string, current: number) =>
+    `${current === value ? "✅" : ""}${label}`;
+
+  if (rule === "sign") {
+    keyboard.text(locale === "zh-CN" ? "签到积分:" : "Sign-in points:", `points:noop:${chatId}`).row();
+    for (const value of [0, 1, 2, 5, 10]) {
+      keyboard.text(option("signInPoints", value, String(value), settings.signInPoints), `points:set:${chatId}:signInPoints:${value}`);
+    }
+    keyboard.row().text(locale === "zh-CN" ? "删除延迟:" : "Delete after:", `points:noop:${chatId}`).row();
+    for (const value of [30, 60, 300]) {
+      keyboard.text(option("deleteSignInSeconds", value, `${value}s`, settings.deleteSignInSeconds), `points:set:${chatId}:deleteSignInSeconds:${value}`);
+    }
+  } else if (rule === "speech") {
+    keyboard.text(locale === "zh-CN" ? "每次发言积分:" : "Speech points:", `points:noop:${chatId}`).row();
+    for (const value of [0, 1, 2, 5]) {
+      keyboard.text(option("speechPoints", value, String(value), settings.speechPoints), `points:set:${chatId}:speechPoints:${value}`);
+    }
+    keyboard.row().text(locale === "zh-CN" ? "每日上限:" : "Daily limit:", `points:noop:${chatId}`).row();
+    for (const value of [10, 50, 100, 0]) {
+      keyboard.text(option("speechDailyLimit", value, value === 0 ? (locale === "zh-CN" ? "无限制" : "Unlimited") : String(value), settings.speechDailyLimit), `points:set:${chatId}:speechDailyLimit:${value}`);
+    }
+    keyboard.row().text(locale === "zh-CN" ? "最小字数:" : "Min length:", `points:noop:${chatId}`).row();
+    for (const value of [0, 5, 10, 20]) {
+      keyboard.text(option("speechMinLength", value, String(value), settings.speechMinLength), `points:set:${chatId}:speechMinLength:${value}`);
+    }
+  } else {
+    keyboard.text(locale === "zh-CN" ? "邀请积分:" : "Invite points:", `points:noop:${chatId}`).row();
+    for (const value of [0, 1, 5, 10]) {
+      keyboard.text(option("invitePoints", value, String(value), settings.invitePoints), `points:set:${chatId}:invitePoints:${value}`);
+    }
+    keyboard.row().text(locale === "zh-CN" ? "每日上限:" : "Daily limit:", `points:noop:${chatId}`).row();
+    for (const value of [10, 50, 100, 0]) {
+      keyboard.text(option("inviteDailyLimit", value, value === 0 ? (locale === "zh-CN" ? "无限制" : "Unlimited") : String(value), settings.inviteDailyLimit), `points:set:${chatId}:inviteDailyLimit:${value}`);
+    }
+  }
+
+  return keyboard.row().text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `chat_feature:points:${chatId}`);
+}
+
+function pointsConfirmClearKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `chat_feature:points:${chatId}`)
+    .text(locale === "zh-CN" ? "❗️确认删除" : "❗️Confirm delete", `points:clear_confirm:${chatId}`);
+}
+
+function pointsBackKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `chat_feature:points:${chatId}`);
+}
+
+function pointExchangeKeyboard(chatId: string, settings: PointExchangeSettings, locale: Locale) {
+  const selected = (active: boolean, label: string) => active ? `✅${label}` : label;
+  if (locale !== "zh-CN") {
+    return new InlineKeyboard()
+      .text("Status:", `points:exchange_noop:${chatId}`)
+      .text(selected(settings.enabled, "On"), `points:exchange_status:${chatId}:on`)
+      .text(selected(!settings.enabled, "Off"), `points:exchange_status:${chatId}:off`)
+      .row()
+      .text("Change exchange keyword", `points:exchange_keyword:${chatId}`)
+      .row()
+      .text("🎁 Product management", `points:products:${chatId}`)
+      .text("🧾 Exchange records", `points:exchange_records:${chatId}`)
+      .row()
+      .text("🔙 Back", `chat_feature:points:${chatId}`);
+  }
+
+  return new InlineKeyboard()
+    .text("状态:", `points:exchange_noop:${chatId}`)
+    .text(selected(settings.enabled, "开启"), `points:exchange_status:${chatId}:on`)
+    .text(selected(!settings.enabled, "关闭"), `points:exchange_status:${chatId}:off`)
+    .row()
+    .text("修改兑换关键词", `points:exchange_keyword:${chatId}`)
+    .row()
+    .text("🎁商品管理", `points:products:${chatId}`)
+    .text("🧾兑换记录", `points:exchange_records:${chatId}`)
+    .row()
+    .text("🔙返回", `chat_feature:points:${chatId}`);
+}
+
+function productsKeyboard(chatId: string, settings: PointExchangeSettings, locale: Locale) {
+  const keyboard = new InlineKeyboard();
+  for (const product of settings.products) {
+    const name = product.name || (locale === "zh-CN" ? "未命名商品" : "Unnamed product");
+    keyboard.text(`${product.listed ? "✅" : "⬜"} ${product.id} ${name}`.slice(0, 64), `points:product:${chatId}:${product.id}`).row();
+  }
+  return keyboard
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `points:exchange:${chatId}`)
+    .text(locale === "zh-CN" ? "➕添加商品" : "➕ Add product", `points:product_add:${chatId}`);
+}
+
+function productKeyboard(chatId: string, product: PointProduct, locale: Locale) {
+  const selected = (active: boolean, label: string) => active ? `✅${label}` : label;
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "是否上架：" : "Listed:", `points:product_noop:${chatId}:${product.id}`)
+    .text(selected(product.listed, locale === "zh-CN" ? "是" : "Yes"), `points:product_listed:${chatId}:${product.id}:on`)
+    .text(selected(!product.listed, locale === "zh-CN" ? "否" : "No"), `points:product_listed:${chatId}:${product.id}:off`)
+    .row()
+    .text(locale === "zh-CN" ? "修改名称" : "Edit name", `points:product_edit:${chatId}:${product.id}:name`)
+    .text(locale === "zh-CN" ? "修改消耗 积分" : "Edit cost", `points:product_edit:${chatId}:${product.id}:cost`)
+    .row()
+    .text(locale === "zh-CN" ? "设置卡密" : "Set codes", `points:product_edit:${chatId}:${product.id}:codes`)
+    .text(locale === "zh-CN" ? "查看卡密" : "View codes", `points:product_codes:${chatId}:${product.id}`)
+    .row()
+    .text(locale === "zh-CN" ? "设置每日兑换上限" : "Set daily limit", `points:product_edit:${chatId}:${product.id}:daily_limit`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `points:products:${chatId}`);
+}
+
+function exchangeProductListKeyboard(chatId: string, products: PointProduct[], locale: Locale) {
+  const keyboard = new InlineKeyboard();
+  for (const product of products) {
+    const name = product.name || (locale === "zh-CN" ? "未命名商品" : "Unnamed product");
+    keyboard.text(`${name} - ${product.cost}`, `points:exchange_redeem:${chatId}:${product.id}`).row();
+  }
+  return keyboard;
 }
 
 function groupStatsKeyboard(chatId: string, locale: Locale) {
@@ -1864,6 +2418,34 @@ function memberStatsKeyboard(chat: PrismaChat, settings: MemberStatsSettings, lo
     .text(!settings.enabled ? `✅${labels.off}` : labels.off, `member_stats:toggle:${chat.id}:off`)
     .row()
     .text(labels.view, `member_stats:view:${chat.id}:7`)
+    .row()
+    .text(labels.back, `menu:chat:${scope}:${chat.id}`);
+}
+
+function groupMembersKeyboard(chat: PrismaChat, settings: GroupMembersSettings, locale: Locale) {
+  const scope = chat.type === "CHANNEL" ? "channel" : "group";
+  const labels = locale === "zh-CN"
+    ? {
+        nickname: "监听昵称",
+        username: "监听用户名",
+        unpinLinkedChannel: "取消绑定频道消息置顶",
+        back: "🔙返回"
+      }
+    : {
+        nickname: "Watch names",
+        username: "Watch usernames",
+        unpinLinkedChannel: "Unpin linked channel messages",
+        back: "🔙Back"
+      };
+
+  const mark = (enabled: boolean, label: string) => `${enabled ? "✅" : "❌"}${label}`;
+
+  return new InlineKeyboard()
+    .text(mark(settings.watchNicknameChange, labels.nickname), `group_members:toggle:nickname:${chat.id}`)
+    .row()
+    .text(mark(settings.watchUsernameChange, labels.username), `group_members:toggle:username:${chat.id}`)
+    .row()
+    .text(mark(settings.unpinLinkedChannelMessages, labels.unpinLinkedChannel), `group_members:toggle:unpin_linked_channel:${chat.id}`)
     .row()
     .text(labels.back, `menu:chat:${scope}:${chat.id}`);
 }
@@ -3616,6 +4198,29 @@ async function handleBannedWordsInputMessage(ctx: Context, locale: Locale) {
   }
 
   const text = getMessageText(ctx.message);
+
+  if (draft.stage === "mute_duration") {
+    const minutes = text ? Number(text.trim()) : NaN;
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 525600) {
+      const settings = await getBannedWordsSettings(draft.chatId);
+      await ctx.reply(bannedWordsMuteDurationPromptText(settings, locale), {
+        parse_mode: "HTML",
+        reply_markup: bannedWordsMuteDurationKeyboard(draft.chatId, locale)
+      });
+      return true;
+    }
+
+    const settings = await getBannedWordsSettings(draft.chatId);
+    settings.muteMinutes = minutes;
+    await saveBannedWordsSettings(draft.chatId, settings);
+    bannedWordsInputDrafts.delete(ctx.from.id);
+    await ctx.reply(locale === "zh-CN" ? "✅ 设置成功，点击按钮返回。" : "✅ Saved. Tap the button to return.", {
+      parse_mode: "HTML",
+      reply_markup: bannedWordsDoneKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
   const words = text ? parseBannedWordsInput(text) : [];
   if (!words.length) {
     const prompt = draft.stage === "add"
@@ -4283,7 +4888,7 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
 
   if (feature === "block") {
     const settings = await getBlocklistSettings(chatId);
-    await editOrReply(ctx, blocklistText(settings, locale), blocklistKeyboard(chatId, settings, locale));
+    await editOrReply(ctx, blocklistText(settings, locale), blocklistKeyboard(chatId, locale));
     return;
   }
 
@@ -4341,6 +4946,11 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
     return;
   }
 
+  if (feature === "anti_spam") {
+    await openAntiSpamMenu(ctx, locale, chat);
+    return;
+  }
+
   if (feature === "night_mode") {
     await openNightModeMenu(ctx, locale);
     return;
@@ -4358,6 +4968,11 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
 
   if (feature === "member_stats") {
     await openMemberStatsPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (feature === "members") {
+    await openGroupMembersPanel(ctx, locale, chat);
     return;
   }
 
@@ -4386,7 +5001,12 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
     return;
   }
 
-  if (feature === "schedule" || feature === "anti_spam" || feature === "import" || feature === "members" || feature === "sync") {
+  if (feature === "import") {
+    await openImportConfigPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (feature === "schedule" || feature === "sync") {
     await editOrReply(
       ctx,
       locale === "zh-CN"
@@ -4398,6 +5018,360 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
   }
 
   await editOrReply(ctx, locale === "zh-CN" ? "该功能正在开发中。" : "This feature is under development.", chatPanelKeyboard(chat.id, chat.type === "CHANNEL" ? "channel" : "group", locale));
+}
+
+async function handleImportConfigCallback(ctx: Context) {
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  const locale = await getLocale(ctx);
+  const [, action, targetChatId] = ctx.callbackQuery?.data?.split(":") ?? [];
+  if (!action || !targetChatId) return;
+
+  const targetChat = await prisma.chat.findUnique({ where: { id: targetChatId } });
+  if (!targetChat) {
+    await editOrReply(ctx, locale === "zh-CN" ? "找不到该管理对象。" : "Managed chat not found.", homeKeyboard(locale));
+    return;
+  }
+
+  if (action === "back") {
+    if (ctx.from) importConfigDrafts.delete(ctx.from.id);
+    await editOrReply(ctx, chatPanelText(targetChat, locale), chatPanelKeyboard(targetChat.id, chatPanelScope(targetChat), locale));
+    return;
+  }
+
+  if (action === "cancel") {
+    if (ctx.from) importConfigDrafts.delete(ctx.from.id);
+    await openImportConfigPanel(ctx, locale, targetChat);
+    return;
+  }
+
+  if (action !== "start" || !ctx.from) return;
+
+  const ownerUserId = await getCurrentDbUserId(ctx.from.id);
+  if (!ownerUserId || targetChat.ownerUserId !== ownerUserId) {
+    await editOrReply(ctx, importConfigOwnerOnlyText(locale), importConfigKeyboard(targetChat.id, chatPanelScope(targetChat), locale));
+    return;
+  }
+
+  clearUserInputState(ctx.from.id);
+  importConfigDrafts.set(ctx.from.id, { targetChatId: targetChat.id });
+  await editOrReply(ctx, importConfigPromptText(targetChat, locale), importConfigCancelKeyboard(targetChat.id, chatPanelScope(targetChat), locale));
+}
+
+async function handleImportConfigInputMessage(ctx: Context, locale: Locale) {
+  if (!ctx.from) return false;
+  const draft = importConfigDrafts.get(ctx.from.id);
+  if (!draft) return false;
+
+  const targetChat = await prisma.chat.findUnique({ where: { id: draft.targetChatId } });
+  const message = ctx.message;
+  const text = message && "text" in message ? message.text?.trim() ?? "" : "";
+  const sourceTelegramChatId = parseImportSourceTelegramChatId(text);
+  if (!sourceTelegramChatId) {
+    await ctx.reply(importConfigInvalidSourceText(locale), {
+      parse_mode: "HTML",
+      reply_markup: importConfigCancelKeyboard(draft.targetChatId, targetChat ? chatPanelScope(targetChat) : "group", locale)
+    });
+    return true;
+  }
+
+  const [sourceChat, ownerUserId] = await Promise.all([
+    prisma.chat.findFirst({
+      where: {
+        telegramChatId: sourceTelegramChatId,
+        status: ChatStatus.ACTIVE
+      }
+    }),
+    getCurrentDbUserId(ctx.from.id)
+  ]);
+
+  if (!targetChat) {
+    importConfigDrafts.delete(ctx.from.id);
+    await ctx.reply(locale === "zh-CN" ? "找不到当前管理对象，请重新打开管理菜单。" : "Managed chat not found. Reopen the management menu.");
+    return true;
+  }
+
+  if (!sourceChat) {
+    await ctx.reply(importConfigSourceNotFoundText(locale), {
+      parse_mode: "HTML",
+      reply_markup: importConfigCancelKeyboard(targetChat.id, chatPanelScope(targetChat), locale)
+    });
+    return true;
+  }
+
+  if (sourceChat.id === targetChat.id) {
+    await ctx.reply(importConfigSameChatText(locale), {
+      parse_mode: "HTML",
+      reply_markup: importConfigCancelKeyboard(targetChat.id, chatPanelScope(targetChat), locale)
+    });
+    return true;
+  }
+
+  if (chatPanelScope(sourceChat) !== chatPanelScope(targetChat)) {
+    await ctx.reply(importConfigTypeMismatchText(locale), {
+      parse_mode: "HTML",
+      reply_markup: importConfigCancelKeyboard(targetChat.id, chatPanelScope(targetChat), locale)
+    });
+    return true;
+  }
+
+  if (!ownerUserId || targetChat.ownerUserId !== ownerUserId || sourceChat.ownerUserId !== ownerUserId) {
+    await ctx.reply(importConfigOwnerOnlyText(locale), {
+      parse_mode: "HTML",
+      reply_markup: importConfigCancelKeyboard(targetChat.id, chatPanelScope(targetChat), locale)
+    });
+    return true;
+  }
+
+  const result = await importChatConfiguration(sourceChat.id, targetChat.id);
+  importConfigDrafts.delete(ctx.from.id);
+  await ctx.reply(importConfigSuccessText(sourceChat, targetChat, result, locale), {
+    parse_mode: "HTML",
+    reply_markup: importConfigDoneKeyboard(targetChat.id, chatPanelScope(targetChat), locale)
+  });
+  return true;
+}
+
+async function openImportConfigPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  await editOrReply(ctx, importConfigPanelText(chat, locale), importConfigKeyboard(chat.id, chatPanelScope(chat), locale));
+}
+
+function importConfigPanelText(chat: PrismaChat, locale: Locale) {
+  const chatId = chat.telegramChatId.toString();
+  return locale === "zh-CN"
+    ? [
+        "📋 <b>导入配置</b>",
+        "",
+        "导入其他群组或频道的设置，使用此功能快速复制其他群组的设置项",
+        "",
+        `当前群组ID: <code>${escapeHtml(chatId)}</code>`,
+        "",
+        "⚠️ 只有拉入bot的创建者可以使用该操作",
+        "⚠️ [夜间模式] 不支持复制"
+      ].join("\n")
+    : [
+        "📋 <b>Import Config</b>",
+        "",
+        "Import settings from another managed group or channel.",
+        "",
+        `Current chat ID: <code>${escapeHtml(chatId)}</code>`,
+        "",
+        "⚠️ Only the user who added the bot can use this action.",
+        "⚠️ Night mode is not copied."
+      ].join("\n");
+}
+
+function importConfigKeyboard(chatId: string, scope: "group" | "channel", locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "导入配置" : "Import config", `import_config:start:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `menu:chat:${scope}:${chatId}`);
+}
+
+function importConfigCancelKeyboard(chatId: string, scope: "group" | "channel", locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "取消" : "Cancel", `import_config:cancel:${chatId}`)
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `menu:chat:${scope}:${chatId}`);
+}
+
+function importConfigDoneKeyboard(chatId: string, scope: "group" | "channel", locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "返回群组设置" : "Back to settings", `menu:chat:${scope}:${chatId}`);
+}
+
+function importConfigPromptText(chat: PrismaChat, locale: Locale) {
+  const currentId = chat.telegramChatId.toString();
+  return locale === "zh-CN"
+    ? [
+        "📋 <b>导入配置</b>",
+        "",
+        `当前群组ID: <code>${escapeHtml(currentId)}</code>`,
+        "",
+        "请发送要复制配置的来源群组/频道 ID。",
+        "示例: <code>-1001234567890</code>",
+        "",
+        "导入会覆盖当前群组已有配置；夜间模式不会复制。"
+      ].join("\n")
+    : [
+        "📋 <b>Import Config</b>",
+        "",
+        `Current chat ID: <code>${escapeHtml(currentId)}</code>`,
+        "",
+        "Send the source group/channel ID to copy from.",
+        "Example: <code>-1001234567890</code>",
+        "",
+        "Importing overwrites current settings. Night mode is not copied."
+      ].join("\n");
+}
+
+function importConfigInvalidSourceText(locale: Locale) {
+  return locale === "zh-CN"
+    ? "来源 ID 格式不正确，请发送类似 <code>-1001234567890</code> 的群组/频道 ID。"
+    : "Invalid source ID. Send a group/channel ID like <code>-1001234567890</code>.";
+}
+
+function importConfigSourceNotFoundText(locale: Locale) {
+  return locale === "zh-CN"
+    ? "未找到这个已绑定的来源群组/频道，请确认机器人已在来源群组中并完成绑定。"
+    : "Source chat was not found. Make sure the bot is added and the chat is bound.";
+}
+
+function importConfigOwnerOnlyText(locale: Locale) {
+  return locale === "zh-CN"
+    ? "只有拉入 bot 的创建者可以导入配置，并且来源和目标都必须由同一个创建者绑定。"
+    : "Only the user who added the bot can import config, and the same user must own both source and target chats.";
+}
+
+function importConfigSameChatText(locale: Locale) {
+  return locale === "zh-CN" ? "不能从当前群组导入到自身。" : "You cannot import from the same chat.";
+}
+
+function importConfigTypeMismatchText(locale: Locale) {
+  return locale === "zh-CN"
+    ? "来源和当前管理对象类型不一致。群组只能导入群组配置，频道只能导入频道配置。"
+    : "Source and target types do not match. Groups can import from groups; channels can import from channels.";
+}
+
+function importConfigSuccessText(
+  sourceChat: PrismaChat,
+  targetChat: PrismaChat,
+  result: { settings: number; moderationRules: number },
+  locale: Locale
+) {
+  const sourceTitle = escapeHtml(sourceChat.title ?? sourceChat.username ?? sourceChat.telegramChatId.toString());
+  const targetTitle = escapeHtml(targetChat.title ?? targetChat.username ?? targetChat.telegramChatId.toString());
+  return locale === "zh-CN"
+    ? [
+        "✅ <b>导入完成</b>",
+        "",
+        `来源: <b>${sourceTitle}</b>`,
+        `目标: <b>${targetTitle}</b>`,
+        "",
+        `已导入配置项: <b>${result.settings}</b>`,
+        `已导入违禁词规则: <b>${result.moderationRules}</b>`,
+        "",
+        "夜间模式未复制。"
+      ].join("\n")
+    : [
+        "✅ <b>Import complete</b>",
+        "",
+        `Source: <b>${sourceTitle}</b>`,
+        `Target: <b>${targetTitle}</b>`,
+        "",
+        `Settings imported: <b>${result.settings}</b>`,
+        `Banned-word rules imported: <b>${result.moderationRules}</b>`,
+        "",
+        "Night mode was not copied."
+      ].join("\n");
+}
+
+function parseImportSourceTelegramChatId(input: string) {
+  const match = input.match(/-?\d{5,}/);
+  if (!match?.[0]) return null;
+  try {
+    return BigInt(match[0]);
+  } catch {
+    return null;
+  }
+}
+
+function chatPanelScope(chat: PrismaChat): "group" | "channel" {
+  return chat.type === "CHANNEL" ? "channel" : "group";
+}
+
+async function getCurrentDbUserId(telegramUserId: number) {
+  const user = await prisma.user.findUnique({
+    where: { telegramUserId: BigInt(telegramUserId) },
+    select: { id: true }
+  });
+  return user?.id ?? null;
+}
+
+async function importChatConfiguration(sourceChatId: string, targetChatId: string) {
+  const [sourceSettings, sourceRules] = await Promise.all([
+    prisma.setting.findMany({
+      where: {
+        chatId: sourceChatId,
+        key: { in: [...importableSettingKeys] }
+      }
+    }),
+    prisma.moderationRule.findMany({
+      where: { chatId: sourceChatId },
+      select: {
+        ruleType: true,
+        pattern: true,
+        action: true,
+        enabled: true
+      }
+    })
+  ]);
+
+  const settings = sourceSettings
+    .map((setting) => {
+      const value = sanitizeImportedSettingValue(setting.key, setting.value);
+      return value === undefined ? null : { key: setting.key, value };
+    })
+    .filter((setting): setting is { key: string; value: Prisma.InputJsonValue } => Boolean(setting));
+
+  await prisma.$transaction(async (tx) => {
+    await tx.setting.deleteMany({
+      where: {
+        chatId: targetChatId,
+        key: { in: [...importableSettingKeys] }
+      }
+    });
+
+    if (settings.length) {
+      await tx.setting.createMany({
+        data: settings.map((setting) => ({
+          chatId: targetChatId,
+          key: setting.key,
+          value: setting.value
+        }))
+      });
+    }
+
+    await tx.moderationRule.deleteMany({ where: { chatId: targetChatId } });
+    if (sourceRules.length) {
+      await tx.moderationRule.createMany({
+        data: sourceRules.map((rule) => ({
+          chatId: targetChatId,
+          ruleType: rule.ruleType,
+          pattern: rule.pattern,
+          action: rule.action,
+          enabled: rule.enabled
+        }))
+      });
+    }
+  });
+
+  return {
+    settings: settings.length,
+    moderationRules: sourceRules.length
+  };
+}
+
+function sanitizeImportedSettingValue(key: string, value: Prisma.JsonValue): Prisma.InputJsonValue | undefined {
+  if (!importableSettingKeySet.has(key)) return undefined;
+  const cloned = cloneJsonValue(value);
+
+  if (key === "welcome" && isRecord(cloned)) {
+    const record = cloned as Record<string, unknown>;
+    const { lastMessageIds: _lastMessageIds, ...rest } = record;
+    return settingsToJson(rest);
+  }
+
+  if (key === "member_stats" && isRecord(cloned)) {
+    const record = cloned as Record<string, unknown>;
+    return settingsToJson({
+      enabled: typeof record.enabled === "boolean" ? record.enabled : defaultMemberStatsSettings.enabled
+    });
+  }
+
+  return cloned;
+}
+
+function cloneJsonValue(value: Prisma.JsonValue): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
 }
 
 async function handleNewMemberLimitCallback(ctx: Context, config: AppConfig) {
@@ -4425,7 +5399,6 @@ async function handleAdultCheckCallback(ctx: Context) {
 }
 
 async function handleNightModeCallback(ctx: Context) {
-  await ctx.answerCallbackQuery().catch(() => undefined);
   const locale = await getLocale(ctx);
   const key = ctx.callbackQuery?.data?.replace("night_mode:", "");
   if (!key) return;
@@ -4593,6 +5566,26 @@ async function handleMemberStatsCallback(ctx: Context) {
   await editOrReply(ctx, memberStatsText(settings, locale), memberStatsKeyboard(chat, settings, locale));
 }
 
+async function handleGroupMembersCallback(ctx: Context) {
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  const locale = await getLocale(ctx);
+  const [, action, key, chatId] = ctx.callbackQuery?.data?.split(":") ?? [];
+  if (!action || !chatId || action === "noop") return;
+
+  const chat = await ensureControlPermissionForChatId(ctx, chatId, locale);
+  if (!chat) return;
+
+  const settings = await getGroupMembersSettings(chat.id);
+  if (action === "toggle") {
+    if (key === "nickname") settings.watchNicknameChange = !settings.watchNicknameChange;
+    if (key === "username") settings.watchUsernameChange = !settings.watchUsernameChange;
+    if (key === "unpin_linked_channel") settings.unpinLinkedChannelMessages = !settings.unpinLinkedChannelMessages;
+    await saveGroupMembersSettings(chat.id, settings);
+  }
+
+  await editOrReply(ctx, groupMembersText(settings, locale), groupMembersKeyboard(chat, settings, locale));
+}
+
 async function handleControlPermissionsCallback(ctx: Context) {
   await ctx.answerCallbackQuery().catch(() => undefined);
   const locale = await getLocale(ctx);
@@ -4666,9 +5659,12 @@ function isConfigurationFeature(feature: string) {
     "open_close",
     "adult_check",
     "speech_check",
+    "anti_spam",
     "scheduled",
     "invite",
-    "member_stats"
+    "giveaway",
+    "member_stats",
+    "members"
   ].includes(feature);
 }
 
@@ -4762,85 +5758,309 @@ async function openInviteLinkPanel(ctx: Context, locale: Locale, chat: PrismaCha
 }
 
 async function openGiveawayPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
-  const scope = chat.type === "CHANNEL" ? "channel" : "group";
-  const giveaways = await prisma.giveaway.findMany({
-    where: { chatId: chat.id, status: GiveawayStatus.ACTIVE },
-    orderBy: { drawAt: "asc" },
-    take: 10
-  });
-
-  if (!giveaways.length) {
-    await editOrReply(
-      ctx,
-      locale === "zh-CN" ? "当前没有进行中的抽奖。" : "No active giveaways.",
-      chatPanelKeyboard(chat.id, scope, locale)
-    );
-    return;
-  }
-
-  const keyboard = new InlineKeyboard();
-  const lines = giveaways.map((item, index) => {
-    keyboard.text(locale === "zh-CN" ? `参与 ${index + 1}` : `Join ${index + 1}`, `giveaway:join:${item.id}`).row();
-    return `${index + 1}. ${escapeHtml(item.title)} - ${escapeHtml(item.prize)}`;
-  });
+  const [created, drawn, active, draft, cancelled] = await prisma.$transaction([
+    prisma.giveaway.count({ where: { chatId: chat.id } }),
+    prisma.giveaway.count({ where: { chatId: chat.id, status: GiveawayStatus.DRAWN } }),
+    prisma.giveaway.count({ where: { chatId: chat.id, status: GiveawayStatus.ACTIVE } }),
+    prisma.giveaway.count({ where: { chatId: chat.id, status: GiveawayStatus.DRAFT } }),
+    prisma.giveaway.count({ where: { chatId: chat.id, status: GiveawayStatus.CANCELLED } })
+  ]);
 
   await editOrReply(
     ctx,
-    [
-      locale === "zh-CN" ? "<b>🎁 抽奖</b>" : "<b>🎁 Giveaway</b>",
-      "",
-      ...lines
-    ].join("\n"),
-    keyboard
-      .row()
-      .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `menu:chat:${scope}:${chat.id}`)
-      .text(locale === "zh-CN" ? "🏠 首页" : "🏠 Home", "menu:home")
+    giveawayPanelText(chat, { created, drawn, pending: active + draft, cancelled }, locale),
+    giveawayPanelKeyboard(chat.id, locale)
   );
 }
 
-async function openPointsPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
-  const scope = chat.type === "CHANNEL" ? "channel" : "group";
-  const rows = await prisma.chatPointBalance.findMany({
+function giveawayPanelText(
+  chat: PrismaChat,
+  stats: { created: number; drawn: number; pending: number; cancelled: number },
+  locale: Locale
+) {
+  const title = escapeHtml(chat.title ?? chat.username ?? String(chat.telegramChatId));
+  return locale === "zh-CN"
+    ? [
+        `<b>🎁[ ${title} ]抽奖</b>`,
+        "",
+        `创建的抽奖次数:<b>${stats.created}</b>`,
+        "",
+        `已开奖:<b>${stats.drawn}</b>       未开奖:<b>${stats.pending}</b>       取消:<b>${stats.cancelled}</b>`
+      ].join("\n")
+    : [
+        `<b>🎁 [ ${title} ] Giveaways</b>`,
+        "",
+        `Created: <b>${stats.created}</b>`,
+        "",
+        `Drawn: <b>${stats.drawn}</b>       Pending: <b>${stats.pending}</b>       Cancelled: <b>${stats.cancelled}</b>`
+      ].join("\n");
+}
+
+function giveawayPanelKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "➕ 发起抽奖活动" : "➕ Create giveaway", `giveaway:create:${chatId}`)
+    .text(locale === "zh-CN" ? "📃 创建的抽奖记录" : "📃 Giveaway records", `giveaway:records:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "⚙ 抽奖设置" : "⚙ Giveaway settings", `giveaway:settings:${chatId}`)
+    .text(locale === "zh-CN" ? "🏠 返回首页" : "🏠 Home", "menu:home");
+}
+
+function giveawayBackKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `chat_feature:giveaway:${chatId}`)
+    .text(locale === "zh-CN" ? "🏠 返回首页" : "🏠 Home", "menu:home");
+}
+
+async function openGiveawayRecordsPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  const giveaways = await prisma.giveaway.findMany({
     where: { chatId: chat.id },
-    include: { user: true },
-    orderBy: { balance: "desc" },
+    include: { _count: { select: { entries: true } } },
+    orderBy: { createdAt: "desc" },
     take: 10
   });
 
-  const lines = rows.length
-    ? rows.map((row, index) => `${index + 1}. ${displayPrismaUser(row.user)} - ${row.balance}`)
-    : [locale === "zh-CN" ? "暂无积分记录。" : "No points yet."];
+  const lines = giveaways.length
+    ? giveaways.map((item, index) => [
+        `${index + 1}. <b>${escapeHtml(item.title)}</b>`,
+        `${locale === "zh-CN" ? "奖品" : "Prize"}: ${escapeHtml(item.prize)}`,
+        `${locale === "zh-CN" ? "状态" : "Status"}: ${giveawayStatusLabel(item.status, locale)}    ${locale === "zh-CN" ? "参与" : "Entries"}: ${item._count.entries}`,
+        `${locale === "zh-CN" ? "开奖时间" : "Draw at"}: ${formatDateTimeForDisplay(item.drawAt)}`
+      ].join("\n"))
+    : [locale === "zh-CN" ? "暂无抽奖记录。" : "No giveaway records yet."];
 
   await editOrReply(
     ctx,
     [
-      locale === "zh-CN" ? "<b>Ⓜ️ 积分</b>" : "<b>Ⓜ️ Points</b>",
+      locale === "zh-CN" ? "<b>📃 创建的抽奖记录</b>" : "<b>📃 Giveaway records</b>",
       "",
       ...lines
-    ].join("\n"),
-    chatPanelKeyboard(chat.id, scope, locale)
+    ].join("\n\n"),
+    giveawayBackKeyboard(chat.id, locale)
   );
+}
+
+async function openGiveawaySettingsPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  await editOrReply(
+    ctx,
+    locale === "zh-CN"
+      ? [
+          "<b>⚙ 抽奖设置</b>",
+          "",
+          "当前抽奖使用默认规则：用户点击按钮参与，到开奖时间自动随机开奖。",
+          "后续可在这里接入参与门槛、积分消耗和开奖提醒等配置。"
+        ].join("\n")
+      : [
+          "<b>⚙ Giveaway settings</b>",
+          "",
+          "Giveaways currently use the default rule: users join by button and winners are drawn automatically at the draw time.",
+          "Join requirements, point cost and reminders can be wired here later."
+        ].join("\n"),
+    giveawayBackKeyboard(chat.id, locale)
+  );
+}
+
+function giveawayStatusLabel(status: GiveawayStatus, locale: Locale) {
+  if (locale === "zh-CN") {
+    if (status === GiveawayStatus.ACTIVE) return "未开奖";
+    if (status === GiveawayStatus.DRAFT) return "草稿";
+    if (status === GiveawayStatus.DRAWN) return "已开奖";
+    return "取消";
+  }
+
+  if (status === GiveawayStatus.ACTIVE) return "Pending";
+  if (status === GiveawayStatus.DRAFT) return "Draft";
+  if (status === GiveawayStatus.DRAWN) return "Drawn";
+  return "Cancelled";
+}
+
+async function openPointsPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  if (ctx.from) pointsInputDrafts.delete(ctx.from.id);
+  const settings = await getPointsSettings(chat.id);
+  await editOrReply(ctx, pointsPanelText(settings, locale), pointsKeyboard(chat.id, settings, locale));
+}
+
+async function openPointsRulePanel(ctx: Context, locale: Locale, chat: PrismaChat, rule: "sign" | "speech" | "invite") {
+  const settings = await getPointsSettings(chat.id);
+  await editOrReply(ctx, pointsRuleText(settings, rule, locale), pointsRuleKeyboard(chat.id, settings, rule, locale));
+}
+
+async function openPointsAdjustPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  await editOrReply(
+    ctx,
+    locale === "zh-CN"
+      ? [
+          "Ⓜ️ 积分",
+          "",
+          "增加或者减少用户积分",
+          "",
+          "💡 群组内命令回复用户可以增减积分",
+          "",
+          "在群组中回复成员消息发送：",
+          "<code>/points 10</code> 增加 10 积分",
+          "<code>/points @xxx 10</code> @某人增加10积分",
+          "<code>/points -10</code> 扣除 10 积分",
+          "",
+          "<code>/points_rank</code> 积分排名",
+          "",
+          "👉 <b>请输入 用户名 或 用户ID</b>"
+        ].join("\n")
+      : [
+          "Ⓜ️ Points",
+          "",
+          "Add or deduct user points.",
+          "",
+          "Reply to a member in the group with:",
+          "<code>/points 10</code> to add 10 points",
+          "<code>/points @xxx 10</code> to add 10 points to @xxx",
+          "<code>/points -10</code> to deduct 10 points",
+          "",
+          "<code>/points_rank</code> points ranking",
+          "",
+          "👉 <b>Send a username or user ID</b>"
+        ].join("\n"),
+    pointsBackKeyboard(chat.id, locale)
+  );
+  if (ctx.from) {
+    clearUserInputState(ctx.from.id);
+    pointsInputDrafts.set(ctx.from.id, { chatId: chat.id, kind: "adjust_user" });
+  }
+}
+
+async function openPointsExchangePanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  const settings = await getPointExchangeSettings(chat.id);
+  await editOrReply(
+    ctx,
+    pointExchangeText(settings, locale),
+    pointExchangeKeyboard(chat.id, settings, locale)
+  );
+}
+
+async function openPointAliasInputPanel(ctx: Context, locale: Locale, chat: PrismaChat, command: Extract<GroupCommandKey, "points" | "points_rank">) {
+  const settings = await getGroupCommandSettings(chat.id);
+  if (ctx.from) {
+    clearUserInputState(ctx.from.id);
+    pointsInputDrafts.set(ctx.from.id, { chatId: chat.id, kind: "alias", command });
+  }
+  await editOrReply(
+    ctx,
+    pointAliasInputText(settings.aliases[command], command, locale),
+    pointsBackKeyboard(chat.id, locale)
+  );
+}
+
+async function openExchangeKeywordInputPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  if (ctx.from) {
+    clearUserInputState(ctx.from.id);
+    pointsInputDrafts.set(ctx.from.id, { chatId: chat.id, kind: "exchange_keyword" });
+  }
+  await editOrReply(ctx, exchangeKeywordInputText(locale), new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `points:exchange:${chat.id}`));
+}
+
+async function openProductsPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  const settings = await getPointExchangeSettings(chat.id);
+  await editOrReply(ctx, productsText(locale), productsKeyboard(chat.id, settings, locale));
+}
+
+async function openProductPanel(ctx: Context, locale: Locale, chat: PrismaChat, productId: string) {
+  const settings = await getPointExchangeSettings(chat.id);
+  const product = settings.products.find((item) => item.id === productId);
+  if (!product) {
+    await openProductsPanel(ctx, locale, chat);
+    return;
+  }
+  await editOrReply(ctx, productText(product, locale), productKeyboard(chat.id, product, locale));
 }
 
 async function handleBlocklistCallback(ctx: Context) {
   await ctx.answerCallbackQuery().catch(() => undefined);
-  const data = ctx.callbackQuery?.data;
-  if (!data) return;
-
-  const [, action, key, chatId] = data.split(":");
-  if (action !== "toggle" || !key || !chatId) return;
-
   const locale = await getLocale(ctx);
-  if (!(await ensureControlPermissionForChatId(ctx, chatId, locale))) return;
+  const parts = ctx.callbackQuery?.data?.split(":") ?? [];
+  const action = parts[1];
+  if (!action) return;
 
-  const settings = await getBlocklistSettings(chatId);
-  if (key in settings && typeof settings[key as keyof BlocklistSettings] === "boolean") {
-    const typedKey = key as keyof Pick<BlocklistSettings, "blockBots" | "banAfterLeave" | "blockFlashJoinLeave" | "blockFollowerRaid">;
-    settings[typedKey] = !settings[typedKey];
-    await saveSetting(chatId, "blocklist", settingsToJson(settings));
+  if (action === "back") {
+    const chatId = parts[2];
+    if (!chatId) return;
+    const chat = await ensureControlPermissionForChatId(ctx, chatId, locale);
+    if (!chat) return;
+    const settings = await getBlocklistSettings(chat.id);
+    await editOrReply(ctx, blocklistText(settings, locale), blocklistKeyboard(chat.id, locale));
+    return;
   }
 
-  await editOrReply(ctx, blocklistText(settings, locale), blocklistKeyboard(chatId, settings, locale));
+  if (action === "menu") {
+    const panel = parts[2];
+    const chatId = parts[3];
+    if (!panel || !chatId) return;
+    const chat = await ensureControlPermissionForChatId(ctx, chatId, locale);
+    if (!chat) return;
+    const settings = await getBlocklistSettings(chat.id);
+    await renderBlocklistPanel(ctx, chat.id, panel, settings, locale);
+    return;
+  }
+
+  if (action === "toggle") {
+    const key = parts[2];
+    const legacyChatId = parts[3];
+    if (!key || !legacyChatId) return;
+    const chat = await ensureControlPermissionForChatId(ctx, legacyChatId, locale);
+    if (!chat) return;
+    const legacySettings = await getBlocklistSettings(legacyChatId);
+    if (key in legacySettings && typeof legacySettings[key as keyof BlocklistSettings] === "boolean") {
+      const typedKey = key as keyof Pick<BlocklistSettings, "blockBots" | "banAfterLeave" | "blockFlashJoinLeave" | "blockFollowerRaid">;
+      legacySettings[typedKey] = !legacySettings[typedKey];
+      if (typedKey === "blockBots") legacySettings.blockBotPunishment = legacySettings.blockBots ? "ban" : "off";
+      await saveBlocklistSettings(legacyChatId, legacySettings);
+    }
+    await editOrReply(ctx, blocklistText(legacySettings, locale), blocklistKeyboard(legacyChatId, locale));
+    return;
+  }
+
+  const chatId = parts[2];
+  const value = parts[3];
+  if (!chatId) return;
+  const chat = await ensureControlPermissionForChatId(ctx, chatId, locale);
+  if (!chat) return;
+  const settings = await getBlocklistSettings(chatId);
+
+  if (action === "bot" && isBlocklistBotPunishment(value)) {
+    settings.blockBotPunishment = value;
+    settings.blockBots = value !== "off";
+    await saveBlocklistSettings(chatId, settings);
+    await editOrReply(ctx, blocklistBotText(settings, locale), blocklistBotKeyboard(chatId, settings, locale));
+    return;
+  }
+
+  if (action === "leave" && (value === "off" || value === "ban")) {
+    settings.banAfterLeave = value === "ban";
+    await saveBlocklistSettings(chatId, settings);
+    await editOrReply(ctx, blocklistLeaveText(settings, locale), blocklistLeaveKeyboard(chatId, settings, locale));
+    return;
+  }
+}
+
+async function renderBlocklistPanel(
+  ctx: Context,
+  chatId: string,
+  panel: string,
+  settings: BlocklistSettings,
+  locale: Locale
+) {
+  if (panel === "bots") {
+    await editOrReply(ctx, blocklistBotText(settings, locale), blocklistBotKeyboard(chatId, settings, locale));
+    return;
+  }
+  if (panel === "leave") {
+    await editOrReply(ctx, blocklistLeaveText(settings, locale), blocklistLeaveKeyboard(chatId, settings, locale));
+    return;
+  }
+  if (panel === "flash") {
+    await editOrReply(ctx, blocklistFlashText(locale), blocklistPremiumKeyboard(chatId, locale));
+    return;
+  }
+  if (panel === "raid") {
+    await editOrReply(ctx, blocklistRaidText(locale), blocklistPremiumKeyboard(chatId, locale));
+  }
 }
 
 async function handleWelcomeCallback(ctx: Context) {
@@ -5124,17 +6344,55 @@ async function handleBannedWordsCallback(ctx: Context) {
     return;
   }
 
-  if (action === "toggle_notice") {
-    settings.deleteNotice = !settings.deleteNotice;
+  if (action === "notice") {
+    await editOrReply(ctx, bannedWordsNoticeText(locale), bannedWordsNoticeKeyboard(chatId, settings, locale));
+    return;
+  }
+
+  if (action === "notice_delay") {
+    const seconds = clampNumber(Number(value ?? defaultBannedWordsSettings.noticeDeleteSeconds), -1, 43200);
+    settings.noticeDeleteSeconds = seconds;
+    settings.deleteNotice = seconds >= 0;
     await saveBannedWordsSettings(chatId, settings);
-    await openBannedWordsPanel(ctx, locale, chat);
+    await editOrReply(ctx, bannedWordsNoticeText(locale), bannedWordsNoticeKeyboard(chatId, settings, locale));
     return;
   }
 
   if (action === "punishment") {
-    settings.punishment = nextBannedWordsPunishment(settings.punishment);
+    if (isBannedWordsPunishment(value)) {
+      settings.punishment = value;
+      await saveBannedWordsSettings(chatId, settings);
+    }
+    await editOrReply(ctx, bannedWordsPunishmentText(settings, locale), bannedWordsPunishmentKeyboard(chatId, settings, locale));
+    return;
+  }
+
+  if (action === "warning_limit") {
+    settings.warningLimit = clampNumber(Number(value ?? settings.warningLimit), 1, 5);
     await saveBannedWordsSettings(chatId, settings);
-    await openBannedWordsPanel(ctx, locale, chat);
+    await editOrReply(ctx, bannedWordsPunishmentText(settings, locale), bannedWordsPunishmentKeyboard(chatId, settings, locale));
+    return;
+  }
+
+  if (action === "warn_action" && isBannedWordsFinalPunishment(value)) {
+    settings.warningPunishment = value;
+    await saveBannedWordsSettings(chatId, settings);
+    await editOrReply(ctx, bannedWordsPunishmentText(settings, locale), bannedWordsPunishmentKeyboard(chatId, settings, locale));
+    return;
+  }
+
+  if (action === "mute_duration") {
+    if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    bannedWordsInputDrafts.set(ctx.from.id, { chatId, stage: "mute_duration" });
+    await editOrReply(ctx, bannedWordsMuteDurationPromptText(settings, locale), bannedWordsMuteDurationKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "mute_forever") {
+    settings.muteMinutes = 0;
+    await saveBannedWordsSettings(chatId, settings);
+    await editOrReply(ctx, bannedWordsPunishmentText(settings, locale), bannedWordsPunishmentKeyboard(chatId, settings, locale));
     return;
   }
 
@@ -5188,21 +6446,40 @@ async function handleGroupCommandsCallback(ctx: Context) {
   if (!(await ensureControlPermissionAccess(ctx, chat, locale))) return;
 
   if (action === "home") {
+    if (ctx.from) groupCommandAliasInputDrafts.delete(ctx.from.id);
     await openGroupCommandsHome(ctx, locale, chat);
     return;
   }
 
   if (action === "list") {
+    if (ctx.from) groupCommandAliasInputDrafts.delete(ctx.from.id);
     const settings = await getGroupCommandSettings(chatId);
     await editOrReply(ctx, groupCommandsText(settings, locale), groupCommandsKeyboard(chatId, settings, locale));
     return;
   }
 
   if (action === "aliases") {
+    if (ctx.from) groupCommandAliasInputDrafts.delete(ctx.from.id);
+    const settings = await getGroupCommandSettings(chatId);
+    await editOrReply(ctx, groupCommandAliasesText(settings, locale), groupCommandsAliasKeyboard(chatId, settings, locale));
+    return;
+  }
+
+  if (action === "alias" && isGroupCommandKey(value)) {
+    if (ctx.from) groupCommandAliasInputDrafts.delete(ctx.from.id);
+    const settings = await getGroupCommandSettings(chatId);
+    await editOrReply(ctx, groupCommandAliasDetailText(settings, value, locale), groupCommandAliasDetailKeyboard(chatId, value, locale));
+    return;
+  }
+
+  if ((action === "alias_add" || action === "alias_delete") && isGroupCommandKey(value)) {
+    if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    groupCommandAliasInputDrafts.set(ctx.from.id, { chatId, command: value, mode: action === "alias_delete" ? "delete" : "add" });
     await editOrReply(
       ctx,
-      locale === "zh-CN" ? "命令别名暂未接入。" : "Command aliases are not wired up yet.",
-      groupCommandsAliasKeyboard(chatId, locale)
+      groupCommandAliasInputPromptText(action === "alias_delete" ? "delete" : "add", value, locale),
+      groupCommandAliasInputKeyboard(chatId, value, locale)
     );
     return;
   }
@@ -5215,6 +6492,343 @@ async function handleGroupCommandsCallback(ctx: Context) {
   }
 }
 
+async function handlePointsCallback(ctx: Context) {
+  const locale = await getLocale(ctx);
+  const [, action, chatId, value, rawNext] = ctx.callbackQuery?.data?.split(":") ?? [];
+  if (!action || !chatId) return;
+  if (action === "noop" || action === "exchange_noop" || action === "product_noop") {
+    await ctx.answerCallbackQuery().catch(() => undefined);
+    return;
+  }
+  if (action !== "exchange_redeem") {
+    await ctx.answerCallbackQuery().catch(() => undefined);
+  }
+
+  const chat = await prisma.chat.findUnique({ where: { id: chatId } });
+  if (!chat) {
+    await editOrReply(ctx, locale === "zh-CN" ? "找不到该管理对象。" : "Managed chat not found.", homeKeyboard(locale));
+    return;
+  }
+
+  if (ctx.from) pointsInputDrafts.delete(ctx.from.id);
+
+  if (action === "exchange_redeem" && value) {
+    await handlePointExchangeRedeem(ctx, locale, chat, value);
+    return;
+  }
+
+  if (!(await ensureControlPermissionAccess(ctx, chat, locale))) return;
+
+  if (action === "alias" && (value === "points" || value === "points_rank")) {
+    await openPointAliasInputPanel(ctx, locale, chat, value);
+    return;
+  }
+
+  if (action === "status") {
+    const settings = await getPointsSettings(chatId);
+    settings.enabled = value === "on";
+    await savePointsSettings(chatId, settings);
+    await openPointsPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "delete_sign") {
+    const settings = await getPointsSettings(chatId);
+    settings.deleteSignInMessage = value === "on";
+    await savePointsSettings(chatId, settings);
+    await openPointsPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "rule" && (value === "sign" || value === "speech" || value === "invite")) {
+    await openPointsRulePanel(ctx, locale, chat, value);
+    return;
+  }
+
+  if (action === "set" && isPointsRuleField(value)) {
+    const nextValue = Number(rawNext);
+    if (!Number.isInteger(nextValue)) return;
+    const settings = await getPointsSettings(chatId);
+    setPointsRuleField(settings, value, nextValue);
+    await savePointsSettings(chatId, settings);
+    await openPointsRulePanel(ctx, locale, chat, pointsRuleForField(value));
+    return;
+  }
+
+  if (action === "adjust") {
+    await openPointsAdjustPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "exchange") {
+    await openPointsExchangePanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "exchange_status") {
+    const settings = await getPointExchangeSettings(chatId);
+    settings.enabled = value === "on";
+    await savePointExchangeSettings(chatId, settings);
+    await openPointsExchangePanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "exchange_keyword") {
+    await openExchangeKeywordInputPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "products") {
+    await openProductsPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "product_add") {
+    const settings = await getPointExchangeSettings(chatId);
+    const product = createPointProduct();
+    settings.products.push(product);
+    await savePointExchangeSettings(chatId, settings);
+    await openProductPanel(ctx, locale, chat, product.id);
+    return;
+  }
+
+  if (action === "product" && value) {
+    await openProductPanel(ctx, locale, chat, value);
+    return;
+  }
+
+  if (action === "product_listed" && value) {
+    const settings = await getPointExchangeSettings(chatId);
+    const product = settings.products.find((item) => item.id === value);
+    if (product) {
+      product.listed = rawNext === "on";
+      await savePointExchangeSettings(chatId, settings);
+    }
+    await openProductPanel(ctx, locale, chat, value);
+    return;
+  }
+
+  if (action === "product_edit" && value && rawNext) {
+    const kind = pointProductInputKind(rawNext);
+    if (!kind || !ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    pointsInputDrafts.set(ctx.from.id, { chatId, kind, productId: value });
+    await editOrReply(ctx, productInputPromptText(kind, locale), new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `points:product:${chatId}:${value}`));
+    return;
+  }
+
+  if (action === "product_codes" && value) {
+    const settings = await getPointExchangeSettings(chatId);
+    const product = settings.products.find((item) => item.id === value);
+    await editOrReply(
+      ctx,
+      pointProductCodesText(product, locale),
+      new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `points:product:${chatId}:${value}`)
+    );
+    return;
+  }
+
+  if (action === "exchange_records") {
+    await editOrReply(ctx, await pointExchangeRecordsText(chatId, locale), new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `points:exchange:${chatId}`));
+    return;
+  }
+
+  if (action === "clear") {
+    await editOrReply(
+      ctx,
+      locale === "zh-CN"
+        ? "Ⓜ️ 积分\n\n🚨🚨 请注意，即将清空该群所有积分数据，操作不可恢复，是否继续："
+        : "Ⓜ️ Points\n\n🚨 This will clear all point data for this group and cannot be recovered. Continue?",
+      pointsConfirmClearKeyboard(chatId, locale)
+    );
+    return;
+  }
+
+  if (action === "clear_confirm") {
+    await prisma.$transaction([
+      prisma.chatPointTransaction.deleteMany({ where: { chatId } }),
+      prisma.chatPointBalance.deleteMany({ where: { chatId } })
+    ]);
+    await openPointsPanel(ctx, locale, chat);
+  }
+}
+
+async function handlePointsInputMessage(ctx: Context, config: AppConfig, locale: Locale) {
+  if (!ctx.from) return false;
+  const draft = pointsInputDrafts.get(ctx.from.id);
+  if (!draft) return false;
+
+  const chat = await ensureControlPermissionForChatId(ctx, draft.chatId, locale);
+  if (!chat) {
+    pointsInputDrafts.delete(ctx.from.id);
+    return true;
+  }
+
+  const text = getMessageText(ctx.message)?.trim() ?? "";
+  if (!text) {
+    await ctx.reply(pointsInputInvalidText(locale), { parse_mode: "HTML", reply_markup: pointsBackKeyboard(draft.chatId, locale) });
+    return true;
+  }
+
+  if (draft.kind === "alias") {
+    const aliases = parseGroupCommandAliases(text);
+    if (!aliases.length) {
+      await ctx.reply(pointAliasInputText([], draft.command, locale), { parse_mode: "HTML", reply_markup: pointsBackKeyboard(draft.chatId, locale) });
+      return true;
+    }
+    const settings = await getGroupCommandSettings(draft.chatId);
+    const normalized = new Set(aliases.map(normalizeGroupCommandAlias));
+    for (const item of groupCommandDefinitions) {
+      if (item.key === draft.command) continue;
+      settings.aliases[item.key] = settings.aliases[item.key].filter((itemAlias) => !normalized.has(normalizeGroupCommandAlias(itemAlias)));
+    }
+    settings.aliases[draft.command] = aliases;
+    await saveGroupCommandSettings(draft.chatId, settings);
+    pointsInputDrafts.delete(ctx.from.id);
+    await ctx.reply(pointAliasSavedText(locale), { parse_mode: "HTML", reply_markup: pointsBackKeyboard(draft.chatId, locale) });
+    return true;
+  }
+
+  if (draft.kind === "exchange_keyword") {
+    const settings = await getPointExchangeSettings(draft.chatId);
+    settings.keyword = text.slice(0, 32);
+    await savePointExchangeSettings(draft.chatId, settings);
+    pointsInputDrafts.delete(ctx.from.id);
+    await ctx.reply(locale === "zh-CN" ? "兑换关键词已更新。" : "Exchange keyword updated.", {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `points:exchange:${draft.chatId}`)
+    });
+    return true;
+  }
+
+  if (draft.kind === "adjust_user") {
+    const target = await findPointTargetUser(chat.id, text);
+    if (!target) {
+      await ctx.reply(locale === "zh-CN" ? "找不到该用户，请输入已在本群产生记录的用户名或用户ID。" : "User not found. Send a username or user ID already known in this group.", {
+        parse_mode: "HTML",
+        reply_markup: pointsBackKeyboard(draft.chatId, locale)
+      });
+      return true;
+    }
+    pointsInputDrafts.set(ctx.from.id, { chatId: draft.chatId, kind: "adjust_amount", targetUserId: target.id });
+    await ctx.reply(pointAdjustAmountPromptText(target, locale), {
+      parse_mode: "HTML",
+      reply_markup: pointsBackKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
+  if (draft.kind === "adjust_amount") {
+    const delta = Number(text);
+    if (!Number.isInteger(delta) || delta === 0) {
+      await ctx.reply(locale === "zh-CN" ? "请输入非 0 整数，例如 <code>10</code> 或 <code>-10</code>。" : "Send a non-zero integer, for example <code>10</code> or <code>-10</code>.", {
+        parse_mode: "HTML",
+        reply_markup: pointsBackKeyboard(draft.chatId, locale)
+      });
+      return true;
+    }
+    const actor = await upsertTelegramUser(ctx.from, config.defaultTimezone);
+    const balance = await addPoints(draft.chatId, draft.targetUserId, delta, PointTransactionType.MANUAL, null, actor.id);
+    pointsInputDrafts.delete(ctx.from.id);
+    await ctx.reply(locale === "zh-CN" ? `已调整，当前积分：${balance}` : `Adjusted. Current points: ${balance}`, {
+      parse_mode: "HTML",
+      reply_markup: pointsBackKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
+  const settings = await getPointExchangeSettings(draft.chatId);
+  const product = settings.products.find((item) => item.id === draft.productId);
+  if (!product) {
+    pointsInputDrafts.delete(ctx.from.id);
+    await openProductsPanel(ctx, locale, chat);
+    return true;
+  }
+
+  if (draft.kind === "product_name") {
+    product.name = text.slice(0, 64);
+  } else if (draft.kind === "product_cost") {
+    const cost = parseNonNegativeInteger(text);
+    if (cost === null || cost <= 0) {
+      await ctx.reply(productInputPromptText(draft.kind, locale), { parse_mode: "HTML", reply_markup: new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `points:product:${draft.chatId}:${draft.productId}`) });
+      return true;
+    }
+    product.cost = clampNumber(cost, 1, 1000000);
+  } else if (draft.kind === "product_daily_limit") {
+    const dailyLimit = parseNonNegativeInteger(text);
+    if (dailyLimit === null) {
+      await ctx.reply(productInputPromptText(draft.kind, locale), { parse_mode: "HTML", reply_markup: new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `points:product:${draft.chatId}:${draft.productId}`) });
+      return true;
+    }
+    product.dailyLimit = clampNumber(dailyLimit, 0, 1000000);
+  } else if (draft.kind === "product_codes") {
+    product.codes = parsePointProductCodes(text);
+  }
+
+  await savePointExchangeSettings(draft.chatId, settings);
+  pointsInputDrafts.delete(ctx.from.id);
+  await ctx.reply(locale === "zh-CN" ? "商品设置已更新。" : "Product updated.", {
+    parse_mode: "HTML",
+    reply_markup: new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `points:product:${draft.chatId}:${draft.productId}`)
+  });
+  return true;
+}
+
+async function handleGroupCommandAliasInputMessage(ctx: Context, locale: Locale) {
+  if (!ctx.from) return false;
+  const draft = groupCommandAliasInputDrafts.get(ctx.from.id);
+  if (!draft) return false;
+
+  const chat = await ensureControlPermissionForChatId(ctx, draft.chatId, locale);
+  if (!chat) {
+    groupCommandAliasInputDrafts.delete(ctx.from.id);
+    return true;
+  }
+
+  const text = getMessageText(ctx.message);
+  const aliases = text ? parseGroupCommandAliases(text) : [];
+  if (!aliases.length) {
+    await ctx.reply(groupCommandAliasInputPromptText(draft.mode, draft.command, locale), {
+      parse_mode: "HTML",
+      reply_markup: groupCommandAliasInputKeyboard(draft.chatId, draft.command, locale)
+    });
+    return true;
+  }
+
+  const settings = await getGroupCommandSettings(draft.chatId);
+  const current = new Set(settings.aliases[draft.command].map(normalizeGroupCommandAlias));
+  let changed = 0;
+  if (draft.mode === "add") {
+    for (const alias of aliases) {
+      const normalized = normalizeGroupCommandAlias(alias);
+      if (!normalized) continue;
+      for (const item of groupCommandDefinitions) {
+        if (item.key !== draft.command) {
+          settings.aliases[item.key] = settings.aliases[item.key].filter((itemAlias) => normalizeGroupCommandAlias(itemAlias) !== normalized);
+        }
+      }
+      if (!current.has(normalized)) {
+        current.add(normalized);
+        changed += 1;
+      }
+    }
+  } else {
+    for (const alias of aliases) {
+      if (current.delete(normalizeGroupCommandAlias(alias))) changed += 1;
+    }
+  }
+
+  const nextAliases = [...current].filter(Boolean).sort((a, b) => a.localeCompare(b));
+  settings.aliases[draft.command] = nextAliases;
+  await saveGroupCommandSettings(draft.chatId, settings);
+  groupCommandAliasInputDrafts.delete(ctx.from.id);
+  await ctx.reply(groupCommandAliasSavedText(changed, draft.mode, locale), {
+    parse_mode: "HTML",
+    reply_markup: groupCommandAliasDetailKeyboard(chat.id, draft.command, locale)
+  });
+  return true;
+}
+
 async function handleIncomingMessage(ctx: Context, config: AppConfig) {
   const message = ctx.message;
   if (!message || !ctx.chat) return;
@@ -5223,6 +6837,10 @@ async function handleIncomingMessage(ctx: Context, config: AppConfig) {
   if (chat && ctx.from && isGroupLike(ctx.chat)) {
     await recordMessageStat(chat.id, ctx.from, config.defaultTimezone);
     await maybeRecordMemberCountSnapshot(ctx, chat);
+  }
+
+  if (chat) {
+    await maybeHandleGroupMembersMessage(ctx, chat, message);
   }
 
   if ("new_chat_members" in message && message.new_chat_members?.length) {
@@ -5240,9 +6858,26 @@ async function handleIncomingMessage(ctx: Context, config: AppConfig) {
   }
 
   if (chat) {
+    if (await maybeHandleGroupCommandAlias(ctx, config, chat, message)) return;
+    if (await handleAntiSpamMessage(ctx, chat, message, await getLocale(ctx))) return;
     if (await maybeHandleBannedWords(ctx, chat, message)) return;
+    if (await maybeHandlePointExchangeKeyword(ctx, chat, message)) return;
+    await maybeRewardSpeechPoints(ctx, config, chat, message);
     await maybeSendAutoReply(ctx, chat.id, message);
     await maybeAutoDelete(ctx, chat.id, message);
+  }
+}
+
+async function maybeHandleGroupMembersMessage(ctx: Context, chat: PrismaChat, message: Message) {
+  if (!ctx.chat || !isGroupLike(ctx.chat)) return;
+
+  const settings = await getGroupMembersSettings(chat.id);
+  if (ctx.from && !ctx.from.is_bot) {
+    await maybeNotifyMemberProfileChange(ctx, chat, ctx.from, settings);
+  }
+
+  if (settings.unpinLinkedChannelMessages) {
+    await maybeUnpinLinkedChannelMessage(ctx, message);
   }
 }
 
@@ -5298,6 +6933,7 @@ async function handleBlocklistNewMember(ctx: Context, chat: PrismaChat, member: 
 
   if (settings.blockBots && member.is_bot) {
     await banUser(ctx, Number(chat.telegramChatId), member.id);
+    await applyBlocklistBotAdderPunishment(ctx, chat, member, settings);
     return true;
   }
 
@@ -5313,7 +6949,7 @@ async function handleBlocklistJoinRequest(ctx: Context, chat: PrismaChat, reques
   const settings = await getBlocklistSettings(chat.id);
   const now = Date.now();
 
-  if (settings.blockBots && request.from.is_bot) {
+  if (settings.blockBotPunishment !== "off" && request.from.is_bot) {
     await declineJoinRequest(ctx, request);
     return true;
   }
@@ -5347,6 +6983,38 @@ async function handleBlocklistLeftChatMember(ctx: Context, member: User) {
   ) {
     await banUser(ctx, ctx.chat.id, member.id);
   }
+}
+
+async function applyBlocklistBotAdderPunishment(
+  ctx: Context,
+  chat: PrismaChat,
+  botUser: User,
+  settings: BlocklistSettings
+) {
+  const actor = ctx.from;
+  if (!actor || actor.id === botUser.id || actor.is_bot || settings.blockBotPunishment === "off") return;
+
+  const telegramChatId = Number(chat.telegramChatId);
+  if (settings.blockBotPunishment === "warn") {
+    await ctx.api.sendMessage(
+      telegramChatId,
+      `${displayName(actor)} 添加了机器人 ${displayName(botUser)}，已警告。`,
+      { parse_mode: "HTML" }
+    ).catch(() => undefined);
+    return;
+  }
+
+  if (settings.blockBotPunishment === "mute") {
+    await muteUser(ctx, telegramChatId, actor.id, 60);
+    return;
+  }
+
+  if (settings.blockBotPunishment === "kick") {
+    await kickUser(ctx, telegramChatId, actor.id);
+    return;
+  }
+
+  await banUser(ctx, telegramChatId, actor.id);
 }
 
 async function handleVerificationCallback(ctx: Context) {
@@ -5820,6 +7488,15 @@ async function handleInfoCommand(ctx: Context, config: AppConfig) {
   await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
 }
 
+async function handleCancelCommand(ctx: Context, config: AppConfig) {
+  const locale = await getLocale(ctx);
+  if (ctx.from) clearUserInputState(ctx.from.id);
+  await ctx.reply(mainMenuText(locale, ctx.from?.first_name, config.botUsername), {
+    parse_mode: "HTML",
+    reply_markup: mainMenuKeyboard(locale)
+  });
+}
+
 async function handleBindCommand(ctx: Context, config: AppConfig) {
   const locale = await getLocale(ctx);
   if (!ctx.chat || !ctx.from || ctx.chat.type === "private") {
@@ -5861,6 +7538,28 @@ async function handlePermissionsCommand(ctx: Context) {
       ? (locale === "zh-CN" ? "Bot 权限检查通过。" : "Bot permissions look good.")
       : `${locale === "zh-CN" ? "Bot 缺少权限：" : "Missing permissions:"}\n${report.missingPermissions.join("\n")}`
   );
+}
+
+async function maybeHandleGroupCommandAlias(ctx: Context, config: AppConfig, chat: PrismaChat, message: Message) {
+  if (!ctx.chat || !isGroupLike(ctx.chat) || !ctx.from) return false;
+  const alias = extractGroupCommandAlias(message);
+  if (!alias) return false;
+
+  const settings = await getGroupCommandSettings(chat.id);
+  const matched = groupCommandDefinitions.find((item) =>
+    settings.aliases[item.key].some((itemAlias) => normalizeGroupCommandAlias(itemAlias) === alias)
+  );
+  if (!matched) return false;
+
+  if (matched.key === "link") await handleInviteLinkCommand(ctx, config);
+  if (matched.key === "sign_in") await handleSignInCommand(ctx, config);
+  if (matched.key === "points_rank") await handlePointsRankCommand(ctx);
+  if (matched.key === "points") await handlePointsCommand(ctx, config);
+  if (matched.key === "stat") await handleStatsCommand(ctx, config, 1);
+  if (matched.key === "stat_week") await handleStatsCommand(ctx, config, 7);
+  if (matched.key === "stats") await handleStatsCommand(ctx, config, 30);
+  if (matched.key === "lottery") await handleLotteryCommand(ctx);
+  return true;
 }
 
 async function ensureGroupCommandEnabled(ctx: Context, chat: PrismaChat, key: GroupCommandKey, locale: Locale) {
@@ -5937,11 +7636,21 @@ async function handleSignInCommand(ctx: Context, config: AppConfig) {
 
   if (!(await ensureGroupCommandEnabled(ctx, chat, "sign_in", locale))) return;
 
+  const settings = await getPointsSettings(chat.id);
+  if (!settings.enabled || settings.signInPoints <= 0) {
+    await ctx.reply(locale === "zh-CN" ? "本群积分功能未开启。" : "Points are disabled in this group.");
+    return;
+  }
+
   const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
   const statDate = formatDate(new Date());
   const referenceKey = `sign_in:${chat.id}:${user.id}:${statDate}`;
-  const balance = await addPoints(chat.id, user.id, 1, PointTransactionType.SIGN_IN, referenceKey, null);
-  await ctx.reply(locale === "zh-CN" ? `签到成功，当前积分：${balance}` : `Signed in. Current points: ${balance}`);
+  const balance = await addPoints(chat.id, user.id, settings.signInPoints, PointTransactionType.SIGN_IN, referenceKey, null, statDate);
+  const sent = await ctx.reply(locale === "zh-CN" ? `签到成功，当前积分：${balance}` : `Signed in. Current points: ${balance}`);
+  if (settings.deleteSignInMessage) {
+    scheduleTelegramMessageDelete(ctx, ctx.chat.id, sent.message_id, settings.deleteSignInSeconds);
+    if (ctx.message?.message_id) scheduleTelegramMessageDelete(ctx, ctx.chat.id, ctx.message.message_id, settings.deleteSignInSeconds);
+  }
 }
 
 async function handlePointsRankCommand(ctx: Context) {
@@ -5977,21 +7686,38 @@ async function handlePointsCommand(ctx: Context, config: AppConfig) {
 
   if (!(await ensureGroupCommandEnabled(ctx, chat, "points", locale))) return;
 
+  const replyUser = "reply_to_message" in ctx.message! ? ctx.message!.reply_to_message?.from : undefined;
+  const text = "text" in ctx.message! ? ctx.message!.text ?? "" : "";
+  const parts = text.split(/\s+/).filter(Boolean);
+  const targetInput = !replyUser && parts.length >= 3 ? parts[1] : undefined;
+  const rawDelta = targetInput ? parts[2] : parts[1];
+
+  if (!replyUser && !targetInput && !rawDelta) {
+    const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
+    const current = await prisma.chatPointBalance.findUnique({ where: { chatId_userId: { chatId: chat.id, userId: user.id } } });
+    await ctx.reply(locale === "zh-CN" ? `当前积分：${current?.balance ?? 0}` : `Current points: ${current?.balance ?? 0}`);
+    return;
+  }
+
   const isAdmin = await isUserChatAdmin(ctx, ctx.chat.id, ctx.from.id).catch(() => false);
   if (!isAdmin) {
     await ctx.reply(locale === "zh-CN" ? "只有管理员可以增减积分。" : "Only admins can adjust points.");
     return;
   }
 
-  const replyUser = "reply_to_message" in ctx.message! ? ctx.message!.reply_to_message?.from : undefined;
-  const text = "text" in ctx.message! ? ctx.message!.text ?? "" : "";
-  const delta = Number(text.split(/\s+/)[1]);
-  if (!replyUser || !Number.isInteger(delta)) {
-    await ctx.reply(locale === "zh-CN" ? "请回复用户消息并发送 /points 数字。" : "Reply to a user and send /points number.");
+  const delta = Number(rawDelta);
+  if (!Number.isInteger(delta)) {
+    await ctx.reply(locale === "zh-CN" ? "请回复用户消息并发送 /points 数字，或发送 /points @用户名 数字。" : "Reply to a user and send /points number, or send /points @username number.");
     return;
   }
 
-  const user = await upsertTelegramUser(replyUser, config.defaultTimezone);
+  const user = replyUser
+    ? await upsertTelegramUser(replyUser, config.defaultTimezone)
+    : targetInput ? await findPointTargetUser(chat.id, targetInput) : null;
+  if (!user) {
+    await ctx.reply(locale === "zh-CN" ? "找不到该用户。" : "User not found.");
+    return;
+  }
   const actor = await upsertTelegramUser(ctx.from, config.defaultTimezone);
   const balance = await addPoints(chat.id, user.id, delta, PointTransactionType.MANUAL, null, actor.id);
   await ctx.reply(locale === "zh-CN" ? `已调整，当前积分：${balance}` : `Adjusted. Current points: ${balance}`);
@@ -6043,6 +7769,642 @@ async function handleLotteryCommand(ctx: Context) {
   await ctx.reply(lines.join("\n"), { reply_markup: keyboard });
 }
 
+async function handleGiveawayCallback(ctx: Context, config: AppConfig) {
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  const parts = ctx.callbackQuery?.data?.split(":") ?? [];
+  const action = parts[1];
+  const chatId = action === "type" || action === "draw" ? parts[3] : parts[2];
+  if (!action || !chatId || action === "join") return;
+
+  const locale = await getLocale(ctx);
+  const chat = await ensureControlPermissionForChatId(ctx, chatId, locale);
+  if (!chat) return;
+
+  if (action === "create") {
+    if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    await editOrReply(ctx, giveawayTypeSelectText(chat, locale), giveawayTypeSelectKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "types") {
+    if (ctx.from) giveawayInputDrafts.delete(ctx.from.id);
+    await editOrReply(ctx, giveawayTypeSelectText(chat, locale), giveawayTypeSelectKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "type" && isGiveawayCreateType(parts[2])) {
+    if (parts[2] !== "common") {
+      await editOrReply(ctx, giveawayTypeUnavailableText(parts[2], locale), giveawayTypeSelectKeyboard(chatId, locale));
+      return;
+    }
+    if (ctx.from) giveawayInputDrafts.delete(ctx.from.id);
+    await editOrReply(ctx, commonGiveawayDrawModeText(locale), commonGiveawayDrawModeKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "draw" && isGiveawayDrawMode(parts[2])) {
+    if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    if (parts[2] === "full") {
+      giveawayInputDrafts.set(ctx.from.id, { chatId, type: "common", drawMode: "full", stage: "target_count" });
+      await editOrReply(ctx, commonGiveawayTargetCountPromptText(locale), giveawayCreateCancelKeyboard(chatId, locale));
+      return;
+    }
+    giveawayInputDrafts.set(ctx.from.id, { chatId, type: "common", drawMode: "timed", stage: "draw_at" });
+    await editOrReply(ctx, commonGiveawayDrawAtPromptText(locale), giveawayCreateCancelKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "cancel") {
+    if (ctx.from) giveawayInputDrafts.delete(ctx.from.id);
+    await openGiveawayPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "records") {
+    await openGiveawayRecordsPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "settings") {
+    await openGiveawaySettingsPanel(ctx, locale, chat);
+    return;
+  }
+
+  await openGiveawayPanel(ctx, locale, chat);
+}
+
+async function handleGiveawayInputMessage(ctx: Context, config: AppConfig, locale: Locale) {
+  if (!ctx.from) return false;
+  const draft = giveawayInputDrafts.get(ctx.from.id);
+  if (!draft) return false;
+
+  const chat = await ensureControlPermissionForChatId(ctx, draft.chatId, locale);
+  if (!chat) {
+    giveawayInputDrafts.delete(ctx.from.id);
+    return true;
+  }
+
+  const text = ctx.message && "text" in ctx.message ? ctx.message.text ?? "" : "";
+
+  if (draft.stage === "target_count") {
+    const targetCount = Number(text.trim());
+    if (!Number.isSafeInteger(targetCount) || targetCount < 1 || targetCount > 100000) {
+      await ctx.reply(locale === "zh-CN" ? "参与人数必须是 1 到 100000 的整数。" : "Participant count must be an integer from 1 to 100000.", {
+        parse_mode: "HTML",
+        reply_markup: giveawayCreateCancelKeyboard(draft.chatId, locale)
+      });
+      return true;
+    }
+    draft.targetCount = targetCount;
+    draft.stage = "details";
+    await ctx.reply(commonGiveawayDetailsPromptText(draft, locale), {
+      parse_mode: "HTML",
+      reply_markup: giveawayCreateCancelKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
+  if (draft.stage === "draw_at") {
+    const drawAt = parseGiveawayDrawAt(text);
+    if (!drawAt || drawAt.getTime() <= Date.now()) {
+      await ctx.reply(
+        locale === "zh-CN"
+          ? "开奖时间必须是未来时间，格式：<code>2026-08-03 17:45:24</code>，也支持 <code>30分钟</code>、<code>2小时</code>。"
+          : "Draw time must be in the future, for example <code>2026-08-03 17:45:24</code>, <code>30 minutes</code>, or <code>2 hours</code>.",
+        {
+          parse_mode: "HTML",
+          reply_markup: giveawayCreateCancelKeyboard(draft.chatId, locale)
+        }
+      );
+      return true;
+    }
+    draft.drawAt = drawAt;
+    draft.stage = "details";
+    await ctx.reply(commonGiveawayDetailsPromptText(draft, locale), {
+      parse_mode: "HTML",
+      reply_markup: giveawayCreateCancelKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
+  const parsed = parseCommonGiveawayDetailsInput(text, locale);
+  if (!parsed.value) {
+    await ctx.reply(parsed.error, {
+      parse_mode: "HTML",
+      reply_markup: giveawayCreateCancelKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
+  const drawAt = draft.drawMode === "timed" && draft.drawAt ? draft.drawAt : fallbackFullGiveawayDrawAt();
+  const joinRequirements: Prisma.InputJsonObject = {
+    type: draft.type,
+    entry: "keyword",
+    keyword: parsed.value.keyword,
+    drawMode: draft.drawMode ?? "timed",
+    ...(draft.targetCount ? { targetCount: draft.targetCount } : {})
+  };
+  const creator = await upsertTelegramUser(ctx.from, config.defaultTimezone);
+  const giveaway = await prisma.giveaway.create({
+    data: {
+      chatId: chat.id,
+      title: parsed.value.title,
+      prize: parsed.value.prize,
+      winnersCount: parsed.value.winnersCount,
+      joinRequirements,
+      drawAt,
+      status: GiveawayStatus.ACTIVE,
+      createdBy: creator.id
+    }
+  });
+
+  if (draft.drawMode === "timed") {
+    await enqueueGiveawayDraw(giveaway.id, giveaway.drawAt);
+  }
+  await prisma.auditLog.create({
+    data: {
+      chatId: chat.id,
+      actorUserId: creator.id,
+      action: "giveaway.created",
+      targetType: "giveaway",
+      targetId: giveaway.id,
+      metadata: {
+        title: giveaway.title,
+        prize: giveaway.prize,
+        winnersCount: giveaway.winnersCount,
+        keyword: parsed.value.keyword,
+        drawMode: draft.drawMode,
+        targetCount: draft.targetCount,
+        drawAt: giveaway.drawAt.toISOString()
+      }
+    }
+  });
+
+  const announced = await sendGiveawayAnnouncement(ctx, chat, giveaway, locale).then(() => true).catch(() => false);
+  giveawayInputDrafts.delete(ctx.from.id);
+
+  await ctx.reply(
+    [
+      locale === "zh-CN" ? "抽奖活动已创建。" : "Giveaway created.",
+      announced
+        ? (locale === "zh-CN" ? "已发送参与按钮到目标群/频道。" : "The join button has been posted to the target chat.")
+        : (locale === "zh-CN" ? "未能发送到目标群/频道，请检查 Bot 发送消息权限；用户仍可通过 /lottery 参与。" : "Could not post to the target chat. Check bot send-message permission; users can still join with /lottery.")
+    ].join("\n"),
+    { reply_markup: giveawayBackKeyboard(chat.id, locale) }
+  );
+  return true;
+}
+
+function giveawayTypeSelectText(chat: PrismaChat, locale: Locale) {
+  const title = escapeHtml(chat.title ?? chat.username ?? String(chat.telegramChatId));
+  return locale === "zh-CN"
+    ? [
+        `🎁 <b>${title} 发起抽奖</b>`,
+        "",
+        "🔥 <b>通用抽奖:</b>群员在群内回复指定关键词参与抽奖",
+        "",
+        "Ⓜ️ <b>积分抽奖:</b>群员在群内点击按钮，消耗积分抽奖",
+        "",
+        "🥰 <b>群活跃抽奖:</b>根据活跃排名抽奖，或达到活跃度参与随机抽奖",
+        "",
+        "🪁 <b>邀请人数抽奖:</b>群成员用专属链接拉人进群，到指定人数后参与抽奖",
+        "",
+        "🙋‍♂️ <b>指定群报道抽奖:</b>A群成员进入B群回复指定关键词参与抽奖",
+        "",
+        "🎰 <b>娱乐抽奖:</b>水果机、摇骰子、飞镖、保龄球...",
+        "",
+        "<b>选择抽奖类型:</b>"
+      ].join("\n")
+    : [
+        `🎁 <b>${title} Create Giveaway</b>`,
+        "",
+        "🔥 <b>General:</b> members reply with a keyword in the group to join.",
+        "",
+        "Ⓜ️ <b>Points:</b> members spend points to join by button.",
+        "",
+        "🥰 <b>Activity:</b> draw from activity ranking or activity-qualified members.",
+        "",
+        "🪁 <b>Invites:</b> members join after inviting enough users with their own links.",
+        "",
+        "🙋‍♂️ <b>Report-in:</b> members from group A reply with a keyword in group B.",
+        "",
+        "🎰 <b>Fun:</b> slots, dice, darts, bowling...",
+        "",
+        "<b>Choose giveaway type:</b>"
+      ].join("\n");
+}
+
+function giveawayTypeSelectKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "🔥通用抽奖" : "🔥 General", `giveaway:type:common:${chatId}`)
+    .text(locale === "zh-CN" ? "Ⓜ️积分抽奖" : "Ⓜ️ Points", `giveaway:type:points:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🥰群活跃抽奖" : "🥰 Activity", `giveaway:type:active:${chatId}`)
+    .text(locale === "zh-CN" ? "🪁邀请人数抽奖" : "🪁 Invites", `giveaway:type:invite:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🙋‍♂️指定群报道抽奖" : "🙋‍♂️ Report-in", `giveaway:type:report:${chatId}`)
+    .text(locale === "zh-CN" ? "🎰娱乐抽奖" : "🎰 Fun", `giveaway:type:fun:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `chat_feature:giveaway:${chatId}`);
+}
+
+function commonGiveawayDrawModeText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "🎁创建<b>通用抽奖</b>",
+        "",
+        "抽奖:群员在群内回复指定关键词参与抽奖",
+        "",
+        "选择开奖方式:"
+      ].join("\n")
+    : [
+        "🎁 Create <b>General Giveaway</b>",
+        "",
+        "Members reply with a keyword in the group to join.",
+        "",
+        "Choose draw mode:"
+      ].join("\n");
+}
+
+function commonGiveawayDrawModeKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "满人开奖" : "Draw when full", `giveaway:draw:full:${chatId}`)
+    .text(locale === "zh-CN" ? "定时开奖" : "Scheduled draw", `giveaway:draw:timed:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回选择抽奖类型" : "🔙 Back to types", `giveaway:types:${chatId}`);
+}
+
+function giveawayTypeUnavailableText(type: GiveawayCreateType, locale: Locale) {
+  const label = giveawayCreateTypeLabel(type, locale);
+  return locale === "zh-CN"
+    ? [
+        `<b>${label}</b>`,
+        "",
+        "该抽奖类型的配置流程暂未接入。当前已接入可用闭环：通用抽奖。"
+      ].join("\n")
+    : [
+        `<b>${label}</b>`,
+        "",
+        "This giveaway type is not wired yet. General giveaways are available now."
+      ].join("\n");
+}
+
+function giveawayCreateTypeLabel(type: GiveawayCreateType, locale: Locale) {
+  const labels: Record<GiveawayCreateType, { zh: string; en: string }> = {
+    common: { zh: "🔥通用抽奖", en: "🔥 General giveaway" },
+    points: { zh: "Ⓜ️积分抽奖", en: "Ⓜ️ Points giveaway" },
+    active: { zh: "🥰群活跃抽奖", en: "🥰 Activity giveaway" },
+    invite: { zh: "🪁邀请人数抽奖", en: "🪁 Invite giveaway" },
+    report: { zh: "🙋‍♂️指定群报道抽奖", en: "🙋‍♂️ Report-in giveaway" },
+    fun: { zh: "🎰娱乐抽奖", en: "🎰 Fun giveaway" }
+  };
+  return locale === "zh-CN" ? labels[type].zh : labels[type].en;
+}
+
+function commonGiveawayTargetCountPromptText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "🎁创建<b>通用抽奖</b>  ( <code>/cancel</code> 命令返回首页)",
+        "",
+        "👉 请回复参与多少人后开奖:"
+      ].join("\n")
+    : [
+        "🎁 Create <b>General Giveaway</b>  (send <code>/cancel</code> to return home)",
+        "",
+        "👉 Send how many participants are needed before drawing:"
+      ].join("\n");
+}
+
+function commonGiveawayDrawAtPromptText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "请回复<strong>开奖时间:</strong>",
+        "格式:年-月-日 时:分",
+        "例如:<code>2026-08-03 17:45:24</code>"
+      ].join("\n")
+    : [
+        "Send the <strong>draw time:</strong>",
+        "Format: year-month-day hour:minute",
+        "Example:<code>2026-08-03 17:45:24</code>"
+      ].join("\n");
+}
+
+function commonGiveawayDetailsPromptText(draft: GiveawayInputDraft, locale: Locale) {
+  const modeLine = draft.drawMode === "full"
+    ? (locale === "zh-CN" ? `满 <b>${draft.targetCount}</b> 人开奖` : `Draw when <b>${draft.targetCount}</b> members join`)
+    : `${locale === "zh-CN" ? "开奖时间" : "Draw at"}: <b>${formatDateTimeForDisplay(draft.drawAt ?? new Date())}</b>`;
+  return locale === "zh-CN"
+    ? [
+        "🎁创建<b>通用抽奖</b>",
+        "",
+        modeLine,
+        "",
+        "请按以下格式发送：",
+        "<code>标题 | 奖品 | 中奖人数 | 参与关键词</code>",
+        "",
+        "示例：",
+        "<code>测试抽奖 | 100U | 1 | 抽奖</code>"
+      ].join("\n")
+    : [
+        "🎁 Create <b>General Giveaway</b>",
+        "",
+        modeLine,
+        "",
+        "Send in this format:",
+        "<code>Title | Prize | Winners | Join keyword</code>",
+        "",
+        "Example:",
+        "<code>Test giveaway | 100U | 1 | lucky</code>"
+      ].join("\n");
+}
+
+function giveawayCreateCancelKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `giveaway:cancel:${chatId}`);
+}
+
+function parseCommonGiveawayDetailsInput(input: string, locale: Locale): {
+  value?: { title: string; prize: string; winnersCount: number; keyword: string };
+  error: string;
+} {
+  const error = locale === "zh-CN"
+    ? [
+        "格式不正确，请按以下格式发送：",
+        "<code>标题 | 奖品 | 中奖人数 | 参与关键词</code>"
+      ].join("\n")
+    : [
+        "Invalid format. Send in this format:",
+        "<code>Title | Prize | Winners | Join keyword</code>"
+      ].join("\n");
+  const parts = input.split("|").map((item) => item.trim());
+  if (parts.length !== 4) return { error };
+
+  const [title = "", prize = "", winnersRaw = "", keyword = ""] = parts;
+  if (!title || title.length > 255) {
+    return { error: locale === "zh-CN" ? "标题不能为空，且不能超过 255 个字符。" : "Title is required and must be 255 characters or fewer." };
+  }
+  if (!prize || prize.length > 255) {
+    return { error: locale === "zh-CN" ? "奖品不能为空，且不能超过 255 个字符。" : "Prize is required and must be 255 characters or fewer." };
+  }
+
+  const winnersCount = Number(winnersRaw);
+  if (!Number.isSafeInteger(winnersCount) || winnersCount < 1 || winnersCount > 100) {
+    return { error: locale === "zh-CN" ? "中奖人数必须是 1 到 100 的整数。" : "Winners must be an integer from 1 to 100." };
+  }
+  if (!keyword || keyword.length > 64 || keyword.includes("|")) {
+    return { error: locale === "zh-CN" ? "参与关键词不能为空，且不能超过 64 个字符。" : "Join keyword is required and must be 64 characters or fewer." };
+  }
+
+  return { value: { title, prize, winnersCount, keyword }, error: "" };
+}
+
+function parseGiveawayDrawAt(input: string) {
+  const durationMinutes = parseScheduleDurationMinutes(input);
+  if (durationMinutes) return new Date(Date.now() + durationMinutes * 60_000);
+  return parseScheduleDateTime(input);
+}
+
+function fallbackFullGiveawayDrawAt() {
+  const date = new Date();
+  date.setFullYear(date.getFullYear() + 10);
+  return date;
+}
+
+function isGiveawayCreateType(value: string | undefined): value is GiveawayCreateType {
+  return value === "common"
+    || value === "points"
+    || value === "active"
+    || value === "invite"
+    || value === "report"
+    || value === "fun";
+}
+
+function isGiveawayDrawMode(value: string | undefined): value is GiveawayDrawMode {
+  return value === "full" || value === "timed";
+}
+
+async function sendGiveawayAnnouncement(
+  ctx: Context,
+  chat: PrismaChat,
+  giveaway: { id: string; title: string; prize: string; winnersCount: number; drawAt: Date; joinRequirements?: Prisma.JsonValue | null },
+  locale: Locale
+) {
+  const requirements = getCommonGiveawayRequirements(giveaway.joinRequirements);
+  const options = requirements
+    ? { parse_mode: "HTML" as const }
+    : {
+        parse_mode: "HTML" as const,
+        reply_markup: new InlineKeyboard().text(locale === "zh-CN" ? "🎁 参与抽奖" : "🎁 Join giveaway", `giveaway:join:${giveaway.id}`)
+      };
+  await ctx.api.sendMessage(
+    Number(chat.telegramChatId),
+    giveawayAnnouncementText(giveaway, requirements, locale),
+    options
+  );
+}
+
+function giveawayAnnouncementText(
+  giveaway: { title: string; prize: string; winnersCount: number; drawAt: Date },
+  requirements: CommonGiveawayRequirements | null,
+  locale: Locale
+) {
+  const drawLine = requirements?.drawMode === "full" && requirements.targetCount
+    ? (locale === "zh-CN" ? `满 <b>${requirements.targetCount}</b> 人自动开奖` : `Draws when <b>${requirements.targetCount}</b> members join`)
+    : `${locale === "zh-CN" ? "开奖时间" : "Draw at"}: <b>${formatDateTimeForDisplay(giveaway.drawAt)}</b>`;
+  const joinLine = requirements
+    ? (
+        locale === "zh-CN"
+          ? `回复关键词 <code>${escapeHtml(requirements.keyword)}</code> 参与抽奖。`
+          : `Reply with <code>${escapeHtml(requirements.keyword)}</code> to join.`
+      )
+    : (locale === "zh-CN" ? "点击下方按钮参与抽奖。" : "Tap the button below to join.");
+
+  return locale === "zh-CN"
+    ? [
+        `🎁 <b>${escapeHtml(giveaway.title)}</b>`,
+        "",
+        `奖品: <b>${escapeHtml(giveaway.prize)}</b>`,
+        `中奖人数: <b>${giveaway.winnersCount}</b>`,
+        drawLine,
+        "",
+        joinLine
+      ].join("\n")
+    : [
+        `🎁 <b>${escapeHtml(giveaway.title)}</b>`,
+        "",
+        `Prize: <b>${escapeHtml(giveaway.prize)}</b>`,
+        `Winners: <b>${giveaway.winnersCount}</b>`,
+        drawLine,
+        "",
+        joinLine
+      ].join("\n");
+}
+
+function getCommonGiveawayRequirements(value: Prisma.JsonValue | null | undefined): CommonGiveawayRequirements | null {
+  if (!isRecord(value)) return null;
+  if (value.type !== "common" || value.entry !== "keyword") return null;
+  if (typeof value.keyword !== "string" || !value.keyword.trim()) return null;
+  const drawMode = typeof value.drawMode === "string" ? value.drawMode : undefined;
+  if (!isGiveawayDrawMode(drawMode)) return null;
+  const targetCount = Number(value.targetCount);
+  return {
+    type: "common",
+    entry: "keyword",
+    keyword: value.keyword.trim(),
+    drawMode,
+    ...(Number.isSafeInteger(targetCount) && targetCount > 0 ? { targetCount } : {})
+  };
+}
+
+async function handleGiveawayKeywordEntry(ctx: Context, config: AppConfig, locale: Locale) {
+  if (!ctx.chat || !ctx.from || !isGroupLike(ctx.chat)) return false;
+  const message = ctx.message;
+  if (!message) return false;
+  const messageText = (getMessageText(message) ?? "").trim();
+  if (!messageText) return false;
+
+  const chat = await getActiveChatByTelegramId(ctx.chat.id);
+  if (!chat) return false;
+
+  const giveaways = await prisma.giveaway.findMany({
+    where: { chatId: chat.id, status: GiveawayStatus.ACTIVE },
+    orderBy: { createdAt: "desc" },
+    take: 50
+  });
+  const matched = giveaways.filter((giveaway) => {
+    const requirements = getCommonGiveawayRequirements(giveaway.joinRequirements);
+    return requirements?.keyword === messageText;
+  });
+  if (!matched.length) return false;
+
+  const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
+  for (const giveaway of matched) {
+    await prisma.giveawayEntry.upsert({
+      where: { giveawayId_userId: { giveawayId: giveaway.id, userId: user.id } },
+      create: { giveawayId: giveaway.id, userId: user.id },
+      update: { isValid: true }
+    });
+    await maybeDrawGiveawayWhenFull(ctx, giveaway.id, locale);
+  }
+
+  await ctx.reply(
+    matched.length === 1
+      ? (locale === "zh-CN" ? "已参与抽奖。" : "Joined the giveaway.")
+      : (locale === "zh-CN" ? `已参与 ${matched.length} 个抽奖。` : `Joined ${matched.length} giveaways.`)
+  ).catch(() => undefined);
+  return true;
+}
+
+async function maybeDrawGiveawayWhenFull(ctx: Context, giveawayId: string, locale: Locale) {
+  const giveaway = await prisma.giveaway.findUnique({
+    where: { id: giveawayId },
+    select: { joinRequirements: true }
+  });
+  const requirements = getCommonGiveawayRequirements(giveaway?.joinRequirements);
+  if (requirements?.drawMode !== "full" || !requirements.targetCount) return;
+
+  const count = await prisma.giveawayEntry.count({ where: { giveawayId, isValid: true } });
+  if (count < requirements.targetCount) return;
+  await drawGiveawayNow(ctx, giveawayId, locale);
+}
+
+async function drawGiveawayNow(ctx: Context, giveawayId: string, locale: Locale) {
+  const giveaway = await prisma.giveaway.findUnique({
+    where: { id: giveawayId },
+    include: {
+      chat: true,
+      entries: {
+        where: { isValid: true },
+        include: { user: true },
+        orderBy: { joinedAt: "asc" }
+      }
+    }
+  });
+  if (!giveaway || giveaway.status !== GiveawayStatus.ACTIVE) return;
+
+  const winners = pickGiveawayWinners(giveaway.entries, giveaway.winnersCount);
+  const drawResult: Prisma.InputJsonObject = {
+    drawnAt: new Date().toISOString(),
+    entryCount: giveaway.entries.length,
+    winnerCount: winners.length,
+    winnerUserIds: winners.map((entry) => entry.userId),
+    winnerTelegramUserIds: winners.map((entry) => entry.user.telegramUserId.toString()),
+    trigger: "target_count"
+  };
+
+  const updated = await prisma.giveaway.updateMany({
+    where: { id: giveaway.id, status: GiveawayStatus.ACTIVE },
+    data: {
+      status: GiveawayStatus.DRAWN,
+      drawResult
+    }
+  });
+  if (updated.count === 0) return;
+
+  await cancelGiveawayDrawJob(giveaway.id);
+  await prisma.auditLog.create({
+    data: {
+      chatId: giveaway.chatId,
+      action: "giveaway.drawn",
+      targetType: "giveaway",
+      targetId: giveaway.id,
+      metadata: drawResult
+    }
+  });
+
+  await ctx.api.sendMessage(
+    Number(giveaway.chat.telegramChatId),
+    buildGiveawayDrawMessage(giveaway.title, giveaway.prize, winners.map((entry) => entry.user), locale),
+    { parse_mode: "HTML" }
+  ).catch(() => undefined);
+}
+
+function pickGiveawayWinners<T>(entries: T[], winnersCount: number) {
+  const shuffled = [...entries];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex]!, shuffled[index]!];
+  }
+  return shuffled.slice(0, Math.max(0, Math.min(winnersCount, shuffled.length)));
+}
+
+function buildGiveawayDrawMessage(title: string, prize: string, winners: PrismaUser[], locale: Locale) {
+  const header = locale === "zh-CN"
+    ? [
+        `🎁 <b>${escapeHtml(title)}</b>`,
+        "",
+        `奖品: <b>${escapeHtml(prize)}</b>`
+      ]
+    : [
+        `🎁 <b>${escapeHtml(title)}</b>`,
+        "",
+        `Prize: <b>${escapeHtml(prize)}</b>`
+      ];
+
+  if (!winners.length) {
+    return [
+      ...header,
+      "",
+      locale === "zh-CN" ? "本次抽奖没有有效参与者，已自动结束。" : "No valid participants. The giveaway has ended."
+    ].join("\n");
+  }
+
+  return [
+    ...header,
+    "",
+    locale === "zh-CN" ? "<b>中奖用户:</b>" : "<b>Winners:</b>",
+    ...winners.map((user, index) => `${index + 1}. ${mentionPrismaUser(user)}`)
+  ].join("\n");
+}
+
+function mentionPrismaUser(user: PrismaUser) {
+  const name = [user.firstName, user.lastName].filter(Boolean).join(" ").trim()
+    || user.username
+    || user.telegramUserId.toString();
+  return `<a href="tg://user?id=${user.telegramUserId.toString()}">${escapeHtml(name)}</a>`;
+}
+
 async function handleGiveawayJoinCallback(ctx: Context, config: AppConfig) {
   await ctx.answerCallbackQuery().catch(() => undefined);
   const id = ctx.callbackQuery?.data?.replace("giveaway:join:", "");
@@ -6060,6 +8422,7 @@ async function handleGiveawayJoinCallback(ctx: Context, config: AppConfig) {
     create: { giveawayId: id, userId: user.id },
     update: { isValid: true }
   });
+  await maybeDrawGiveawayWhenFull(ctx, id, await getLocale(ctx));
   await ctx.answerCallbackQuery({ text: "已参与" }).catch(() => undefined);
 }
 
@@ -6108,13 +8471,32 @@ async function saveWelcomeSettings(chatId: string, settings: WelcomeSettings) {
 
 async function getBlocklistSettings(chatId: string) {
   const raw = await getSettingRecord(chatId, "blocklist");
+  const blockBotPunishment = isBlocklistBotPunishment(raw.blockBotPunishment)
+    ? raw.blockBotPunishment
+    : raw.blockBots === true ? "ban" : defaultBlocklistSettings.blockBotPunishment;
   return {
-    ...defaultBlocklistSettings,
-    ...raw,
+    blockBots: blockBotPunishment !== "off",
+    blockBotPunishment,
+    banAfterLeave: typeof raw.banAfterLeave === "boolean" ? raw.banAfterLeave : defaultBlocklistSettings.banAfterLeave,
+    blockFlashJoinLeave: typeof raw.blockFlashJoinLeave === "boolean" ? raw.blockFlashJoinLeave : defaultBlocklistSettings.blockFlashJoinLeave,
+    blockFollowerRaid: typeof raw.blockFollowerRaid === "boolean" ? raw.blockFollowerRaid : defaultBlocklistSettings.blockFollowerRaid,
     flashWindowSeconds: clampNumber(Number(raw.flashWindowSeconds ?? defaultBlocklistSettings.flashWindowSeconds), 10, 3600),
     raidWindowSeconds: clampNumber(Number(raw.raidWindowSeconds ?? defaultBlocklistSettings.raidWindowSeconds), 10, 3600),
     raidJoinThreshold: clampNumber(Number(raw.raidJoinThreshold ?? defaultBlocklistSettings.raidJoinThreshold), 3, 100)
   } as BlocklistSettings;
+}
+
+async function saveBlocklistSettings(chatId: string, settings: BlocklistSettings) {
+  await saveSetting(chatId, "blocklist", settingsToJson({
+    blockBots: settings.blockBotPunishment !== "off",
+    blockBotPunishment: settings.blockBotPunishment,
+    banAfterLeave: settings.banAfterLeave,
+    blockFlashJoinLeave: settings.blockFlashJoinLeave,
+    blockFollowerRaid: settings.blockFollowerRaid,
+    flashWindowSeconds: settings.flashWindowSeconds,
+    raidWindowSeconds: settings.raidWindowSeconds,
+    raidJoinThreshold: settings.raidJoinThreshold
+  }));
 }
 
 async function getInviteLinkSettings(chatId: string) {
@@ -6591,12 +8973,25 @@ async function saveAutoReplySettings(chatId: string, settings: AutoReplySettings
 
 async function getBannedWordsSettings(chatId: string): Promise<BannedWordsSettings> {
   const raw = await getSettingRecord(chatId, "banned_words");
+  const punishment = parseBannedWordsPunishment(raw.punishment);
+  const rawNoticeDeleteSeconds = Number(raw.noticeDeleteSeconds);
+  const noticeDeleteSeconds = Number.isFinite(rawNoticeDeleteSeconds)
+    ? clampNumber(rawNoticeDeleteSeconds, -1, 43200)
+    : typeof raw.deleteNotice === "boolean"
+      ? (raw.deleteNotice ? defaultBannedWordsSettings.noticeDeleteSeconds : -1)
+      : defaultBannedWordsSettings.noticeDeleteSeconds;
   return {
     enabled: typeof raw.enabled === "boolean" ? raw.enabled : defaultBannedWordsSettings.enabled,
-    punishment: isBannedWordsPunishment(raw.punishment) ? raw.punishment : defaultBannedWordsSettings.punishment,
-    warningLimit: clampNumber(Number(raw.warningLimit ?? defaultBannedWordsSettings.warningLimit), 1, 20),
-    muteMinutes: clampNumber(Number(raw.muteMinutes ?? defaultBannedWordsSettings.muteMinutes), 1, 24 * 60),
-    deleteNotice: typeof raw.deleteNotice === "boolean" ? raw.deleteNotice : defaultBannedWordsSettings.deleteNotice
+    punishment,
+    warningPunishment: isBannedWordsFinalPunishment(raw.warningPunishment)
+      ? raw.warningPunishment
+      : raw.punishment === "warn_mute"
+        ? "mute"
+        : defaultBannedWordsSettings.warningPunishment,
+    warningLimit: clampNumber(Number(raw.warningLimit ?? defaultBannedWordsSettings.warningLimit), 1, 5),
+    muteMinutes: clampNumber(Number(raw.muteMinutes ?? defaultBannedWordsSettings.muteMinutes), 0, 525600),
+    deleteNotice: noticeDeleteSeconds >= 0,
+    noticeDeleteSeconds
   };
 }
 
@@ -6604,9 +8999,11 @@ async function saveBannedWordsSettings(chatId: string, settings: BannedWordsSett
   await saveSetting(chatId, "banned_words", settingsToJson({
     enabled: settings.enabled,
     punishment: settings.punishment,
+    warningPunishment: settings.warningPunishment,
     warningLimit: settings.warningLimit,
     muteMinutes: settings.muteMinutes,
-    deleteNotice: settings.deleteNotice
+    deleteNotice: settings.noticeDeleteSeconds >= 0,
+    noticeDeleteSeconds: settings.noticeDeleteSeconds
   }));
 }
 
@@ -6671,24 +9068,169 @@ async function deleteBannedWordsByPattern(chatId: string, inputWords: string[]) 
 async function getGroupCommandSettings(chatId: string): Promise<GroupCommandSettings> {
   const raw = await getSettingRecord(chatId, "group_commands");
   const rawCommands = isRecord(raw.commands) ? raw.commands : {};
+  const rawAliases = isRecord(raw.aliases) ? raw.aliases : {};
   const commands = { ...defaultGroupCommandSettings.commands };
+  const aliases = { ...defaultGroupCommandSettings.aliases };
   for (const item of groupCommandDefinitions) {
     const rawValue = rawCommands[item.key];
     if (typeof rawValue === "boolean") {
       commands[item.key] = rawValue;
     }
+    if (Object.prototype.hasOwnProperty.call(rawAliases, item.key)) {
+      aliases[item.key] = parseGroupCommandAliases(rawAliases[item.key]);
+    }
   }
-  return { commands };
+  return { commands, aliases };
 }
 
 async function saveGroupCommandSettings(chatId: string, settings: GroupCommandSettings) {
   await saveSetting(chatId, "group_commands", settingsToJson({
-    commands: settings.commands
+    commands: settings.commands,
+    aliases: settings.aliases
   }));
+}
+
+async function getPointsSettings(chatId: string): Promise<PointsSettings> {
+  const raw = await getSettingRecord(chatId, "points");
+  return {
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : defaultPointsSettings.enabled,
+    deleteSignInMessage: typeof raw.deleteSignInMessage === "boolean"
+      ? raw.deleteSignInMessage
+      : defaultPointsSettings.deleteSignInMessage,
+    deleteSignInSeconds: clampNumber(Number(raw.deleteSignInSeconds ?? defaultPointsSettings.deleteSignInSeconds), 1, 3600),
+    signInPoints: clampNumber(Number(raw.signInPoints ?? defaultPointsSettings.signInPoints), 0, 100000),
+    speechPoints: clampNumber(Number(raw.speechPoints ?? defaultPointsSettings.speechPoints), 0, 100000),
+    speechDailyLimit: clampNumber(Number(raw.speechDailyLimit ?? defaultPointsSettings.speechDailyLimit), 0, 1000000),
+    speechMinLength: clampNumber(Number(raw.speechMinLength ?? defaultPointsSettings.speechMinLength), 0, 1000),
+    invitePoints: clampNumber(Number(raw.invitePoints ?? defaultPointsSettings.invitePoints), 0, 100000),
+    inviteDailyLimit: clampNumber(Number(raw.inviteDailyLimit ?? defaultPointsSettings.inviteDailyLimit), 0, 1000000)
+  };
+}
+
+async function savePointsSettings(chatId: string, settings: PointsSettings) {
+  await saveSetting(chatId, "points", settingsToJson(settings));
+}
+
+async function getPointExchangeSettings(chatId: string): Promise<PointExchangeSettings> {
+  const raw = await getSettingRecord(chatId, "point_exchange");
+  const products = Array.isArray(raw.products)
+    ? raw.products.map(parsePointProduct).filter((item): item is PointProduct => Boolean(item)).slice(0, 100)
+    : [];
+  return {
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : defaultPointExchangeSettings.enabled,
+    keyword: typeof raw.keyword === "string" && raw.keyword.trim()
+      ? raw.keyword.trim().slice(0, 32)
+      : defaultPointExchangeSettings.keyword,
+    products
+  };
+}
+
+async function savePointExchangeSettings(chatId: string, settings: PointExchangeSettings) {
+  await saveSetting(chatId, "point_exchange", settingsToJson({
+    enabled: settings.enabled,
+    keyword: settings.keyword,
+    products: settings.products.map((product) => ({
+      id: product.id,
+      name: product.name,
+      cost: product.cost,
+      listed: product.listed,
+      codes: product.codes,
+      soldCount: product.soldCount,
+      dailyLimit: product.dailyLimit
+    }))
+  }));
+}
+
+function parsePointProduct(value: unknown): PointProduct | null {
+  if (!isRecord(value)) return null;
+  const id = typeof value.id === "string" && value.id.trim() ? value.id.trim().slice(0, 16) : "";
+  if (!id) return null;
+  const rawCodes = Array.isArray(value.codes) ? value.codes : [];
+  return {
+    id,
+    name: typeof value.name === "string" ? value.name.slice(0, 64) : "",
+    cost: clampNumber(Number(value.cost ?? 1), 1, 1000000),
+    listed: typeof value.listed === "boolean" ? value.listed : false,
+    codes: rawCodes.filter((item): item is string => typeof item === "string" && Boolean(item.trim())).map((item) => item.trim()).slice(0, 10000),
+    soldCount: clampNumber(Number(value.soldCount ?? 0), 0, 100000000),
+    dailyLimit: clampNumber(Number(value.dailyLimit ?? 0), 0, 1000000)
+  };
+}
+
+function createPointProduct(): PointProduct {
+  return {
+    id: String(Math.floor(1000 + Math.random() * 9000)),
+    name: "",
+    cost: 1,
+    listed: false,
+    codes: [],
+    soldCount: 0,
+    dailyLimit: 0
+  };
+}
+
+function isPointsRuleField(value: unknown): value is PointsRuleField {
+  return typeof value === "string" && [
+    "signInPoints",
+    "deleteSignInSeconds",
+    "speechPoints",
+    "speechDailyLimit",
+    "speechMinLength",
+    "invitePoints",
+    "inviteDailyLimit"
+  ].includes(value);
+}
+
+function setPointsRuleField(settings: PointsSettings, field: PointsRuleField, value: number) {
+  if (field === "signInPoints") settings.signInPoints = clampNumber(value, 0, 100000);
+  if (field === "deleteSignInSeconds") settings.deleteSignInSeconds = clampNumber(value, 1, 3600);
+  if (field === "speechPoints") settings.speechPoints = clampNumber(value, 0, 100000);
+  if (field === "speechDailyLimit") settings.speechDailyLimit = clampNumber(value, 0, 1000000);
+  if (field === "speechMinLength") settings.speechMinLength = clampNumber(value, 0, 1000);
+  if (field === "invitePoints") settings.invitePoints = clampNumber(value, 0, 100000);
+  if (field === "inviteDailyLimit") settings.inviteDailyLimit = clampNumber(value, 0, 1000000);
+}
+
+function pointsRuleForField(field: PointsRuleField): "sign" | "speech" | "invite" {
+  if (field === "signInPoints" || field === "deleteSignInSeconds") return "sign";
+  if (field === "speechPoints" || field === "speechDailyLimit" || field === "speechMinLength") return "speech";
+  return "invite";
 }
 
 function isGroupCommandKey(value: unknown): value is GroupCommandKey {
   return typeof value === "string" && groupCommandDefinitions.some((item) => item.key === value);
+}
+
+function parseGroupCommandAliases(input: unknown): string[] {
+  const source = Array.isArray(input)
+    ? input.filter((item): item is string => typeof item === "string").join("\n")
+    : typeof input === "string" ? input : "";
+  if (!source) return [];
+  const aliases: string[] = [];
+  const seen = new Set<string>();
+  for (const item of source.split(/[\r\n,，]+/)) {
+    const alias = normalizeGroupCommandAlias(item);
+    if (!alias || seen.has(alias)) continue;
+    seen.add(alias);
+    aliases.push(alias);
+  }
+  return aliases.slice(0, 20);
+}
+
+function normalizeGroupCommandAlias(value: string) {
+  return value
+    .trim()
+    .split(/\s+/, 1)[0]
+    ?.replace(/^\/+/, "")
+    .replace(/@[^@\s]+$/, "")
+    .toLocaleLowerCase()
+    .slice(0, 32) ?? "";
+}
+
+function extractGroupCommandAlias(message: Message) {
+  const text = getMessageText(message);
+  if (!text) return "";
+  return normalizeGroupCommandAlias(text);
 }
 
 async function getMemberStatsSettings(chatId: string): Promise<MemberStatsSettings> {
@@ -6713,6 +9255,25 @@ async function saveMemberStatsSettings(chatId: string, settings: MemberStatsSett
     lastCount: settings.lastCount,
     snapshots: settings.snapshots.slice(-120)
   }));
+}
+
+async function getGroupMembersSettings(chatId: string): Promise<GroupMembersSettings> {
+  const raw = await getSettingRecord(chatId, "group_members");
+  return {
+    watchNicknameChange: typeof raw.watchNicknameChange === "boolean"
+      ? raw.watchNicknameChange
+      : defaultGroupMembersSettings.watchNicknameChange,
+    watchUsernameChange: typeof raw.watchUsernameChange === "boolean"
+      ? raw.watchUsernameChange
+      : defaultGroupMembersSettings.watchUsernameChange,
+    unpinLinkedChannelMessages: typeof raw.unpinLinkedChannelMessages === "boolean"
+      ? raw.unpinLinkedChannelMessages
+      : defaultGroupMembersSettings.unpinLinkedChannelMessages
+  };
+}
+
+async function saveGroupMembersSettings(chatId: string, settings: GroupMembersSettings) {
+  await saveSetting(chatId, "group_members", settingsToJson(settings));
 }
 
 function parseMemberStatsSnapshot(value: unknown): MemberStatsSnapshot | null {
@@ -6901,8 +9462,34 @@ async function recordInviteJoin(ctx: Context, chat: PrismaChat, member: User) {
   });
 
   if (savedInviteLink) {
+    await maybeRewardInvitePoints(chat, savedInviteLink.creatorUserId, user.id);
     await maybeSendInviteNotice(ctx, chat, member, savedInviteLink.creatorUserId);
   }
+}
+
+async function maybeRewardInvitePoints(chat: PrismaChat, inviterUserId: string, invitedUserId: string) {
+  if (inviterUserId === invitedUserId) return;
+  const settings = await getPointsSettings(chat.id);
+  if (!settings.enabled || settings.invitePoints <= 0) return;
+
+  const dayKey = formatDate(new Date());
+  let delta = settings.invitePoints;
+  if (settings.inviteDailyLimit > 0) {
+    const earned = await getDailyPointDelta(chat.id, inviterUserId, PointTransactionType.INVITE, dayKey);
+    const remaining = settings.inviteDailyLimit - earned;
+    if (remaining <= 0) return;
+    delta = Math.min(delta, remaining);
+  }
+
+  await addPoints(
+    chat.id,
+    inviterUserId,
+    delta,
+    PointTransactionType.INVITE,
+    `invite:${chat.id}:${inviterUserId}:${invitedUserId}`,
+    null,
+    dayKey
+  );
 }
 
 async function recordInviteLeave(chatId: string, member: User) {
@@ -6999,28 +9586,26 @@ async function applyBannedWordsPunishment(
     return;
   }
 
-  if (settings.punishment === "ban") {
-    await banUser(ctx, telegramChatId, user.id);
-    await sendBannedWordsNotice(ctx, telegramChatId, `${name} 触发违禁词 <code>${matched}</code>，已封禁。`, settings);
-    clearBannedWordWarning(chat.id, user.id);
-    return;
-  }
-
-  if (settings.punishment === "mute") {
-    await muteUser(ctx, telegramChatId, user.id, settings.muteMinutes);
-    await sendBannedWordsNotice(ctx, telegramChatId, `${name} 触发违禁词 <code>${matched}</code>，已禁言 ${settings.muteMinutes} 分钟。`, settings);
+  if (settings.punishment !== "warn") {
+    await applyBannedWordsFinalPunishment(ctx, telegramChatId, user.id, settings.punishment, settings.muteMinutes);
+    await sendBannedWordsNotice(
+      ctx,
+      telegramChatId,
+      `${name} 触发违禁词 <code>${matched}</code>，已${bannedWordsFinalPunishmentNoticeLabel(settings.punishment, settings, "zh-CN")}。`,
+      settings
+    );
     clearBannedWordWarning(chat.id, user.id);
     return;
   }
 
   const warningCount = incrementBannedWordWarning(chat.id, user.id);
   if (warningCount >= settings.warningLimit) {
-    await muteUser(ctx, telegramChatId, user.id, settings.muteMinutes);
+    await applyBannedWordsFinalPunishment(ctx, telegramChatId, user.id, settings.warningPunishment, settings.muteMinutes);
     clearBannedWordWarning(chat.id, user.id);
     await sendBannedWordsNotice(
       ctx,
       telegramChatId,
-      `${name} 触发违禁词 <code>${matched}</code>，警告已达 ${settings.warningLimit} 次，禁言 ${settings.muteMinutes} 分钟。`,
+      `${name} 触发违禁词 <code>${matched}</code>，警告已达 ${settings.warningLimit} 次，已${bannedWordsFinalPunishmentNoticeLabel(settings.warningPunishment, settings, "zh-CN")}。`,
       settings
     );
     return;
@@ -7035,18 +9620,44 @@ async function applyBannedWordsPunishment(
 }
 
 async function sendBannedWordsNotice(ctx: Context, telegramChatId: number, text: string, settings: BannedWordsSettings) {
+  if (settings.noticeDeleteSeconds < 0) return;
   const sent = await ctx.api.sendMessage(telegramChatId, text, { parse_mode: "HTML" }).catch(() => null);
-  if (!sent || !settings.deleteNotice) return;
+  if (!sent || settings.noticeDeleteSeconds <= 0) return;
   setTimeout(() => {
     void ctx.api.deleteMessage(telegramChatId, sent.message_id).catch(() => undefined);
-  }, 30_000);
+  }, settings.noticeDeleteSeconds * 1000);
 }
 
 async function muteUser(ctx: Context, chatId: number, userId: number, minutes: number) {
-  const untilDate = Math.floor((Date.now() + minutes * 60 * 1000) / 1000);
+  const untilDate = minutes <= 0 ? 0 : Math.floor((Date.now() + minutes * 60 * 1000) / 1000);
   await ctx.api.restrictChatMember(chatId, userId, noChatPermissions(), { until_date: untilDate }).catch((error) => {
     console.error("Failed to mute member", { chatId, userId, minutes, error });
   });
+}
+
+async function applyBannedWordsFinalPunishment(
+  ctx: Context,
+  chatId: number,
+  userId: number,
+  punishment: BannedWordsFinalPunishment,
+  muteMinutes: number
+) {
+  if (punishment === "mute") {
+    await muteUser(ctx, chatId, userId, muteMinutes);
+    return;
+  }
+  if (punishment === "kick") {
+    await kickUser(ctx, chatId, userId);
+    return;
+  }
+  await banUser(ctx, chatId, userId);
+}
+
+async function kickUser(ctx: Context, chatId: number, userId: number) {
+  await ctx.api.banChatMember(chatId, userId).catch((error) => {
+    console.error("Failed to kick member", { chatId, userId, error });
+  });
+  await ctx.api.unbanChatMember(chatId, userId, { only_if_banned: true }).catch(() => undefined);
 }
 
 function incrementBannedWordWarning(chatId: string, userId: number) {
@@ -7179,13 +9790,161 @@ async function maybeSendAutoReply(ctx: Context, chatId: string, message: Message
   }
 }
 
+async function maybeHandlePointExchangeKeyword(ctx: Context, chat: PrismaChat, message: Message) {
+  if (!ctx.chat || !isGroupLike(ctx.chat)) return false;
+  const text = getMessageText(message);
+  if (!text) return false;
+
+  const settings = await getPointExchangeSettings(chat.id);
+  if (!settings.enabled || text.trim() !== settings.keyword) return false;
+
+  const products = settings.products.filter((item) => item.listed);
+  if (!products.length) {
+    await ctx.reply("暂无可兑换商品。").catch(() => undefined);
+    return true;
+  }
+
+  const lines = products.map((product, index) => {
+    const name = product.name || "未命名商品";
+    return `${index + 1}. ${escapeHtml(name)} - ${product.cost} 积分 - 剩余 ${product.codes.length}`;
+  });
+  await ctx.reply(["🛒 <b>商品兑换</b>", "", ...lines].join("\n"), {
+    parse_mode: "HTML",
+    reply_markup: exchangeProductListKeyboard(chat.id, products, "zh-CN")
+  });
+  return true;
+}
+
+async function handlePointExchangeRedeem(ctx: Context, locale: Locale, chat: PrismaChat, productId: string) {
+  if (!ctx.from) {
+    await ctx.answerCallbackQuery({ text: locale === "zh-CN" ? "无法识别用户。" : "User not found.", show_alert: true }).catch(() => undefined);
+    return;
+  }
+
+  const settings = await getPointExchangeSettings(chat.id);
+  if (!settings.enabled) {
+    await ctx.answerCallbackQuery({ text: locale === "zh-CN" ? "商品兑换未开启。" : "Product exchange is disabled.", show_alert: true }).catch(() => undefined);
+    return;
+  }
+
+  const product = settings.products.find((item) => item.id === productId);
+  if (!product || !product.listed) {
+    await ctx.answerCallbackQuery({ text: locale === "zh-CN" ? "商品不可兑换。" : "Product unavailable.", show_alert: true }).catch(() => undefined);
+    return;
+  }
+  if (!product.codes.length) {
+    await ctx.answerCallbackQuery({ text: locale === "zh-CN" ? "库存不足。" : "Out of stock.", show_alert: true }).catch(() => undefined);
+    return;
+  }
+
+  const user = await upsertTelegramUser(ctx.from, chat.timezone);
+  const balance = await prisma.chatPointBalance.findUnique({ where: { chatId_userId: { chatId: chat.id, userId: user.id } } });
+  if ((balance?.balance ?? 0) < product.cost) {
+    await ctx.answerCallbackQuery({ text: locale === "zh-CN" ? "积分不足。" : "Not enough points.", show_alert: true }).catch(() => undefined);
+    return;
+  }
+
+  const dayKey = formatDate(new Date());
+  if (product.dailyLimit > 0) {
+    const todayCount = await prisma.chatPointTransaction.count({
+      where: {
+        chatId: chat.id,
+        userId: user.id,
+        type: PointTransactionType.EXCHANGE,
+        dayKey,
+        referenceKey: { startsWith: `exchange:${product.id}:` }
+      }
+    });
+    if (todayCount >= product.dailyLimit) {
+      await ctx.answerCallbackQuery({ text: locale === "zh-CN" ? "今日兑换次数已达上限。" : "Daily exchange limit reached.", show_alert: true }).catch(() => undefined);
+      return;
+    }
+  }
+
+  const code = product.codes.shift();
+  if (!code) return;
+  product.soldCount += 1;
+  await savePointExchangeSettings(chat.id, settings);
+  const currentBalance = await addPoints(
+    chat.id,
+    user.id,
+    -product.cost,
+    PointTransactionType.EXCHANGE,
+    `exchange:${product.id}:${user.id}:${Date.now()}`,
+    null,
+    dayKey
+  );
+
+  await ctx.answerCallbackQuery({ text: locale === "zh-CN" ? "兑换成功。" : "Redeemed." }).catch(() => undefined);
+  await ctx.api.sendMessage(
+    ctx.from.id,
+    locale === "zh-CN"
+      ? [`兑换成功：${escapeHtml(product.name || "未命名商品")}`, `卡密：<code>${escapeHtml(code)}</code>`, `当前积分：${currentBalance}`].join("\n")
+      : [`Redeemed: ${escapeHtml(product.name || "Unnamed product")}`, `Code: <code>${escapeHtml(code)}</code>`, `Current points: ${currentBalance}`].join("\n"),
+    { parse_mode: "HTML" }
+  ).catch(async () => {
+    await ctx.reply(locale === "zh-CN" ? "兑换成功，请先私聊机器人 /start 后再领取卡密。" : "Redeemed. Start a private chat with the bot to receive the code.").catch(() => undefined);
+  });
+}
+
+async function findPointTargetUser(chatId: string, input: string) {
+  const value = input.trim().replace(/^@/, "");
+  if (!value) return null;
+
+  const userWhere = /^\d+$/.test(value)
+    ? { telegramUserId: BigInt(value) }
+    : { username: { equals: value, mode: "insensitive" as const } };
+
+  const balance = await prisma.chatPointBalance.findFirst({
+    where: {
+      chatId,
+      user: userWhere
+    },
+    include: { user: true }
+  });
+  if (balance?.user) return balance.user;
+
+  return prisma.user.findFirst({ where: userWhere });
+}
+
+async function maybeRewardSpeechPoints(ctx: Context, config: AppConfig, chat: PrismaChat, message: Message) {
+  if (!ctx.chat || !ctx.from || ctx.from.is_bot) return;
+  const text = getMessageText(message);
+  if (!text || text.startsWith("/")) return;
+
+  const settings = await getPointsSettings(chat.id);
+  if (!settings.enabled || settings.speechPoints <= 0) return;
+  if (text.length < settings.speechMinLength) return;
+
+  const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
+  const dayKey = formatDate(new Date());
+  let delta = settings.speechPoints;
+  if (settings.speechDailyLimit > 0) {
+    const earned = await getDailyPointDelta(chat.id, user.id, PointTransactionType.SPEECH, dayKey);
+    const remaining = settings.speechDailyLimit - earned;
+    if (remaining <= 0) return;
+    delta = Math.min(delta, remaining);
+  }
+
+  await addPoints(
+    chat.id,
+    user.id,
+    delta,
+    PointTransactionType.SPEECH,
+    `speech:${chat.id}:${user.id}:${message.message_id}`,
+    null,
+    dayKey
+  );
+}
+
 async function addPoints(
   chatId: string,
   userId: string,
   delta: number,
   type: PointTransactionType,
   referenceKey: string | null,
-  actorUserId: string | null
+  actorUserId: string | null,
+  dayKey: string | null = null
 ) {
   const result = await prisma.$transaction(async (tx) => {
     if (referenceKey) {
@@ -7211,6 +9970,7 @@ async function addPoints(
         delta,
         balanceAfter: balance.balance,
         referenceKey,
+        dayKey,
         metadata: {}
       }
     });
@@ -7221,6 +9981,26 @@ async function addPoints(
   return result;
 }
 
+async function getDailyPointDelta(chatId: string, userId: string, type: PointTransactionType, dayKey: string) {
+  const result = await prisma.chatPointTransaction.aggregate({
+    where: {
+      chatId,
+      userId,
+      type,
+      dayKey,
+      delta: { gt: 0 }
+    },
+    _sum: { delta: true }
+  });
+  return result._sum.delta ?? 0;
+}
+
+function scheduleTelegramMessageDelete(ctx: Context, chatId: number, messageId: number, seconds: number) {
+  setTimeout(() => {
+    void ctx.api.deleteMessage(chatId, messageId).catch(() => undefined);
+  }, seconds * 1000);
+}
+
 async function openGroupStatsPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
   await editOrReply(ctx, groupStatsHomeText(chat, locale), groupStatsKeyboard(chat.id, locale));
 }
@@ -7228,6 +10008,11 @@ async function openGroupStatsPanel(ctx: Context, locale: Locale, chat: PrismaCha
 async function openMemberStatsPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
   const settings = await maybeRecordMemberCountSnapshot(ctx, chat);
   await editOrReply(ctx, memberStatsText(settings, locale), memberStatsKeyboard(chat, settings, locale));
+}
+
+async function openGroupMembersPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  const settings = await getGroupMembersSettings(chat.id);
+  await editOrReply(ctx, groupMembersText(settings, locale), groupMembersKeyboard(chat, settings, locale));
 }
 
 async function sendMemberStatsReport(
@@ -7704,6 +10489,26 @@ function memberStatsText(settings: MemberStatsSettings, locale: Locale) {
   ].join("\n");
 }
 
+function groupMembersText(settings: GroupMembersSettings, locale: Locale) {
+  if (locale !== "zh-CN") {
+    return [
+      "👥 <b>Group & members</b>",
+      "",
+      `<b>Watch nickname changes:</b> ${settings.watchNicknameChange ? "On✅" : "Off❌"}`,
+      `<b>Watch username changes:</b> ${settings.watchUsernameChange ? "On✅" : "Off❌"}`,
+      `<b>Unpin linked channel messages:</b> ${settings.unpinLinkedChannelMessages ? "On✅" : "Off❌"}`
+    ].join("\n");
+  }
+
+  return [
+    "👥 <b>群组&成员</b>",
+    "",
+    `<b>监听昵称变更:</b> ${settings.watchNicknameChange ? "✅开启" : "❌关闭"}`,
+    `<b>监听用户名变更:</b> ${settings.watchUsernameChange ? "✅开启" : "❌关闭"}`,
+    `<b>取消绑定频道消息置顶:</b> ${settings.unpinLinkedChannelMessages ? "✅开启" : "❌关闭"}`
+  ].join("\n");
+}
+
 function groupStatsHomeText(chat: PrismaChat, locale: Locale) {
   const title = escapeHtml(chat.title ?? chat.username ?? String(chat.telegramChatId));
   return locale === "zh-CN"
@@ -7819,7 +10624,7 @@ function blocklistText(settings: BlocklistSettings, locale: Locale) {
   if (locale !== "zh-CN") {
     return [
       "<b>🚫 Block</b>",
-      `Bots: ${onOff(settings.blockBots)}`,
+      `Bots: ${blocklistBotPunishmentLabel(settings.blockBotPunishment, locale)}`,
       `Ban after leave: ${onOff(settings.banAfterLeave)}`,
       `Flash join/leave: ${onOff(settings.blockFlashJoinLeave)} (${settings.flashWindowSeconds}s)`,
       `Join raid: ${onOff(settings.blockFollowerRaid)} (${settings.raidJoinThreshold}/${settings.raidWindowSeconds}s)`
@@ -7827,12 +10632,99 @@ function blocklistText(settings: BlocklistSettings, locale: Locale) {
   }
 
   return [
-    "<b>🚫 屏蔽</b>",
-    `屏蔽机器人：${onOffZh(settings.blockBots)}`,
+    "<b>🚫👤 屏蔽</b>",
+    `屏蔽机器人：${blocklistBotPunishmentLabel(settings.blockBotPunishment, locale)}`,
     `退群封禁：${onOffZh(settings.banAfterLeave)}`,
     `屏蔽闪进闪退：${onOffZh(settings.blockFlashJoinLeave)}（${settings.flashWindowSeconds} 秒内退群）`,
     `屏蔽刷粉攻击：${onOffZh(settings.blockFollowerRaid)}（${settings.raidWindowSeconds} 秒 ${settings.raidJoinThreshold} 人）`
   ].join("\n");
+}
+
+function blocklistBotText(settings: BlocklistSettings, locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "🤖 <b>屏蔽机器人</b>",
+        "",
+        "你也可以设置 处罚 把机器人添加进群组的用户",
+        "",
+        `<b>处罚:</b> ${blocklistBotPunishmentLabel(settings.blockBotPunishment, locale)}`
+      ].join("\n")
+    : [
+        "🤖 <b>Block bots</b>",
+        "",
+        "You can also punish the user who adds a bot to the group.",
+        "",
+        `<b>Punishment:</b> ${blocklistBotPunishmentLabel(settings.blockBotPunishment, locale)}`
+      ].join("\n");
+}
+
+function blocklistLeaveText(settings: BlocklistSettings, locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "🚪 <b>退群封禁</b>",
+        "",
+        "封禁离开群组(频道)的用户。",
+        "",
+        `<b>状态:</b> ${onOffZh(settings.banAfterLeave)}`
+      ].join("\n")
+    : [
+        "🚪 <b>Ban leavers</b>",
+        "",
+        "Ban users who leave the group or channel.",
+        "",
+        `<b>Status:</b> ${onOff(settings.banAfterLeave)}`
+      ].join("\n");
+}
+
+function blocklistFlashText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "🏃‍♂️ <b>屏蔽闪进闪退</b>",
+        "",
+        "如果用户加入群组(频道)几秒钟内离开，服务消息和欢迎消息将被删除。",
+        "您还可以对此类用户设置惩罚",
+        "<strong>该功能开通会员可用</strong>"
+      ].join("\n")
+    : [
+        "🏃‍♂️ <b>Block flash join/leave</b>",
+        "",
+        "If a user leaves a group or channel seconds after joining, service and welcome messages are deleted.",
+        "You can also set punishment for these users.",
+        "<strong>This feature requires a membership.</strong>"
+      ].join("\n");
+}
+
+function blocklistRaidText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "👨‍👩‍👧‍👦 <b>屏蔽刷粉攻击</b>",
+        "",
+        "如果在 2 秒内有 4 个用户加入该群组(频道)，则给予惩罚。",
+        "",
+        "状态: <strong>该功能开通会员可用</strong>"
+      ].join("\n")
+    : [
+        "👨‍👩‍👧‍👦 <b>Block join raids</b>",
+        "",
+        "If 4 users join the group or channel within 2 seconds, a punishment is applied.",
+        "",
+        "Status: <strong>This feature requires a membership.</strong>"
+      ].join("\n");
+}
+
+function blocklistBotPunishmentLabel(punishment: BlocklistBotPunishment, locale: Locale) {
+  if (locale === "zh-CN") {
+    if (punishment === "off") return "关闭";
+    if (punishment === "warn") return "警告";
+    if (punishment === "mute") return "禁言";
+    if (punishment === "kick") return "踢出";
+    return "封禁";
+  }
+  if (punishment === "off") return "Off";
+  if (punishment === "warn") return "Warn";
+  if (punishment === "mute") return "Mute";
+  if (punishment === "kick") return "Kick";
+  return "Ban";
 }
 
 function welcomeText(settings: WelcomeSettings, locale: Locale) {
@@ -8025,7 +10917,7 @@ function bannedWordsText(settings: BannedWordsSettings, count: number, locale: L
       `<b>Status</b>: ${settings.enabled ? "On✅" : "Off❌"}`,
       `<b>Punishment</b>: ${bannedWordsPunishmentLabel(settings, locale)}`,
       `<b>Words</b>: ${count}`,
-      `<b>Auto-delete notices</b>: ${settings.deleteNotice ? "On" : "Off"}`
+      `<b>Notice deletion</b>: ${bannedWordsNoticeDeleteLabel(settings.noticeDeleteSeconds, locale)}`
     ].join("\n");
   }
 
@@ -8035,8 +10927,55 @@ function bannedWordsText(settings: BannedWordsSettings, count: number, locale: L
     `<b>状态</b>: ${settings.enabled ? "开启✅" : "关闭❌"}`,
     `<b>惩罚</b>: ${bannedWordsPunishmentLabel(settings, locale)}`,
     `<b>词库</b>: ${count} 个`,
-    `<b>提醒自动删除</b>: ${settings.deleteNotice ? "开启" : "关闭"}`
+    `<b>提醒删除</b>: ${bannedWordsNoticeDeleteLabel(settings.noticeDeleteSeconds, locale)}`
   ].join("\n");
+}
+
+function bannedWordsPunishmentText(settings: BannedWordsSettings, locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "🔇 <b>违禁词</b>",
+        "",
+        `惩罚：${bannedWordsPunishmentLabel(settings, locale)}`
+      ].join("\n")
+    : [
+        "🔇 <b>Banned words</b>",
+        "",
+        `Punishment: ${bannedWordsPunishmentLabel(settings, locale)}`
+      ].join("\n");
+}
+
+function bannedWordsMuteDurationPromptText(settings: BannedWordsSettings, locale: Locale) {
+  const duration = bannedWordsMuteDurationLabel(settings.muteMinutes, locale);
+  return locale === "zh-CN"
+    ? [
+        "🔇 违禁词",
+        "",
+        `当前设置: 禁言${duration}`,
+        "",
+        "👉 输入处罚禁言的时长 如 <strong>60</strong> 单位/分钟:"
+      ].join("\n")
+    : [
+        "🔇 Banned words",
+        "",
+        `Current setting: mute ${duration}`,
+        "",
+        "👉 Send the mute duration in minutes, for example <strong>60</strong>:"
+      ].join("\n");
+}
+
+function bannedWordsNoticeText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "🔇 <strong>违禁词</strong>",
+        "",
+        "群成员触发 🔇 违禁词时，机器人发出的提醒消息在多久时间后自动删除"
+      ].join("\n")
+    : [
+        "🔇 <strong>Banned words</strong>",
+        "",
+        "Choose how long bot warning notices stay after a member triggers a banned word."
+      ].join("\n");
 }
 
 async function bannedWordsListText(chatId: string, locale: Locale) {
@@ -8100,16 +11039,57 @@ function bannedWordsDeletedText(count: number, locale: Locale) {
 
 function bannedWordsPunishmentLabel(settings: BannedWordsSettings, locale: Locale) {
   if (locale === "zh-CN") {
-    if (settings.punishment === "warn_mute") return `警告${settings.warningLimit}次后禁言${settings.muteMinutes}分钟`;
-    if (settings.punishment === "mute") return `直接禁言${settings.muteMinutes}分钟`;
-    if (settings.punishment === "ban") return "直接封禁";
+    if (settings.punishment === "warn") return `警告${settings.warningLimit}次后${bannedWordsFinalPunishmentLabel(settings.warningPunishment, settings, locale)}`;
+    if (settings.punishment === "mute") return `禁言${bannedWordsMuteDurationLabel(settings.muteMinutes, locale)}`;
+    if (settings.punishment === "kick") return "踢出";
+    if (settings.punishment === "ban") return "踢出+封禁";
     return "仅删除消息";
   }
 
-  if (settings.punishment === "warn_mute") return `${settings.warningLimit} warnings, then mute ${settings.muteMinutes}m`;
-  if (settings.punishment === "mute") return `Mute ${settings.muteMinutes}m`;
-  if (settings.punishment === "ban") return "Ban";
+  if (settings.punishment === "warn") return `${settings.warningLimit} warnings, then ${bannedWordsFinalPunishmentLabel(settings.warningPunishment, settings, locale)}`;
+  if (settings.punishment === "mute") return `Mute ${bannedWordsMuteDurationLabel(settings.muteMinutes, locale)}`;
+  if (settings.punishment === "kick") return "Kick";
+  if (settings.punishment === "ban") return "Kick+ban";
   return "Delete message only";
+}
+
+function bannedWordsFinalPunishmentLabel(punishment: BannedWordsFinalPunishment, settings: BannedWordsSettings, locale: Locale) {
+  if (locale === "zh-CN") {
+    if (punishment === "mute") return `禁言${bannedWordsMuteDurationLabel(settings.muteMinutes, locale)}`;
+    if (punishment === "kick") return "踢出";
+    return "踢出+封禁";
+  }
+  if (punishment === "mute") return `mute ${bannedWordsMuteDurationLabel(settings.muteMinutes, locale)}`;
+  if (punishment === "kick") return "kick";
+  return "kick+ban";
+}
+
+function bannedWordsFinalPunishmentNoticeLabel(punishment: BannedWordsFinalPunishment, settings: BannedWordsSettings, locale: Locale) {
+  if (locale === "zh-CN") {
+    if (punishment === "mute") return `禁言 ${bannedWordsMuteDurationLabel(settings.muteMinutes, locale)}`;
+    if (punishment === "kick") return "踢出";
+    return "封禁";
+  }
+  return bannedWordsFinalPunishmentLabel(punishment, settings, locale);
+}
+
+function bannedWordsMuteDurationLabel(minutes: number, locale: Locale) {
+  if (minutes <= 0) return locale === "zh-CN" ? "永久" : "permanently";
+  return locale === "zh-CN" ? `${minutes}分钟` : `${minutes}m`;
+}
+
+function bannedWordsNoticeDeleteLabel(seconds: number, locale: Locale) {
+  if (seconds < 0) return locale === "zh-CN" ? "不提醒" : "Do not notify";
+  if (seconds === 0) return locale === "zh-CN" ? "不删除" : "Do not delete";
+  if (seconds < 60) return locale === "zh-CN" ? `${seconds}秒` : `${seconds}s`;
+  if (seconds % 3600 === 0) return locale === "zh-CN" ? `${seconds / 3600}小时` : `${seconds / 3600}h`;
+  if (seconds % 60 === 0) return locale === "zh-CN" ? `${seconds / 60}分钟` : `${seconds / 60}m`;
+  return locale === "zh-CN" ? `${seconds}秒` : `${seconds}s`;
+}
+
+function bannedWordsNoticeStatusLabel(settings: BannedWordsSettings, label: string) {
+  if (settings.noticeDeleteSeconds < 0) return label;
+  return `✅${label}`;
 }
 
 function groupCommandsHomeText(locale: Locale) {
@@ -8127,6 +11107,223 @@ function groupCommandsText(settings: GroupCommandSettings, locale: Locale) {
   return locale === "zh-CN"
     ? ["<b>群组命令</b>", "", "关闭后，群内成员将无法使用对应命令。", "", ...lines].join("\n")
     : ["<b>Group commands</b>", "", "When disabled, members cannot use the matching command in this group.", "", ...lines].join("\n");
+}
+
+function groupCommandAliasesText(settings: GroupCommandSettings, locale: Locale) {
+  const lines = groupCommandDefinitions.map((item) => {
+    const aliases = settings.aliases[item.key];
+    return `${groupCommandLabel(item.key, locale)}: ${aliases.length ? aliases.map((alias) => `<code>${escapeHtml(alias)}</code>`).join(" ") : "-"}`;
+  });
+  return locale === "zh-CN"
+    ? ["<b>命令别名</b>", "", "成员发送别名时，会按对应群组命令执行。", "", ...lines].join("\n")
+    : ["<b>Command aliases</b>", "", "When members send an alias, the matching group command runs.", "", ...lines].join("\n");
+}
+
+function groupCommandAliasDetailText(settings: GroupCommandSettings, command: GroupCommandKey, locale: Locale) {
+  const aliases = settings.aliases[command];
+  const lines = aliases.length ? aliases.map((alias) => `- <code>${escapeHtml(alias)}</code>`) : [locale === "zh-CN" ? "暂无别名。" : "No aliases yet."];
+  return locale === "zh-CN"
+    ? [`<b>${groupCommandLabel(command, locale)} 别名</b>`, "", ...lines].join("\n")
+    : [`<b>${groupCommandLabel(command, locale)} aliases</b>`, "", ...lines].join("\n");
+}
+
+function groupCommandAliasInputPromptText(mode: "add" | "delete", command: GroupCommandKey, locale: Locale) {
+  const name = groupCommandLabel(command, locale);
+  if (locale === "zh-CN") {
+    return mode === "add"
+      ? [`<b>添加 ${name} 别名</b>`, "", "请发送别名，多个别名可用换行或逗号分隔。", "示例: <code>签到, qd, /qd</code>"].join("\n")
+      : [`<b>删除 ${name} 别名</b>`, "", "请发送要删除的别名，多个别名可用换行或逗号分隔。"].join("\n");
+  }
+  return mode === "add"
+    ? [`<b>Add aliases for ${name}</b>`, "", "Send aliases separated by new lines or commas.", "Example: <code>checkin, qd, /qd</code>"].join("\n")
+    : [`<b>Delete aliases for ${name}</b>`, "", "Send aliases to delete, separated by new lines or commas."].join("\n");
+}
+
+function groupCommandAliasSavedText(count: number, mode: "add" | "delete", locale: Locale) {
+  if (locale === "zh-CN") return mode === "add" ? `已添加 ${count} 个别名。` : `已删除 ${count} 个别名。`;
+  return mode === "add" ? `Added ${count} alias(es).` : `Deleted ${count} alias(es).`;
+}
+
+function pointAliasInputText(aliases: string[], command: Extract<GroupCommandKey, "points" | "points_rank">, locale: Locale) {
+  const current = aliases.length ? aliases.join(", ") : (command === "points_rank" ? "积分排名" : "积分");
+  const title = command === "points_rank" ? (locale === "zh-CN" ? "积分排名" : "Points ranking") : (locale === "zh-CN" ? "积分" : "Points");
+  return locale === "zh-CN"
+    ? [`Ⓜ️ <b>${title}</b>`, "", `当前设置: <code>${escapeHtml(current)}</code>`, "", "👉 输入内容进行设置:"].join("\n")
+    : [`Ⓜ️ <b>${title}</b>`, "", `Current setting: <code>${escapeHtml(current)}</code>`, "", "👉 Send the new alias:"].join("\n");
+}
+
+function pointAliasSavedText(locale: Locale) {
+  return locale === "zh-CN" ? "别名已更新。" : "Alias updated.";
+}
+
+function pointExchangeText(settings: PointExchangeSettings, locale: Locale) {
+  return locale === "zh-CN"
+    ? ["🛒<b>商品兑换</b>", "", `<b>状态:</b> ${settings.enabled ? "开启" : "关闭"}`, "", `兑换关键词: ${escapeHtml(settings.keyword)}`].join("\n")
+    : ["🛒<b>Product exchange</b>", "", `<b>Status:</b> ${settings.enabled ? "On" : "Off"}`, "", `Exchange keyword: ${escapeHtml(settings.keyword)}`].join("\n");
+}
+
+function exchangeKeywordInputText(locale: Locale) {
+  return locale === "zh-CN"
+    ? ["群成员输入关键词后，机器人会在群里发送商品列表", "", "<b>请输入兑换关键词:</b>"].join("\n")
+    : ["When members send the keyword, the bot sends the product list in the group.", "", "<b>Send the exchange keyword:</b>"].join("\n");
+}
+
+function productsText(locale: Locale) {
+  return locale === "zh-CN" ? "<b>🎁商品管理</b>" : "<b>🎁 Product management</b>";
+}
+
+function productText(product: PointProduct, locale: Locale) {
+  const stock = product.codes.length;
+  if (locale !== "zh-CN") {
+    return [
+      `<b>Product ID:</b> ${escapeHtml(product.id)}`,
+      `<b>Product name:</b> ${escapeHtml(product.name)}`,
+      `<b>Point cost:</b> ${product.cost}`,
+      `<b>Remaining:</b> ${stock}`,
+      `<b>Total exchanged:</b> ${product.soldCount}`,
+      `<b>Daily exchange limit:</b> ${formatPointsLimit(product.dailyLimit, locale)}`
+    ].join("\n");
+  }
+  return [
+    `<b>商品编号：</b> ${escapeHtml(product.id)}`,
+    `<b>商品名称：</b> ${escapeHtml(product.name)}`,
+    `<b>消耗积分：</b> ${product.cost}`,
+    `<b>剩余：</b> ${stock}`,
+    `<b>累计兑换：</b> ${product.soldCount}`,
+    `<b>每日兑换上限：</b> ${formatPointsLimit(product.dailyLimit, locale)}`
+  ].join("\n");
+}
+
+function productInputPromptText(kind: Extract<PointsInputDraft, { productId: string }>["kind"], locale: Locale) {
+  if (kind === "product_name") return locale === "zh-CN" ? "请输入商品名称:" : "Send the product name:";
+  if (kind === "product_cost") return locale === "zh-CN" ? "请输入消耗积分:" : "Send the point cost:";
+  if (kind === "product_codes") return locale === "zh-CN" ? "请输入卡密，每行一个:" : "Send codes, one per line:";
+  return locale === "zh-CN" ? "请输入每日兑换上限，0 表示无限制:" : "Send the daily exchange limit. Use 0 for unlimited:";
+}
+
+function pointProductInputKind(value: string): Extract<PointsInputDraft, { productId: string }>["kind"] | null {
+  if (value === "name") return "product_name";
+  if (value === "cost") return "product_cost";
+  if (value === "codes") return "product_codes";
+  if (value === "daily_limit") return "product_daily_limit";
+  return null;
+}
+
+function pointProductCodesText(product: PointProduct | undefined, locale: Locale) {
+  if (!product) return locale === "zh-CN" ? "找不到商品。" : "Product not found.";
+  const codes = product.codes.length ? product.codes.map((code) => `<code>${escapeHtml(code)}</code>`) : [locale === "zh-CN" ? "暂无卡密。" : "No codes."];
+  return [locale === "zh-CN" ? "<b>查看卡密</b>" : "<b>Codes</b>", "", ...codes].join("\n");
+}
+
+function parsePointProductCodes(text: string) {
+  const seen = new Set<string>();
+  const codes: string[] = [];
+  for (const item of text.split(/[\r\n]+/)) {
+    const code = item.trim();
+    if (!code || seen.has(code)) continue;
+    seen.add(code);
+    codes.push(code.slice(0, 255));
+  }
+  return codes.slice(0, 10000);
+}
+
+async function pointExchangeRecordsText(chatId: string, locale: Locale) {
+  const rows = await prisma.chatPointTransaction.findMany({
+    where: { chatId, type: PointTransactionType.EXCHANGE },
+    include: { user: true },
+    orderBy: { createdAt: "desc" },
+    take: 20
+  });
+  const lines = rows.length
+    ? rows.map((row) => `${formatDateTimeForDisplay(row.createdAt)} ${displayPrismaUser(row.user)} ${row.delta}`)
+    : [locale === "zh-CN" ? "暂无兑换记录。" : "No exchange records yet."];
+  return [locale === "zh-CN" ? "<b>🧾兑换记录</b>" : "<b>🧾 Exchange records</b>", "", ...lines].join("\n");
+}
+
+function pointsInputInvalidText(locale: Locale) {
+  return locale === "zh-CN" ? "请输入有效内容。" : "Send a valid value.";
+}
+
+function pointAdjustAmountPromptText(user: PrismaUser, locale: Locale) {
+  const name = escapeHtml(displayPrismaUser(user));
+  return locale === "zh-CN"
+    ? [`当前用户: <b>${name}</b>`, "", "请输入增减积分数量，例如 <code>10</code> 或 <code>-10</code>:"].join("\n")
+    : [`Current user: <b>${name}</b>`, "", "Send the point delta, for example <code>10</code> or <code>-10</code>:"].join("\n");
+}
+
+function pointsPanelText(settings: PointsSettings, locale: Locale) {
+  if (locale !== "zh-CN") {
+    return [
+      "<b>Ⓜ️ Points</b>",
+      "",
+      "Set points gained from daily sign-in, messages and invites. Points can be spent by giveaways or adjusted manually by admins.",
+      "",
+      `<b>Status:</b>${settings.enabled ? "✅On" : "❌Off"}`,
+      `<b>Delete sign-in reply:</b>${settings.deleteSignInMessage ? "✅On" : "❌Off"} (${settings.deleteSignInSeconds}s after)`,
+      "<b>Sign-in rule:</b>",
+      `└ Send <code>/sign_in</code>, daily sign-in earns: ${settings.signInPoints} point(s)`,
+      "",
+      "<blockquote>After the optimized alias flow, set trigger words for <code>/sign_in</code> under <b>Group commands - Command aliases</b>. The system no longer forces the built-in sign-in keyword.</blockquote>",
+      "",
+      "<b>Speech rule:</b>",
+      `└ 1 message earns: ${settings.speechPoints} point(s)`,
+      `└ Daily earning limit: ${formatPointsLimit(settings.speechDailyLimit, locale)} point(s)`,
+      `└ Minimum text length: ${settings.speechMinLength}`,
+      "<b>Invite rule:</b>",
+      `└ 1 invite earns: ${settings.invitePoints} point(s)`,
+      `└ Daily earning limit: ${formatPointsLimit(settings.inviteDailyLimit, locale)} point(s)`,
+      "Points alias:",
+      "└ Send <code>points</code> or <code>积分</code> in group to check your points",
+      "Ranking alias:",
+      "└ Send <code>points ranking</code> or <code>积分排名</code> in group to check ranking"
+    ].join("\n");
+  }
+
+  return [
+    "<b>Ⓜ️ 积分</b>",
+    "",
+    "设置群成员签到或发言获得积分，消耗积分抽奖或管理员手动扣除积分。",
+    "",
+    `<b>状态:</b>${settings.enabled ? "✅开启" : "❌关闭"}`,
+    `<b>删除签到信息:</b>${settings.deleteSignInMessage ? "✅开启" : "❌关闭"} (${settings.deleteSignInSeconds}s后删除)`,
+    "<b>签到规则:</b>",
+    `└ 发送 <code>/sign_in</code>，每日签到获得:${settings.signInPoints} 积分`,
+    "",
+    "<blockquote>新版优化后，请手动在 <b>群组命令-命令别名</b> 中，设置命令 <code>/sign_in</code> 的签到触发词别名。\n\n系统不再强制用户使用系统自带的 <b>签到</b> 关键词</blockquote>",
+    "",
+    "<b>发言规则:</b>",
+    `└ 发言1次，获得: ${settings.speechPoints} 积分`,
+    `└ 每日获取上限:${formatPointsLimit(settings.speechDailyLimit, locale)} 积分`,
+    `└ 最小字数长度限制: ${settings.speechMinLength}`,
+    "<b>邀请规则:</b>",
+    `└ 邀请1人，获得: ${settings.invitePoints} 积分`,
+    `└ 每日获取上限: ${formatPointsLimit(settings.inviteDailyLimit, locale)} 积分`,
+    "积分别名:",
+    "└ 群组中发送“<code>积分</code>”查询自己的积分",
+    "排名别名：",
+    "└ 群组中发送“<code>积分排名</code>”查询积分排名"
+  ].join("\n");
+}
+
+function pointsRuleText(settings: PointsSettings, rule: "sign" | "speech" | "invite", locale: Locale) {
+  if (rule === "sign") {
+    return locale === "zh-CN"
+      ? ["<b>⚙️ 签到规则</b>", "", `每日签到积分: ${settings.signInPoints}`, `签到信息删除延迟: ${settings.deleteSignInSeconds}s`].join("\n")
+      : ["<b>⚙️ Sign-in rule</b>", "", `Daily sign-in points: ${settings.signInPoints}`, `Sign-in reply delete delay: ${settings.deleteSignInSeconds}s`].join("\n");
+  }
+  if (rule === "speech") {
+    return locale === "zh-CN"
+      ? ["<b>⚙️ 发言规则</b>", "", `发言1次获得: ${settings.speechPoints} 积分`, `每日获取上限: ${formatPointsLimit(settings.speechDailyLimit, locale)} 积分`, `最小字数长度限制: ${settings.speechMinLength}`].join("\n")
+      : ["<b>⚙️ Speech rule</b>", "", `1 message earns: ${settings.speechPoints} point(s)`, `Daily earning limit: ${formatPointsLimit(settings.speechDailyLimit, locale)} point(s)`, `Minimum text length: ${settings.speechMinLength}`].join("\n");
+  }
+  return locale === "zh-CN"
+    ? ["<b>⚙️ 邀请规则</b>", "", `邀请1人获得: ${settings.invitePoints} 积分`, `每日获取上限: ${formatPointsLimit(settings.inviteDailyLimit, locale)} 积分`].join("\n")
+    : ["<b>⚙️ Invite rule</b>", "", `1 invite earns: ${settings.invitePoints} point(s)`, `Daily earning limit: ${formatPointsLimit(settings.inviteDailyLimit, locale)} point(s)`].join("\n");
+}
+
+function formatPointsLimit(value: number, locale: Locale) {
+  if (value <= 0) return locale === "zh-CN" ? "无限制" : "Unlimited";
+  return String(value);
 }
 
 function groupCommandLabel(key: GroupCommandKey, locale: Locale) {
@@ -8326,14 +11523,20 @@ function normalizeBannedWordForMatch(value: string) {
 }
 
 function isBannedWordsPunishment(value: unknown): value is BannedWordsPunishment {
-  return value === "warn_mute" || value === "mute" || value === "ban" || value === "delete_only";
+  return value === "warn" || value === "mute" || value === "kick" || value === "ban" || value === "delete_only";
 }
 
-function nextBannedWordsPunishment(value: BannedWordsPunishment): BannedWordsPunishment {
-  if (value === "warn_mute") return "mute";
-  if (value === "mute") return "ban";
-  if (value === "ban") return "delete_only";
-  return "warn_mute";
+function parseBannedWordsPunishment(value: unknown): BannedWordsPunishment {
+  if (value === "warn_mute") return "warn";
+  return isBannedWordsPunishment(value) ? value : defaultBannedWordsSettings.punishment;
+}
+
+function isBannedWordsFinalPunishment(value: unknown): value is BannedWordsFinalPunishment {
+  return value === "mute" || value === "kick" || value === "ban";
+}
+
+function isBlocklistBotPunishment(value: unknown): value is BlocklistBotPunishment {
+  return value === "off" || value === "warn" || value === "mute" || value === "kick" || value === "ban";
 }
 
 function userChatKey(chatId: string, userId: number) {
@@ -8359,6 +11562,93 @@ function isGroupLike(chat: Chat) {
 function displayName(user: User) {
   const fullName = [user.first_name, user.last_name].filter(Boolean).join(" ");
   return escapeHtml(fullName || user.username || String(user.id));
+}
+
+function buildUserProfileChange(previous: StoredUserProfile, current: StoredUserProfile): UserProfileChange {
+  return {
+    previous,
+    current,
+    nicknameChanged: profileNickname(previous) !== profileNickname(current),
+    usernameChanged: normalizeUsername(previous.username) !== normalizeUsername(current.username)
+  };
+}
+
+function profileNickname(user: StoredUserProfile) {
+  return [user.firstName, user.lastName].filter(Boolean).join(" ").trim();
+}
+
+function normalizeUsername(username: string | null) {
+  return (username ?? "").trim().toLocaleLowerCase();
+}
+
+function formatProfileField(value: string | null | undefined, locale: Locale) {
+  const fallback = locale === "zh-CN" ? "无" : "None";
+  return escapeHtml((value ?? "").trim() || fallback);
+}
+
+function linkedChannelPinnedMessage(message: Message) {
+  const pinned = "pinned_message" in message ? message.pinned_message : undefined;
+  if (!pinned) return false;
+  const anyMessage = pinned as Message & {
+    is_automatic_forward?: boolean;
+    sender_chat?: Chat;
+    forward_origin?: { type?: string; chat?: Chat };
+    forward_from_chat?: Chat;
+  };
+  return Boolean(
+    anyMessage.is_automatic_forward
+    || anyMessage.sender_chat?.type === "channel"
+    || anyMessage.forward_origin?.type === "channel"
+    || anyMessage.forward_origin?.chat?.type === "channel"
+    || anyMessage.forward_from_chat?.type === "channel"
+  );
+}
+
+async function maybeNotifyMemberProfileChange(ctx: Context, chat: PrismaChat, user: User, settings: GroupMembersSettings) {
+  const change = userProfileChanges.get(user.id);
+  if (!change) return;
+  userProfileChanges.delete(user.id);
+
+  const changedNickname = settings.watchNicknameChange && change.nicknameChanged;
+  const changedUsername = settings.watchUsernameChange && change.usernameChanged;
+  if (!changedNickname && !changedUsername) return;
+
+  const locale = await getLocale(ctx);
+  const link = `<a href="tg://user?id=${user.id}">${displayName(user)}</a>`;
+  const lines = locale === "zh-CN"
+    ? ["👥 <b>成员资料变更</b>", "", `用户：${link}`]
+    : ["👥 <b>Member profile changed</b>", "", `User: ${link}`];
+
+  if (changedNickname) {
+    lines.push(
+      locale === "zh-CN"
+        ? `昵称：${formatProfileField(profileNickname(change.previous), locale)} -> ${formatProfileField(profileNickname(change.current), locale)}`
+        : `Nickname: ${formatProfileField(profileNickname(change.previous), locale)} -> ${formatProfileField(profileNickname(change.current), locale)}`
+    );
+  }
+
+  if (changedUsername) {
+    lines.push(
+      locale === "zh-CN"
+        ? `用户名：${formatProfileField(change.previous.username ? `@${change.previous.username}` : "", locale)} -> ${formatProfileField(change.current.username ? `@${change.current.username}` : "", locale)}`
+        : `Username: ${formatProfileField(change.previous.username ? `@${change.previous.username}` : "", locale)} -> ${formatProfileField(change.current.username ? `@${change.current.username}` : "", locale)}`
+    );
+  }
+
+  await ctx.api.sendMessage(Number(chat.telegramChatId), lines.join("\n"), {
+    parse_mode: "HTML",
+    link_preview_options: { is_disabled: true }
+  }).catch(() => undefined);
+}
+
+async function maybeUnpinLinkedChannelMessage(ctx: Context, message: Message) {
+  if (!linkedChannelPinnedMessage(message) || !ctx.chat) return;
+
+  const pinned = "pinned_message" in message ? message.pinned_message : undefined;
+  if (!pinned) return;
+
+  await ctx.api.unpinChatMessage(ctx.chat.id, pinned.message_id).catch(() => undefined);
+  await ctx.api.deleteMessage(ctx.chat.id, message.message_id).catch(() => undefined);
 }
 
 function displayPrismaUser(user: PrismaUser) {
