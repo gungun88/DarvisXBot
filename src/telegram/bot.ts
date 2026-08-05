@@ -147,6 +147,7 @@ type JoinVerifySettings = {
   enabled: boolean;
   adminApproval: boolean;
   mode: JoinVerifyMode;
+  requiredChannel: string | undefined;
   durationMinutes: number;
   punishment: "kick" | "ban" | "mute";
 };
@@ -157,11 +158,17 @@ type BlocklistSettings = {
   blockBots: boolean;
   blockBotPunishment: BlocklistBotPunishment;
   banAfterLeave: boolean;
+  banAfterLeaveSeconds: number;
   blockFlashJoinLeave: boolean;
   blockFollowerRaid: boolean;
   flashWindowSeconds: number;
   raidWindowSeconds: number;
   raidJoinThreshold: number;
+};
+
+type BlocklistInputDraft = {
+  chatId: string;
+  field: "leaveBanDuration";
 };
 
 type InviteLinkSettings = {
@@ -466,6 +473,11 @@ type WelcomeInputDraft = {
   field: WelcomeInputField;
 };
 
+type JoinVerifyInputDraft = {
+  chatId: string;
+  field: "requiredChannel";
+};
+
 type ImportConfigDraft = {
   targetChatId: string;
 };
@@ -522,6 +534,7 @@ const defaultJoinVerifySettings: JoinVerifySettings = {
   enabled: false,
   adminApproval: false,
   mode: "button",
+  requiredChannel: undefined,
   durationMinutes: 1,
   punishment: "mute"
 };
@@ -530,6 +543,7 @@ const defaultBlocklistSettings: BlocklistSettings = {
   blockBots: false,
   blockBotPunishment: "off",
   banAfterLeave: false,
+  banAfterLeaveSeconds: 60,
   blockFlashJoinLeave: false,
   blockFollowerRaid: false,
   flashWindowSeconds: 120,
@@ -675,10 +689,12 @@ const publishDrafts = new Map<number, PublishDraft>();
 const scheduledInputDrafts = new Map<number, ScheduledInputDraft>();
 const autoReplyInputDrafts = new Map<number, AutoReplyInputDraft>();
 const autoReplySelectedChats = new Map<number, string>();
+const blocklistInputDrafts = new Map<number, BlocklistInputDraft>();
 const bannedWordsInputDrafts = new Map<number, BannedWordsInputDraft>();
 const groupCommandAliasInputDrafts = new Map<number, GroupCommandAliasInputDraft>();
 const pointsInputDrafts = new Map<number, PointsInputDraft>();
 const welcomeInputDrafts = new Map<number, WelcomeInputDraft>();
+const joinVerifyInputDrafts = new Map<number, JoinVerifyInputDraft>();
 const inviteLinkInputDrafts = new Map<number, InviteLinkInputDraft>();
 const giveawayInputDrafts = new Map<number, GiveawayInputDraft>();
 const importConfigDrafts = new Map<number, ImportConfigDraft>();
@@ -938,11 +954,13 @@ export function createBot(config: AppConfig) {
   bot.on("message", async (ctx) => {
     const locale = await getLocale(ctx);
     if (await handleAntiSpamInputMessage(ctx, locale)) return;
+    if (await handleBlocklistInputMessage(ctx, locale)) return;
     if (await handleBannedWordsInputMessage(ctx, locale)) return;
     if (await handlePointsInputMessage(ctx, config, locale)) return;
     if (await handleGroupCommandAliasInputMessage(ctx, locale)) return;
     if (await handleAutoReplyInputMessage(ctx, locale)) return;
     if (await handleWelcomeInputMessage(ctx, locale)) return;
+    if (await handleJoinVerifyInputMessage(ctx, locale)) return;
     if (await handleInviteLinkInputMessage(ctx, locale)) return;
     if (await handleGiveawayInputMessage(ctx, config, locale)) return;
     if (await handleImportConfigInputMessage(ctx, locale)) return;
@@ -1073,10 +1091,12 @@ function clearUserInputState(userId: number) {
   timezoneInputUsers.delete(userId);
   scheduledInputDrafts.delete(userId);
   autoReplyInputDrafts.delete(userId);
+  blocklistInputDrafts.delete(userId);
   bannedWordsInputDrafts.delete(userId);
   groupCommandAliasInputDrafts.delete(userId);
   pointsInputDrafts.delete(userId);
   welcomeInputDrafts.delete(userId);
+  joinVerifyInputDrafts.delete(userId);
   inviteLinkInputDrafts.delete(userId);
   giveawayInputDrafts.delete(userId);
   importConfigDrafts.delete(userId);
@@ -1623,16 +1643,58 @@ function publishMediaPromptText(locale: Locale) {
 function membershipPanelText(locale: Locale) {
   return locale === "zh-CN"
     ? [
-        "💎 <b>订阅会员</b>",
-        "这里用于管理会员套餐、有效期和到期提醒。",
+        "💎 <b>高级会员专属功能</b>",
         "",
-        "请选择一个套餐查看详情："
+        "<b>到期时间：</b>未开通",
+        "",
+        "<b>开通会员，解锁全面进阶功能，助你高效管理频道与群组！</b>",
+        "",
+        "🔹 <b>1. 定时消息数量提升</b>",
+        "📍 免费：每频道/群组可设定 5 条",
+        "🚀 会员：每频道/群组可设定 50 条",
+        "",
+        "🔹 <b>2. 频道同步数量提升</b>",
+        "📍 免费：最多同步 2 个频道",
+        "🚀 会员：最多同步 20 个频道",
+        "",
+        "🔹 <b>3. 群组自动回复扩展</b>",
+        "📍 免费：最多设置 10 条规则",
+        "🚀 会员：最多设置 300 条规则",
+        "",
+        "🔹 <b>4. 屏蔽闪进闪退功能（会员专属）</b>",
+        "🛡 自动识别并屏蔽短时间内反复进退群用户",
+        "💡 防止刷屏干扰，维护群组秩序",
+        "",
+        "🔹 <b>5. 任务优先处理机制</b>",
+        "⚙️ 会员任务将被系统优先处理",
+        "⚡️ 响应更快，服务更稳定"
       ].join("\n")
     : [
-        "💎 <b>Memberships</b>",
-        "Manage membership plans, expiration and reminders here.",
+        "💎 <b>Premium features</b>",
         "",
-        "Choose a plan to view details:"
+        "<b>Expiration:</b> Not active",
+        "",
+        "<b>Unlock advanced tools for efficient channel and group management.</b>",
+        "",
+        "🔹 <b>1. More scheduled messages</b>",
+        "📍 Free: 5 per channel/group",
+        "🚀 Premium: 50 per channel/group",
+        "",
+        "🔹 <b>2. More channel sync targets</b>",
+        "📍 Free: up to 2 channels",
+        "🚀 Premium: up to 20 channels",
+        "",
+        "🔹 <b>3. More group auto-reply rules</b>",
+        "📍 Free: up to 10 rules",
+        "🚀 Premium: up to 300 rules",
+        "",
+        "🔹 <b>4. Flash join/leave blocking</b>",
+        "🛡 Detect and block users who repeatedly join and leave quickly",
+        "💡 Reduce spam noise and keep the group orderly",
+        "",
+        "🔹 <b>5. Priority task processing</b>",
+        "⚙️ Premium tasks are processed first",
+        "⚡️ Faster responses and more stable service"
       ].join("\n");
 }
 
@@ -1644,7 +1706,7 @@ function membershipPanelKeyboard(locale: Locale) {
     .text("55U 6个月", "membership:plan:6m")
     .text("100U 1年", "membership:plan:12m")
     .row()
-    .text(locale === "zh-CN" ? "🏠 首页" : "🏠 Home", "menu:home");
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", "menu:home");
 }
 
 function chatPanelKeyboard(chatId: string, scope: "group" | "channel", locale: Locale) {
@@ -1739,12 +1801,20 @@ function blocklistBotKeyboard(chatId: string, settings: BlocklistSettings, local
 }
 
 function blocklistLeaveKeyboard(chatId: string, settings: BlocklistSettings, locale: Locale) {
-  const selected = (active: boolean, label: string) => active ? `✅${label}` : label;
   return new InlineKeyboard()
-    .text(selected(!settings.banAfterLeave, locale === "zh-CN" ? "关闭" : "Off"), `blocklist:leave:${chatId}:off`)
-    .text(selected(settings.banAfterLeave, locale === "zh-CN" ? "🚷封禁" : "🚷 Ban"), `blocklist:leave:${chatId}:ban`)
+    .text(locale === "zh-CN" ? "❌关闭" : "❌ Off", `blocklist:leave:${chatId}:off`)
+    .text(locale === "zh-CN" ? "🚷封禁" : "🚷 Ban", `blocklist:leave:${chatId}:ban`)
+    .row()
+    .text(locale === "zh-CN" ? "🚷🕘设置封禁时长" : "🚷🕘 Set ban duration", `blocklist:leave_duration:${chatId}`)
     .row()
     .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `blocklist:back:${chatId}`);
+}
+
+function blocklistLeaveDurationKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "🚷永久封禁" : "🚷 Permanent ban", `blocklist:leave_forever:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `blocklist:menu:leave:${chatId}`);
 }
 
 function blocklistPremiumKeyboard(chatId: string, locale: Locale) {
@@ -1871,6 +1941,10 @@ function welcomeSavedKeyboard(chatId: string, locale: Locale) {
   return new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `chat_feature:welcome:${chatId}`);
 }
 
+function joinVerifyInputKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `join_verify:cancel_input:${chatId}`);
+}
+
 function joinVerifyKeyboard(chatId: string, settings: JoinVerifySettings, locale: Locale) {
   const selected = (active: boolean, label: string) => active ? `✅${label}` : label;
   const text = locale === "zh-CN"
@@ -1884,6 +1958,7 @@ function joinVerifyKeyboard(chatId: string, settings: JoinVerifySettings, locale
         math: "数学题",
         captcha: "数字验证码",
         emoji: "Emoji识别",
+        channel: "验证频道",
         duration: "验证时长:",
         mute: "禁言",
         kick: "踢出",
@@ -1900,6 +1975,7 @@ function joinVerifyKeyboard(chatId: string, settings: JoinVerifySettings, locale
         math: "Math",
         captcha: "Number captcha",
         emoji: "Emoji",
+        channel: "Channel",
         duration: "Duration:",
         mute: "Mute",
         kick: "Kick",
@@ -1922,6 +1998,7 @@ function joinVerifyKeyboard(chatId: string, settings: JoinVerifySettings, locale
     .text(selected(settings.mode === "captcha", text.captcha), `join_verify:mode:captcha:${chatId}`)
     .row()
     .text(selected(settings.mode === "emoji", text.emoji), `join_verify:mode:emoji:${chatId}`)
+    .text(selected(settings.mode === "channel", text.channel), `join_verify:mode:channel:${chatId}`)
     .row()
     .text(text.duration, `join_verify:noop:${chatId}`)
     .text(selected(settings.durationMinutes === 1, locale === "zh-CN" ? "1分钟" : "1m"), `join_verify:duration:1:${chatId}`)
@@ -2356,7 +2433,10 @@ function productsKeyboard(chatId: string, settings: PointExchangeSettings, local
   const keyboard = new InlineKeyboard();
   for (const product of settings.products) {
     const name = product.name || (locale === "zh-CN" ? "未命名商品" : "Unnamed product");
-    keyboard.text(`${product.listed ? "✅" : "⬜"} ${product.id} ${name}`.slice(0, 64), `points:product:${chatId}:${product.id}`).row();
+    keyboard
+      .text(`${product.listed ? "✅" : "⬜"} ${product.id} ${name}`.slice(0, 48), `points:product:${chatId}:${product.id}`)
+      .text(locale === "zh-CN" ? "删除🗑" : "Delete 🗑", `points:product_delete:${chatId}:${product.id}`)
+      .row();
   }
   return keyboard
     .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `points:exchange:${chatId}`)
@@ -2378,7 +2458,15 @@ function productKeyboard(chatId: string, product: PointProduct, locale: Locale) 
     .row()
     .text(locale === "zh-CN" ? "设置每日兑换上限" : "Set daily limit", `points:product_edit:${chatId}:${product.id}:daily_limit`)
     .row()
+    .text(locale === "zh-CN" ? "删除商品🗑" : "Delete product 🗑", `points:product_delete:${chatId}:${product.id}`)
+    .row()
     .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `points:products:${chatId}`);
+}
+
+function productDeleteConfirmKeyboard(chatId: string, productId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "🔙取消" : "🔙 Cancel", `points:product:${chatId}:${productId}`)
+    .text(locale === "zh-CN" ? "❗️确认删除" : "❗️Confirm delete", `points:product_delete_confirm:${chatId}:${productId}`);
 }
 
 function exchangeProductListKeyboard(chatId: string, products: PointProduct[], locale: Locale) {
@@ -2497,11 +2585,11 @@ function groupMembersKeyboard(chat: PrismaChat, settings: GroupMembersSettings, 
   const mark = (enabled: boolean, label: string) => `${enabled ? "✅" : "❌"}${label}`;
 
   return new InlineKeyboard()
-    .text(mark(settings.watchNicknameChange, labels.nickname), `group_members:toggle:nickname:${chat.id}`)
+    .text(mark(settings.watchNicknameChange, labels.nickname), `group_members:t:n:${chat.id}`)
     .row()
-    .text(mark(settings.watchUsernameChange, labels.username), `group_members:toggle:username:${chat.id}`)
+    .text(mark(settings.watchUsernameChange, labels.username), `group_members:t:u:${chat.id}`)
     .row()
-    .text(mark(settings.unpinLinkedChannelMessages, labels.unpinLinkedChannel), `group_members:toggle:unpin_linked_channel:${chat.id}`)
+    .text(mark(settings.unpinLinkedChannelMessages, labels.unpinLinkedChannel), `group_members:t:p:${chat.id}`)
     .row()
     .text(labels.back, `menu:chat:${scope}:${chat.id}`);
 }
@@ -4243,6 +4331,40 @@ async function handleAutoReplyInputMessage(ctx: Context, locale: Locale) {
   return true;
 }
 
+async function handleBlocklistInputMessage(ctx: Context, locale: Locale) {
+  if (!ctx.from || !ctx.message) return false;
+  const draft = blocklistInputDrafts.get(ctx.from.id);
+  if (!draft) return false;
+
+  const chat = await ensureControlPermissionForChatId(ctx, draft.chatId, locale);
+  if (!chat) {
+    blocklistInputDrafts.delete(ctx.from.id);
+    return true;
+  }
+
+  const text = getMessageText(ctx.message);
+  const minutes = text ? Number(text.trim()) : NaN;
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 525600) {
+    const settings = await getBlocklistSettings(chat.id);
+    await ctx.reply(blocklistLeaveDurationPromptText(settings, locale), {
+      parse_mode: "HTML",
+      reply_markup: blocklistLeaveDurationKeyboard(chat.id, locale)
+    });
+    return true;
+  }
+
+  const settings = await getBlocklistSettings(chat.id);
+  settings.banAfterLeave = true;
+  settings.banAfterLeaveSeconds = minutes * 60;
+  await saveBlocklistSettings(chat.id, settings);
+  blocklistInputDrafts.delete(ctx.from.id);
+  await ctx.reply(blocklistLeaveText(settings, locale), {
+    parse_mode: "HTML",
+    reply_markup: blocklistLeaveKeyboard(chat.id, settings, locale)
+  });
+  return true;
+}
+
 async function handleBannedWordsInputMessage(ctx: Context, locale: Locale) {
   if (!ctx.from) return false;
   const draft = bannedWordsInputDrafts.get(ctx.from.id);
@@ -4479,6 +4601,55 @@ async function handleWelcomeInputMessage(ctx: Context, locale: Locale) {
   await ctx.reply(welcomeInputSavedText(locale), {
     parse_mode: "HTML",
     reply_markup: welcomeSavedKeyboard(draft.chatId, locale)
+  });
+  return true;
+}
+
+async function handleJoinVerifyInputMessage(ctx: Context, locale: Locale) {
+  if (!ctx.from || ctx.chat?.type !== "private") return false;
+  const draft = joinVerifyInputDrafts.get(ctx.from.id);
+  if (!draft) return false;
+
+  if (!(await ensureControlPermissionForChatId(ctx, draft.chatId, locale))) {
+    joinVerifyInputDrafts.delete(ctx.from.id);
+    return true;
+  }
+
+  const settings = await getJoinVerifySettings(draft.chatId);
+  const text = getMessageText(ctx.message);
+  if (!text) {
+    await ctx.reply(joinVerifyChannelPromptText(settings, locale), {
+      parse_mode: "HTML",
+      reply_markup: joinVerifyInputKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
+  const channel = normalizeJoinVerifyRequiredChannel(text);
+  if (!channel) {
+    await ctx.reply(joinVerifyInvalidChannelText(text, locale), {
+      parse_mode: "HTML",
+      reply_markup: joinVerifyInputKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
+  if (!(await canBotReadJoinVerifyChannel(ctx.api, channel))) {
+    await ctx.reply(joinVerifyUnreadableChannelText(locale), {
+      parse_mode: "HTML",
+      reply_markup: joinVerifyInputKeyboard(draft.chatId, locale)
+    });
+    return true;
+  }
+
+  settings.mode = "channel";
+  settings.requiredChannel = channel;
+  await saveSetting(draft.chatId, "join_verify", settingsToJson(settings));
+  joinVerifyInputDrafts.delete(ctx.from.id);
+
+  await ctx.reply(joinVerifyText(settings, locale), {
+    parse_mode: "HTML",
+    reply_markup: joinVerifyKeyboard(draft.chatId, settings, locale)
   });
   return true;
 }
@@ -5632,10 +5803,10 @@ async function handleGroupMembersCallback(ctx: Context) {
   if (!chat) return;
 
   const settings = await getGroupMembersSettings(chat.id);
-  if (action === "toggle") {
-    if (key === "nickname") settings.watchNicknameChange = !settings.watchNicknameChange;
-    if (key === "username") settings.watchUsernameChange = !settings.watchUsernameChange;
-    if (key === "unpin_linked_channel") settings.unpinLinkedChannelMessages = !settings.unpinLinkedChannelMessages;
+  if (action === "t" || action === "toggle") {
+    if (key === "n" || key === "nickname") settings.watchNicknameChange = !settings.watchNicknameChange;
+    if (key === "u" || key === "username") settings.watchUsernameChange = !settings.watchUsernameChange;
+    if (key === "p" || key === "unpin_linked_channel") settings.unpinLinkedChannelMessages = !settings.unpinLinkedChannelMessages;
     await saveGroupMembersSettings(chat.id, settings);
   }
 
@@ -6078,6 +6249,7 @@ async function handleBlocklistCallback(ctx: Context) {
     if (!chatId) return;
     const chat = await ensureControlPermissionForChatId(ctx, chatId, locale);
     if (!chat) return;
+    if (ctx.from) blocklistInputDrafts.delete(ctx.from.id);
     const settings = await getBlocklistSettings(chat.id);
     await editOrReply(ctx, blocklistText(settings, locale), blocklistKeyboard(chat.id, locale));
     return;
@@ -6089,6 +6261,7 @@ async function handleBlocklistCallback(ctx: Context) {
     if (!panel || !chatId) return;
     const chat = await ensureControlPermissionForChatId(ctx, chatId, locale);
     if (!chat) return;
+    if (ctx.from) blocklistInputDrafts.delete(ctx.from.id);
     const settings = await getBlocklistSettings(chat.id);
     await renderBlocklistPanel(ctx, chat.id, panel, settings, locale);
     return;
@@ -6108,6 +6281,32 @@ async function handleBlocklistCallback(ctx: Context) {
       await saveBlocklistSettings(legacyChatId, legacySettings);
     }
     await editOrReply(ctx, blocklistText(legacySettings, locale), blocklistKeyboard(legacyChatId, locale));
+    return;
+  }
+
+  if (action === "leave_duration") {
+    const chatId = parts[2];
+    if (!chatId || !ctx.from) return;
+    const chat = await ensureControlPermissionForChatId(ctx, chatId, locale);
+    if (!chat) return;
+    const settings = await getBlocklistSettings(chat.id);
+    clearUserInputState(ctx.from.id);
+    blocklistInputDrafts.set(ctx.from.id, { chatId: chat.id, field: "leaveBanDuration" });
+    await editOrReply(ctx, blocklistLeaveDurationPromptText(settings, locale), blocklistLeaveDurationKeyboard(chat.id, locale));
+    return;
+  }
+
+  if (action === "leave_forever") {
+    const chatId = parts[2];
+    if (!chatId) return;
+    const chat = await ensureControlPermissionForChatId(ctx, chatId, locale);
+    if (!chat) return;
+    const settings = await getBlocklistSettings(chat.id);
+    settings.banAfterLeave = true;
+    settings.banAfterLeaveSeconds = 0;
+    await saveBlocklistSettings(chat.id, settings);
+    if (ctx.from) blocklistInputDrafts.delete(ctx.from.id);
+    await editOrReply(ctx, blocklistLeaveText(settings, locale), blocklistLeaveKeyboard(chat.id, settings, locale));
     return;
   }
 
@@ -6233,7 +6432,7 @@ async function handleJoinVerifyCallback(ctx: Context) {
   const parts = ctx.callbackQuery?.data?.split(":") ?? [];
   const action = parts[1];
   const value = parts[2];
-  const chatId = parts[3] ?? (
+  const chatId = (action === "cancel_input" ? value : parts[3]) ?? (
     action === "toggle" || action === "approval" || action === "noop" ? value : undefined
   );
   if (!action || !chatId) return;
@@ -6243,6 +6442,20 @@ async function handleJoinVerifyCallback(ctx: Context) {
 
   const settings = await getJoinVerifySettings(chatId);
   let changed = false;
+
+  if (action === "mode" && value === "channel") {
+    if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    joinVerifyInputDrafts.set(ctx.from.id, { chatId, field: "requiredChannel" });
+    await editOrReply(ctx, joinVerifyChannelPromptText(settings, locale), joinVerifyInputKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "cancel_input") {
+    if (ctx.from) joinVerifyInputDrafts.delete(ctx.from.id);
+    await editOrReply(ctx, joinVerifyText(settings, locale), joinVerifyKeyboard(chatId, settings, locale));
+    return;
+  }
 
   if (action === "status" && (value === "on" || value === "off")) {
     settings.enabled = value === "on";
@@ -6268,6 +6481,7 @@ async function handleJoinVerifyCallback(ctx: Context) {
   }
 
   if (changed) {
+    if (ctx.from) joinVerifyInputDrafts.delete(ctx.from.id);
     await saveSetting(chatId, "join_verify", settingsToJson(settings));
   }
 
@@ -6692,6 +6906,28 @@ async function handlePointsCallback(ctx: Context) {
     return;
   }
 
+  if (action === "product_delete" && value) {
+    const settings = await getPointExchangeSettings(chatId);
+    const product = settings.products.find((item) => item.id === value);
+    if (!product) {
+      await openProductsPanel(ctx, locale, chat);
+      return;
+    }
+    await editOrReply(ctx, productDeleteConfirmText(product, locale), productDeleteConfirmKeyboard(chatId, value, locale));
+    return;
+  }
+
+  if (action === "product_delete_confirm" && value) {
+    const settings = await getPointExchangeSettings(chatId);
+    const nextProducts = settings.products.filter((item) => item.id !== value);
+    if (nextProducts.length !== settings.products.length) {
+      settings.products = nextProducts;
+      await savePointExchangeSettings(chatId, settings);
+    }
+    await openProductsPanel(ctx, locale, chat);
+    return;
+  }
+
   if (action === "product_listed" && value) {
     const settings = await getPointExchangeSettings(chatId);
     const product = settings.products.find((item) => item.id === value);
@@ -7073,7 +7309,7 @@ async function handleBlocklistLeftChatMember(ctx: Context, member: User) {
   recentJoins.delete(userChatKey(chat.id, member.id));
 
   if (settings.banAfterLeave) {
-    await banUser(ctx, ctx.chat.id, member.id);
+    await banUser(ctx, ctx.chat.id, member.id, settings.banAfterLeaveSeconds);
     return;
   }
 
@@ -7149,6 +7385,19 @@ async function handleVerificationCallback(ctx: Context) {
     return;
   }
 
+  if (expectedAnswer === "channel" || stored?.mode === "channel") {
+    const requiredChannel = await resolveJoinVerificationRequiredChannel(chatId, stored?.chatId);
+    if (!requiredChannel) {
+      await ctx.answerCallbackQuery({ text: "验证频道未设置，请联系管理员。", show_alert: true }).catch(() => undefined);
+      return;
+    }
+
+    if (!(await userJoinedJoinVerifyChannel(ctx.api, requiredChannel, userId))) {
+      await ctx.answerCallbackQuery({ text: "请先加入指定频道后再点击验证。", show_alert: true }).catch(() => undefined);
+      return;
+    }
+  }
+
   if (pending) clearTimeout(pending.timeout);
   pendingVerifications.delete(key);
   await deleteStoredJoinVerification(chatId, userId);
@@ -7160,7 +7409,7 @@ async function handleVerificationCallback(ctx: Context) {
 
 async function startJoinVerification(ctx: Context, chat: PrismaChat, member: User, settings: JoinVerifySettings) {
   const telegramChatId = Number(chat.telegramChatId);
-  const challenge = createJoinVerificationChallenge(settings.mode);
+  const challenge = createJoinVerificationChallenge(settings.mode, settings.requiredChannel);
   await ctx.api.restrictChatMember(telegramChatId, member.id, noChatPermissions()).catch(() => undefined);
 
   const sent = await ctx.api.sendMessage(
@@ -9525,6 +9774,7 @@ async function getBlocklistSettings(chatId: string) {
     blockBots: blockBotPunishment !== "off",
     blockBotPunishment,
     banAfterLeave: typeof raw.banAfterLeave === "boolean" ? raw.banAfterLeave : defaultBlocklistSettings.banAfterLeave,
+    banAfterLeaveSeconds: clampNumber(Number(raw.banAfterLeaveSeconds ?? defaultBlocklistSettings.banAfterLeaveSeconds), 0, 31_536_000),
     blockFlashJoinLeave: typeof raw.blockFlashJoinLeave === "boolean" ? raw.blockFlashJoinLeave : defaultBlocklistSettings.blockFlashJoinLeave,
     blockFollowerRaid: typeof raw.blockFollowerRaid === "boolean" ? raw.blockFollowerRaid : defaultBlocklistSettings.blockFollowerRaid,
     flashWindowSeconds: clampNumber(Number(raw.flashWindowSeconds ?? defaultBlocklistSettings.flashWindowSeconds), 10, 3600),
@@ -9538,6 +9788,7 @@ async function saveBlocklistSettings(chatId: string, settings: BlocklistSettings
     blockBots: settings.blockBotPunishment !== "off",
     blockBotPunishment: settings.blockBotPunishment,
     banAfterLeave: settings.banAfterLeave,
+    banAfterLeaveSeconds: settings.banAfterLeaveSeconds,
     blockFlashJoinLeave: settings.blockFlashJoinLeave,
     blockFollowerRaid: settings.blockFollowerRaid,
     flashWindowSeconds: settings.flashWindowSeconds,
@@ -10441,6 +10692,9 @@ async function getJoinVerifySettings(chatId: string): Promise<JoinVerifySettings
     enabled: typeof raw.enabled === "boolean" ? raw.enabled : defaultJoinVerifySettings.enabled,
     adminApproval: typeof raw.adminApproval === "boolean" ? raw.adminApproval : defaultJoinVerifySettings.adminApproval,
     mode: isJoinVerifyMode(raw.mode) ? raw.mode : defaultJoinVerifySettings.mode,
+    requiredChannel: typeof raw.requiredChannel === "string"
+      ? normalizeJoinVerifyRequiredChannel(raw.requiredChannel) || undefined
+      : undefined,
     durationMinutes: Number.isFinite(durationValue) && durationValue > 0
       ? clampNumber(durationValue, 1, 24 * 60)
       : defaultJoinVerifySettings.durationMinutes,
@@ -11707,7 +11961,7 @@ function blocklistText(settings: BlocklistSettings, locale: Locale) {
     return [
       "<b>🚫 Block</b>",
       `Bots: ${blocklistBotPunishmentLabel(settings.blockBotPunishment, locale)}`,
-      `Ban after leave: ${onOff(settings.banAfterLeave)}`,
+      `Ban after leave: ${blocklistLeaveStatusLabel(settings, locale)}`,
       `Flash join/leave: ${onOff(settings.blockFlashJoinLeave)} (${settings.flashWindowSeconds}s)`,
       `Join raid: ${onOff(settings.blockFollowerRaid)} (${settings.raidJoinThreshold}/${settings.raidWindowSeconds}s)`
     ].join("\n");
@@ -11716,7 +11970,7 @@ function blocklistText(settings: BlocklistSettings, locale: Locale) {
   return [
     "<b>🚫👤 屏蔽</b>",
     `屏蔽机器人：${blocklistBotPunishmentLabel(settings.blockBotPunishment, locale)}`,
-    `退群封禁：${onOffZh(settings.banAfterLeave)}`,
+    `退群封禁：${blocklistLeaveStatusLabel(settings, locale)}`,
     `屏蔽闪进闪退：${onOffZh(settings.blockFlashJoinLeave)}（${settings.flashWindowSeconds} 秒内退群）`,
     `屏蔽刷粉攻击：${onOffZh(settings.blockFollowerRaid)}（${settings.raidWindowSeconds} 秒 ${settings.raidJoinThreshold} 人）`
   ].join("\n");
@@ -11747,14 +12001,32 @@ function blocklistLeaveText(settings: BlocklistSettings, locale: Locale) {
         "",
         "封禁离开群组(频道)的用户。",
         "",
-        `<b>状态:</b> ${onOffZh(settings.banAfterLeave)}`
+        `<b>状态:</b> ${blocklistLeaveStatusLabel(settings, locale)}`
       ].join("\n")
     : [
         "🚪 <b>Ban leavers</b>",
         "",
         "Ban users who leave the group or channel.",
         "",
-        `<b>Status:</b> ${onOff(settings.banAfterLeave)}`
+        `<b>Status:</b> ${blocklistLeaveStatusLabel(settings, locale)}`
+      ].join("\n");
+}
+
+function blocklistLeaveDurationPromptText(settings: BlocklistSettings, locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "🚪 <b>退群封禁</b>",
+        "",
+        `当前设置: ${blocklistBanDurationLabel(settings.banAfterLeaveSeconds, locale)}`,
+        "",
+        "👉 输入封禁时长，如 <strong>1</strong>，单位/分钟:"
+      ].join("\n")
+    : [
+        "🚪 <b>Ban leavers</b>",
+        "",
+        `Current duration: ${blocklistBanDurationLabel(settings.banAfterLeaveSeconds, locale)}`,
+        "",
+        "👉 Send the ban duration in minutes, for example <strong>1</strong>:"
       ].join("\n");
 }
 
@@ -11770,7 +12042,7 @@ function blocklistFlashText(locale: Locale) {
     : [
         "🏃‍♂️ <b>Block flash join/leave</b>",
         "",
-        "If a user leaves a group or channel seconds after joining, service and welcome messages are deleted.",
+        "If users leave a group or channel seconds after joining, service and welcome messages are deleted.",
         "You can also set punishment for these users.",
         "<strong>This feature requires a membership.</strong>"
       ].join("\n");
@@ -11807,6 +12079,22 @@ function blocklistBotPunishmentLabel(punishment: BlocklistBotPunishment, locale:
   if (punishment === "mute") return "Mute";
   if (punishment === "kick") return "Kick";
   return "Ban";
+}
+
+function blocklistLeaveStatusLabel(settings: BlocklistSettings, locale: Locale) {
+  if (!settings.banAfterLeave) return locale === "zh-CN" ? "关闭" : "Off";
+  return locale === "zh-CN"
+    ? `封禁 ${blocklistBanDurationLabel(settings.banAfterLeaveSeconds, locale)}`
+    : `Ban ${blocklistBanDurationLabel(settings.banAfterLeaveSeconds, locale)}`;
+}
+
+function blocklistBanDurationLabel(seconds: number, locale: Locale) {
+  if (seconds <= 0) return locale === "zh-CN" ? "永久" : "permanently";
+  if (seconds < 60) return locale === "zh-CN" ? `${seconds} 秒` : `${seconds}s`;
+  if (seconds % 86400 === 0) return locale === "zh-CN" ? `${seconds / 86400} 天` : `${seconds / 86400}d`;
+  if (seconds % 3600 === 0) return locale === "zh-CN" ? `${seconds / 3600} 小时` : `${seconds / 3600}h`;
+  if (seconds % 60 === 0) return locale === "zh-CN" ? `${seconds / 60} 分钟` : `${seconds / 60}m`;
+  return locale === "zh-CN" ? `${seconds} 秒` : `${seconds}s`;
 }
 
 function welcomeText(settings: WelcomeSettings, locale: Locale) {
@@ -11892,6 +12180,76 @@ function clearWelcomeField(settings: WelcomeSettings, field: WelcomeInputField) 
   settings.replyKeyboard = undefined;
 }
 
+function joinVerifyModeLabel(settings: JoinVerifySettings, locale: Locale) {
+  if (locale === "zh-CN") {
+    if (settings.mode === "math") return "数学题";
+    if (settings.mode === "captcha") return "数字验证码";
+    if (settings.mode === "emoji") return "Emoji识别";
+    if (settings.mode === "channel") return "验证频道";
+    return "按钮";
+  }
+
+  if (settings.mode === "math") return "Math";
+  if (settings.mode === "captcha") return "Number captcha";
+  if (settings.mode === "emoji") return "Emoji";
+  if (settings.mode === "channel") return "Channel";
+  return "Button";
+}
+
+function joinVerifyChannelPromptText(settings: JoinVerifySettings, locale: Locale) {
+  const current = settings.requiredChannel ? `<code>${escapeHtml(settings.requiredChannel)}</code>` : (locale === "zh-CN" ? "未设置" : "Not set");
+  return locale === "zh-CN"
+    ? [
+        "<b>🤖 进群验证</b>",
+        "",
+        "请发送验证频道的 ID、频道用户名或频道链接。",
+        "",
+        `<b>当前频道</b>：${current}`,
+        "",
+        "<b>格式示例：</b>",
+        "• <code>-1001234567890</code>",
+        "• <code>@example_channel</code>",
+        "• <code>https://t.me/example_channel</code>",
+        "• <code>https://t.me/c/1234567890/1</code>",
+        "",
+        "私密邀请链接无法识别，请发送频道 ID。请确保机器人已加入目标频道，并拥有读取成员状态的权限。"
+      ].join("\n")
+    : [
+        "<b>🤖 Join verification</b>",
+        "",
+        "Send the required channel ID, username, or link.",
+        "",
+        `<b>Current channel</b>: ${current}`,
+        "",
+        "<b>Examples:</b>",
+        "• <code>-1001234567890</code>",
+        "• <code>@example_channel</code>",
+        "• <code>https://t.me/example_channel</code>",
+        "• <code>https://t.me/c/1234567890/1</code>",
+        "",
+        "Private invite links cannot be resolved. Send the channel ID instead. Make sure the bot is added to the target channel and can read member status."
+      ].join("\n");
+}
+
+function joinVerifyInvalidChannelText(input: string, locale: Locale) {
+  const isPrivateInvite = /^https?:\/\/t\.me\/\+|^t\.me\/\+|^https?:\/\/telegram\.me\/\+|^telegram\.me\/\+|^https?:\/\/telegram\.me\/joinchat\/|^telegram\.me\/joinchat\//i.test(input.trim());
+  if (locale === "zh-CN") {
+    return isPrivateInvite
+      ? "这是私密邀请链接，机器人无法从链接反查频道。请发送频道 ID，例如 <code>-1001234567890</code>。"
+      : "频道格式不正确，请发送频道 ID、<code>@username</code> 或 <code>https://t.me/username</code>。";
+  }
+
+  return isPrivateInvite
+    ? "This is a private invite link. Send the channel ID instead, for example <code>-1001234567890</code>."
+    : "Invalid channel. Send a channel ID, <code>@username</code>, or <code>https://t.me/username</code>.";
+}
+
+function joinVerifyUnreadableChannelText(locale: Locale) {
+  return locale === "zh-CN"
+    ? "无法读取该频道成员状态。请确认机器人已加入目标频道，并拥有读取成员状态的权限。"
+    : "Could not read member status for that channel. Make sure the bot is added to the target channel and can read member status.";
+}
+
 function joinVerifyText(settings: JoinVerifySettings, locale: Locale) {
   if (locale !== "zh-CN") {
     return [
@@ -11900,6 +12258,8 @@ function joinVerifyText(settings: JoinVerifySettings, locale: Locale) {
       "New members must complete verification before they can send messages.",
       "",
       `<b>Status</b>: ${settings.enabled ? "On✅" : "Off❌"}`,
+      `<b>Mode</b>: ${joinVerifyModeLabel(settings, locale)}`,
+      ...(settings.mode === "channel" ? [`<b>Required channel</b>: ${settings.requiredChannel ? `<code>${escapeHtml(settings.requiredChannel)}</code>` : "Not set"}`] : []),
       `<b>Verification time</b>: ${settings.durationMinutes} minute${settings.durationMinutes === 1 ? "" : "s"}`,
       `<b>Timeout penalty</b>: ${settings.punishment === "mute" ? "Mute 24h" : settings.punishment === "kick" ? "Kick" : "Ban"}`,
       "",
@@ -11916,6 +12276,8 @@ function joinVerifyText(settings: JoinVerifySettings, locale: Locale) {
     "启用后，新用户需要完成验证，才能发送消息。",
     "",
     `<b>状态</b>：${settings.enabled ? "开启✅" : "关闭❌"}`,
+    `<b>验证模式</b>：${joinVerifyModeLabel(settings, locale)}`,
+    ...(settings.mode === "channel" ? [`<b>验证频道</b>：${settings.requiredChannel ? `<code>${escapeHtml(settings.requiredChannel)}</code>` : "未设置"}`] : []),
     `<b>验证时间</b>：${settings.durationMinutes} 分钟`,
     `<b>超时惩罚</b>：${settings.punishment === "mute" ? "禁言24小时" : settings.punishment === "kick" ? "踢出" : "封禁"}`,
     "",
@@ -12276,6 +12638,30 @@ function productText(product: PointProduct, locale: Locale) {
   ].join("\n");
 }
 
+function productDeleteConfirmText(product: PointProduct, locale: Locale) {
+  const name = escapeHtml(product.name || (locale === "zh-CN" ? "未命名商品" : "Unnamed product"));
+  const stock = product.codes.length;
+  return locale === "zh-CN"
+    ? [
+        "<b>删除商品</b>",
+        "",
+        `商品编号：<code>${escapeHtml(product.id)}</code>`,
+        `商品名称：<b>${name}</b>`,
+        `剩余卡密：${stock}`,
+        "",
+        "删除后商品和未兑换卡密会从商品管理中移除，是否继续？"
+      ].join("\n")
+    : [
+        "<b>Delete product</b>",
+        "",
+        `Product ID: <code>${escapeHtml(product.id)}</code>`,
+        `Product name: <b>${name}</b>`,
+        `Remaining codes: ${stock}`,
+        "",
+        "This removes the product and unredeemed codes from product management. Continue?"
+      ].join("\n");
+}
+
 function productInputPromptText(kind: Extract<PointsInputDraft, { productId: string }>["kind"], locale: Locale) {
   if (kind === "product_name") return locale === "zh-CN" ? "请输入商品名称:" : "Send the product name:";
   if (kind === "product_cost") return locale === "zh-CN" ? "请输入消耗积分:" : "Send the point cost:";
@@ -12565,9 +12951,10 @@ function isRaidJoin(chatId: string, now: number, settings: BlocklistSettings) {
   return events.length >= settings.raidJoinThreshold;
 }
 
-async function banUser(ctx: Context, chatId: number, userId: number) {
-  await ctx.api.banChatMember(chatId, userId).catch((error) => {
-    console.error("Failed to ban member", { chatId, userId, error });
+async function banUser(ctx: Context, chatId: number, userId: number, seconds = 0) {
+  const options = seconds > 0 ? { until_date: Math.floor((Date.now() + seconds * 1000) / 1000) } : undefined;
+  await ctx.api.banChatMember(chatId, userId, options).catch((error) => {
+    console.error("Failed to ban member", { chatId, userId, seconds, error });
   });
 }
 
@@ -12669,6 +13056,50 @@ function verificationKey(chatId: number, userId: number) {
 
 function joinVerificationRecordId(chatId: string, userId: number) {
   return `${chatId}:${userId}`;
+}
+
+function normalizeJoinVerifyRequiredChannel(text: string) {
+  const value = text.trim().replace(/^<|>$/g, "").split(/[?#]/, 1)[0]?.trim() ?? "";
+  if (!value) return "";
+
+  const privateInvite = /^(?:https?:\/\/)?(?:t\.me\/\+|t\.me\/joinchat\/|telegram\.me\/\+|telegram\.me\/joinchat\/)/i;
+  if (privateInvite.test(value)) return "";
+
+  const privateChannelLink = value.match(/^(?:https?:\/\/)?(?:t\.me|telegram\.me)\/c\/(\d+)(?:\/|$)/i);
+  if (privateChannelLink?.[1]) return `-100${privateChannelLink[1]}`;
+
+  if (/^-?\d{5,20}$/.test(value)) return value;
+
+  const username = value
+    .replace(/^(?:https?:\/\/)?(?:t\.me|telegram\.me)\//i, "")
+    .replace(/^@/, "")
+    .split("/")[0]
+    ?.trim() ?? "";
+  if (/^[A-Za-z0-9_]{5,32}$/.test(username)) return `@${username}`;
+  return "";
+}
+
+function joinVerifyChatIdentifier(channel: string) {
+  return /^-?\d+$/.test(channel) ? Number(channel) : channel;
+}
+
+async function canBotReadJoinVerifyChannel(api: TelegramApi, channel: string) {
+  const me = await api.getMe().catch(() => null);
+  if (!me) return false;
+  const member = await api.getChatMember(joinVerifyChatIdentifier(channel), me.id).catch(() => null);
+  return Boolean(member && member.status !== "left" && member.status !== "kicked");
+}
+
+async function userJoinedJoinVerifyChannel(api: TelegramApi, channel: string, userId: number) {
+  const member = await api.getChatMember(joinVerifyChatIdentifier(channel), userId).catch(() => null);
+  return Boolean(member && member.status !== "left" && member.status !== "kicked");
+}
+
+async function resolveJoinVerificationRequiredChannel(telegramChatId: number, storedChatId: string | undefined) {
+  const chatId = storedChatId ?? (await getActiveChatByTelegramId(telegramChatId))?.id;
+  if (!chatId) return undefined;
+  const settings = await getJoinVerifySettings(chatId);
+  return settings.requiredChannel;
 }
 
 function isJoinVerifyPunishment(value: unknown): value is JoinVerifySettings["punishment"] {

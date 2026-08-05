@@ -298,7 +298,7 @@ function adultCheckKeyboard(locale: Locale, chat: PrismaChat, settings: AdultChe
     .row()
     .text(locale === "zh-CN" ? `⏲ 延迟删除(${settings.deleteDelaySeconds})s` : `⏲ Delete delay (${settings.deleteDelaySeconds})s`, "adult_check:delay")
     .row()
-    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `managed_chat:${chat.id}`);
+    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `menu:chat:group:${chat.id}`);
 }
 
 function matchAdultContent(message: AdultCheckCandidate, sensitivity: AdultCheckSensitivity) {

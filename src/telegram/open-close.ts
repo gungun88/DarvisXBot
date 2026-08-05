@@ -49,7 +49,12 @@ export async function handleOpenCloseAction(ctx: Context, _config: AppConfig, lo
   const chat = await selectedChat(ctx, locale);
   if (!chat) return;
 
-  if (key === "noop") return;
+  if (key === "noop" || key === "back") {
+    drafts.delete(ctx.from.id);
+    const settings = await getSettings(chat.id);
+    await renderMenu(ctx, menuText(settings), menuKeyboard(settings, chat.id), "HTML");
+    return;
+  }
 
   if (key === "toggle:on" || key === "toggle:off") {
     const enabled = key.endsWith(":on");
@@ -72,7 +77,7 @@ export async function handleOpenCloseAction(ctx: Context, _config: AppConfig, lo
     const field = key.replace("edit:", "");
     if (!isField(field)) return;
     drafts.set(ctx.from.id, { chatId: chat.id, field });
-    await renderMenu(ctx, `请发送新的 <b>${fieldLabel(field)}</b>。`, new InlineKeyboard().text("返回", "open_close:noop"), "HTML");
+    await renderMenu(ctx, `请发送新的 <b>${fieldLabel(field)}</b>。`, new InlineKeyboard().text("返回", "open_close:back"), "HTML");
     return;
   }
 

@@ -70,6 +70,12 @@ export async function handleNightModeAction(ctx: Context, locale: Locale, key: s
 
   if (key === "noop") return;
 
+  if (key === "back") {
+    drafts.delete(ctx.from.id);
+    await renderNightModeMenu(ctx, locale, chat);
+    return;
+  }
+
   if (key === "status:on" || key === "status:off") {
     const enabled = key.endsWith(":on");
     const current = await getNightModeSettings(chat);
@@ -112,7 +118,7 @@ export async function handleNightModeAction(ctx: Context, locale: Locale, key: s
       locale === "zh-CN"
         ? ["<b>请发送群组时区</b>", "", "支持 IANA 时区，例如 <code>Asia/Shanghai</code>；也可以发送城市名或位置。"].join("\n")
         : ["<b>Send the group timezone</b>", "", "Use an IANA timezone such as <code>Asia/Shanghai</code>, a city name, or a location."].join("\n"),
-      new InlineKeyboard().text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "night_mode:noop"),
+      new InlineKeyboard().text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "night_mode:back"),
       "HTML"
     );
     return;
@@ -366,7 +372,7 @@ function nightModeTimePromptKeyboard(locale: Locale) {
     .text("Copy1", "night_mode:example:1")
     .text("Copy2", "night_mode:example:2")
     .row()
-    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "night_mode:noop");
+    .text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", "night_mode:back");
 }
 
 async function getNightModeSettings(chat: PrismaChat): Promise<NightModeSettings> {

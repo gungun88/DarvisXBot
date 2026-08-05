@@ -11,11 +11,12 @@ test("join verification modes are recognized", () => {
   assert.equal(isJoinVerifyMode("math"), true);
   assert.equal(isJoinVerifyMode("captcha"), true);
   assert.equal(isJoinVerifyMode("emoji"), true);
+  assert.equal(isJoinVerifyMode("channel"), true);
   assert.equal(isJoinVerifyMode("unknown"), false);
 });
 
 test("join verification challenges include the correct answer", () => {
-  const modes: JoinVerifyMode[] = ["button", "math", "captcha", "emoji"];
+  const modes: JoinVerifyMode[] = ["button", "math", "captcha", "emoji", "channel"];
 
   for (const mode of modes) {
     const challenge = createJoinVerificationChallenge(mode);
@@ -29,4 +30,11 @@ test("button verification has a stable callback answer", () => {
   const challenge = createJoinVerificationChallenge("button");
   assert.equal(challenge.answer, "button");
   assert.deepEqual(challenge.choices, [{ label: "✅ 我不是机器人", value: "button" }]);
+});
+
+test("channel verification has a stable callback answer", () => {
+  const challenge = createJoinVerificationChallenge("channel", "@example_channel");
+  assert.equal(challenge.answer, "channel");
+  assert.match(challenge.prompt, /@example_channel/);
+  assert.deepEqual(challenge.choices, [{ label: "✅ 我已加入频道", value: "channel" }]);
 });

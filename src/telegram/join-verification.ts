@@ -1,4 +1,4 @@
-export type JoinVerifyMode = "button" | "math" | "captcha" | "emoji";
+export type JoinVerifyMode = "button" | "math" | "captcha" | "emoji" | "channel";
 
 export type JoinVerificationChoice = {
   label: string;
@@ -12,10 +12,21 @@ export type JoinVerificationChallenge = {
 };
 
 export function isJoinVerifyMode(value: unknown): value is JoinVerifyMode {
-  return value === "button" || value === "math" || value === "captcha" || value === "emoji";
+  return value === "button" || value === "math" || value === "captcha" || value === "emoji" || value === "channel";
 }
 
-export function createJoinVerificationChallenge(mode: JoinVerifyMode): JoinVerificationChallenge {
+export function createJoinVerificationChallenge(mode: JoinVerifyMode, requiredChannel?: string): JoinVerificationChallenge {
+  if (mode === "channel") {
+    const channel = requiredChannel?.trim();
+    return {
+      answer: "channel",
+      prompt: channel
+        ? `请先加入指定频道：<code>${channel}</code>，然后点击下方按钮完成验证。`
+        : "请先加入指定频道，然后点击下方按钮完成验证。",
+      choices: [{ label: "✅ 我已加入频道", value: "channel" }]
+    };
+  }
+
   if (mode === "math") {
     const left = randomInt(2, 9);
     const right = randomInt(1, 9);
