@@ -2,21 +2,25 @@ import { loadConfig } from "./lib/config.js";
 import { createBot, registerBotCommands } from "./telegram/bot.js";
 import { startScheduledMessageWorker } from "./scheduled-messages/scheduled-message.worker.js";
 import { startGiveawayDrawWorker, syncActiveGiveawayDrawJobs } from "./giveaways/giveaway.worker.js";
+import { startSignInMessageDeleteWorker } from "./telegram/sign-in-delete.worker.js";
 
 const config = loadConfig();
 const scheduledMessageWorker = startScheduledMessageWorker(config);
 const giveawayDrawWorker = startGiveawayDrawWorker(config);
+const signInMessageDeleteWorker = startSignInMessageDeleteWorker(config);
 await syncActiveGiveawayDrawJobs();
 
 process.once("SIGINT", async () => {
   await scheduledMessageWorker.close();
   await giveawayDrawWorker.close();
+  await signInMessageDeleteWorker.close();
   process.exit(0);
 });
 
 process.once("SIGTERM", async () => {
   await scheduledMessageWorker.close();
   await giveawayDrawWorker.close();
+  await signInMessageDeleteWorker.close();
   process.exit(0);
 });
 

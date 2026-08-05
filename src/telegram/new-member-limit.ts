@@ -67,7 +67,7 @@ export async function handleNewMemberLimitAction(ctx: Context, _config: AppConfi
         ? [
             "<b>请发送禁言时长</b>",
             "",
-            "支持格式：1分钟、10分钟、2小时、1天、1m、2h、1d",
+            "支持格式：10、10分钟、2小时、1天、10m、2h、1d",
             "范围：1 分钟 - 30 天"
           ].join("\n")
         : [
@@ -95,8 +95,8 @@ export async function handleNewMemberLimitPrivateMessage(ctx: Context, _config: 
   if (!durationMinutes) {
     await ctx.reply(
       locale === "zh-CN"
-        ? "格式不正确。请发送 1分钟、10分钟、2小时、1天、1m、2h 或 1d。"
-        : "Invalid duration. Send 1m, 10m, 2h, 1d, 1 minute, or 2 hours."
+        ? "格式不正确。请发送 10、10分钟、2小时、1天、10m、2h 或 1d。"
+        : "Invalid duration. Send 10, 10m, 2h, 1d, 10 minutes, or 2 hours."
     );
     return true;
   }
@@ -273,12 +273,12 @@ function mutedChatPermissions(): ChatPermissions {
 
 export function parseDurationMinutes(input: string) {
   const text = input.trim().toLowerCase().replace(/\s+/g, "");
-  const match = text.match(/^(\d+)(分钟|分|小时|时|天|日|minute|minutes|min|m|hour|hours|h|day|days|d)$/i);
+  const match = text.match(/^(\d+)(分钟|分|单位\/?分钟|小时|时|天|日|minute|minutes|min|m|hour|hours|h|day|days|d)?$/i);
   if (!match) return null;
 
   const amountText = match[1];
-  const rawUnit = match[2];
-  if (!amountText || !rawUnit) return null;
+  const rawUnit = match[2] ?? "分钟";
+  if (!amountText) return null;
   const amount = Number(amountText);
   if (!Number.isSafeInteger(amount) || amount <= 0) return null;
 

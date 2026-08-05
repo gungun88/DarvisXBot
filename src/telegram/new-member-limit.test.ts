@@ -26,6 +26,8 @@ test("new member limit duration parser accepts common units", () => {
   assert.equal(parseDurationMinutes("2h"), 120);
   assert.equal(parseDurationMinutes("3d"), 4320);
   assert.equal(parseDurationMinutes("10 minutes"), 10);
+  assert.equal(parseDurationMinutes("120"), 120);
+  assert.equal(parseDurationMinutes("120 \u5355\u4f4d/\u5206\u949f"), 120);
   assert.equal(parseDurationMinutes("2 hours"), 120);
   assert.equal(parseDurationMinutes("1 day"), 1440);
   assert.equal(parseDurationMinutes("5\u5206\u949f"), 5);

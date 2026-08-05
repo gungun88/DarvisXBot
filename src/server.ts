@@ -7,6 +7,7 @@ import { prisma } from "./lib/prisma.js";
 import { redis } from "./lib/redis.js";
 import { startScheduledMessageWorker } from "./scheduled-messages/scheduled-message.worker.js";
 import { startGiveawayDrawWorker, syncActiveGiveawayDrawJobs } from "./giveaways/giveaway.worker.js";
+import { startSignInMessageDeleteWorker } from "./telegram/sign-in-delete.worker.js";
 
 export async function createServer(config: AppConfig) {
   const app = Fastify({ logger: true });
@@ -16,6 +17,7 @@ export async function createServer(config: AppConfig) {
   await registerBotCommands(bot);
   const scheduledMessageWorker = startScheduledMessageWorker(config);
   const giveawayDrawWorker = startGiveawayDrawWorker(config);
+  const signInMessageDeleteWorker = startSignInMessageDeleteWorker(config);
   await syncActiveGiveawayDrawJobs();
 
   app.get("/health", async () => {
@@ -42,6 +44,7 @@ export async function createServer(config: AppConfig) {
   app.addHook("onClose", async () => {
     await scheduledMessageWorker.close();
     await giveawayDrawWorker.close();
+    await signInMessageDeleteWorker.close();
     await prisma.$disconnect();
     redis.disconnect();
   });

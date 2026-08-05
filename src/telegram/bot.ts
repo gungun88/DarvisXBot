@@ -57,6 +57,7 @@ import {
   cancelGiveawayDrawJob,
   enqueueGiveawayDraw
 } from "../giveaways/giveaway.service.js";
+import { enqueueSignInMessageDelete } from "./sign-in-delete.service.js";
 import {
   handleAdultCheckAction,
   handleAdultCheckMessage,
@@ -306,12 +307,18 @@ type PointsInputDraft =
 
 type GiveawayCreateType = "common" | "points" | "active" | "invite" | "report" | "fun";
 type GiveawayDrawMode = "full" | "timed";
+type ActiveGiveawayMode = "ranking" | "speech_count";
+type InviteGiveawayMode = "ranking" | "count";
+type FunGiveawayMode = "dice" | "dart" | "basketball" | "football" | "bowling" | "slot";
 type GiveawayInputStage = "target_count" | "draw_at" | "details";
 
 type GiveawayInputDraft = {
   chatId: string;
   type: GiveawayCreateType;
   drawMode?: GiveawayDrawMode;
+  activeMode?: ActiveGiveawayMode;
+  inviteMode?: InviteGiveawayMode;
+  funMode?: FunGiveawayMode;
   stage: GiveawayInputStage;
   targetCount?: number;
   drawAt?: Date;
@@ -324,6 +331,38 @@ type CommonGiveawayRequirements = {
   drawMode: GiveawayDrawMode;
   targetCount?: number;
 };
+
+type GiveawayRequirements =
+  | CommonGiveawayRequirements
+  | {
+      type: "points";
+      entry: "button";
+      cost: number;
+      drawMode: GiveawayDrawMode;
+      targetCount?: number;
+    }
+  | {
+      type: "active";
+      mode: ActiveGiveawayMode;
+      days: number;
+      minCount?: number;
+    }
+  | {
+      type: "invite";
+      mode: InviteGiveawayMode;
+      days: number;
+      minCount?: number;
+    }
+  | {
+      type: "report";
+      sourceChatId: string;
+      keyword: string;
+    }
+  | {
+      type: "fun";
+      mode: FunGiveawayMode;
+      attempts: number;
+    };
 
 type MemberStatsSnapshot = {
   date: string;
@@ -903,6 +942,7 @@ export function createBot(config: AppConfig) {
     if (await handleSpeechCheckMessage(ctx, locale)) return;
     if (await handleAdultCheckMessage(ctx, locale)) return;
     if (await handleGiveawayKeywordEntry(ctx, config, locale)) return;
+    if (await handleFunGiveawayDiceMessage(ctx, config, locale)) return;
     await handleIncomingMessage(ctx, config);
   });
 
@@ -4200,8 +4240,8 @@ async function handleBannedWordsInputMessage(ctx: Context, locale: Locale) {
   const text = getMessageText(ctx.message);
 
   if (draft.stage === "mute_duration") {
-    const minutes = text ? Number(text.trim()) : NaN;
-    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 525600) {
+    const minutes = text ? parseBannedWordsMuteDurationMinutes(text) : null;
+    if (minutes === null) {
       const settings = await getBannedWordsSettings(draft.chatId);
       await ctx.reply(bannedWordsMuteDurationPromptText(settings, locale), {
         parse_mode: "HTML",
@@ -7646,8 +7686,16 @@ async function handleSignInCommand(ctx: Context, config: AppConfig) {
   const statDate = formatDate(new Date());
   const referenceKey = `sign_in:${chat.id}:${user.id}:${statDate}`;
   const balance = await addPoints(chat.id, user.id, settings.signInPoints, PointTransactionType.SIGN_IN, referenceKey, null, statDate);
-  const sent = await ctx.reply(locale === "zh-CN" ? `签到成功，当前积分：${balance}` : `Signed in. Current points: ${balance}`);
-  if (settings.deleteSignInMessage) {
+  const canDeleteMessages = settings.deleteSignInMessage && await botHasDeleteMessagePermission(ctx, chat).catch(() => false);
+  const replyText = settings.deleteSignInMessage && !canDeleteMessages
+    ? locale === "zh-CN"
+      ? `签到成功，当前积分：${balance}（机器人缺少删除消息权限）`
+      : `Signed in. Current points: ${balance} (bot lacks Delete messages permission)`
+    : locale === "zh-CN"
+      ? `签到成功，当前积分：${balance}`
+      : `Signed in. Current points: ${balance}`;
+  const sent = await ctx.reply(replyText);
+  if (settings.deleteSignInMessage && canDeleteMessages) {
     scheduleTelegramMessageDelete(ctx, ctx.chat.id, sent.message_id, settings.deleteSignInSeconds);
     if (ctx.message?.message_id) scheduleTelegramMessageDelete(ctx, ctx.chat.id, ctx.message.message_id, settings.deleteSignInSeconds);
   }
@@ -7695,7 +7743,13 @@ async function handlePointsCommand(ctx: Context, config: AppConfig) {
   if (!replyUser && !targetInput && !rawDelta) {
     const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
     const current = await prisma.chatPointBalance.findUnique({ where: { chatId_userId: { chatId: chat.id, userId: user.id } } });
-    await ctx.reply(locale === "zh-CN" ? `当前积分：${current?.balance ?? 0}` : `Current points: ${current?.balance ?? 0}`);
+    const name = escapeHtml(displayPrismaUser(user));
+    await ctx.reply(
+      locale === "zh-CN"
+        ? `<b>${name}</b> 的当前积分：${current?.balance ?? 0}`
+        : `<b>${name}</b>'s current points: ${current?.balance ?? 0}`,
+      { parse_mode: "HTML" }
+    );
     return;
   }
 
@@ -7720,7 +7774,13 @@ async function handlePointsCommand(ctx: Context, config: AppConfig) {
   }
   const actor = await upsertTelegramUser(ctx.from, config.defaultTimezone);
   const balance = await addPoints(chat.id, user.id, delta, PointTransactionType.MANUAL, null, actor.id);
-  await ctx.reply(locale === "zh-CN" ? `已调整，当前积分：${balance}` : `Adjusted. Current points: ${balance}`);
+  const targetName = escapeHtml(displayPrismaUser(user));
+  await ctx.reply(
+    locale === "zh-CN"
+      ? `已调整 <b>${targetName}</b>，当前积分：${balance}`
+      : `Adjusted <b>${targetName}</b>. Current points: ${balance}`,
+    { parse_mode: "HTML" }
+  );
 }
 
 async function handleStatsCommand(ctx: Context, config: AppConfig, days: number) {
@@ -7773,12 +7833,14 @@ async function handleGiveawayCallback(ctx: Context, config: AppConfig) {
   await ctx.answerCallbackQuery().catch(() => undefined);
   const parts = ctx.callbackQuery?.data?.split(":") ?? [];
   const action = parts[1];
-  const chatId = action === "type" || action === "draw" ? parts[3] : parts[2];
+  const chatId = parts[parts.length - 1];
   if (!action || !chatId || action === "join") return;
 
   const locale = await getLocale(ctx);
   const chat = await ensureControlPermissionForChatId(ctx, chatId, locale);
   if (!chat) return;
+
+  if (action === "noop") return;
 
   if (action === "create") {
     if (!ctx.from) return;
@@ -7794,13 +7856,36 @@ async function handleGiveawayCallback(ctx: Context, config: AppConfig) {
   }
 
   if (action === "type" && isGiveawayCreateType(parts[2])) {
-    if (parts[2] !== "common") {
-      await editOrReply(ctx, giveawayTypeUnavailableText(parts[2], locale), giveawayTypeSelectKeyboard(chatId, locale));
+    if (parts[2] === "common") {
+      if (ctx.from) giveawayInputDrafts.delete(ctx.from.id);
+      await editOrReply(ctx, commonGiveawayDrawModeText(locale), commonGiveawayDrawModeKeyboard(chatId, locale));
       return;
     }
-    if (ctx.from) giveawayInputDrafts.delete(ctx.from.id);
-    await editOrReply(ctx, commonGiveawayDrawModeText(locale), commonGiveawayDrawModeKeyboard(chatId, locale));
-    return;
+    if (parts[2] === "points") {
+      if (ctx.from) giveawayInputDrafts.delete(ctx.from.id);
+      await editOrReply(ctx, pointsGiveawayDrawModeText(locale), pointsGiveawayDrawModeKeyboard(chatId, locale));
+      return;
+    }
+    if (parts[2] === "active") {
+      if (ctx.from) giveawayInputDrafts.delete(ctx.from.id);
+      await editOrReply(ctx, activeGiveawaySelectText(locale), activeGiveawaySelectKeyboard(chatId, locale));
+      return;
+    }
+    if (parts[2] === "invite") {
+      if (ctx.from) giveawayInputDrafts.delete(ctx.from.id);
+      await editOrReply(ctx, inviteGiveawaySelectText(locale), inviteGiveawaySelectKeyboard(chatId, locale));
+      return;
+    }
+    if (parts[2] === "report") {
+      if (ctx.from) giveawayInputDrafts.delete(ctx.from.id);
+      await editOrReply(ctx, reportGiveawayConfirmText(locale), reportGiveawayConfirmKeyboard(chatId, locale));
+      return;
+    }
+    if (parts[2] === "fun") {
+      if (ctx.from) giveawayInputDrafts.delete(ctx.from.id);
+      await editOrReply(ctx, funGiveawaySelectText(locale), funGiveawaySelectKeyboard(chatId, locale));
+      return;
+    }
   }
 
   if (action === "draw" && isGiveawayDrawMode(parts[2])) {
@@ -7813,6 +7898,51 @@ async function handleGiveawayCallback(ctx: Context, config: AppConfig) {
     }
     giveawayInputDrafts.set(ctx.from.id, { chatId, type: "common", drawMode: "timed", stage: "draw_at" });
     await editOrReply(ctx, commonGiveawayDrawAtPromptText(locale), giveawayCreateCancelKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "points_draw" && isGiveawayDrawMode(parts[2])) {
+    if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    if (parts[2] === "full") {
+      giveawayInputDrafts.set(ctx.from.id, { chatId, type: "points", drawMode: "full", stage: "target_count" });
+      await editOrReply(ctx, pointsGiveawayTargetCountPromptText(locale), giveawayCreateCancelKeyboard(chatId, locale));
+      return;
+    }
+    giveawayInputDrafts.set(ctx.from.id, { chatId, type: "points", drawMode: "timed", stage: "draw_at" });
+    await editOrReply(ctx, pointsGiveawayDrawAtPromptText(locale), giveawayCreateCancelKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "active_mode" && isActiveGiveawayMode(parts[2])) {
+    if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    giveawayInputDrafts.set(ctx.from.id, { chatId, type: "active", activeMode: parts[2], stage: "details" });
+    await editOrReply(ctx, activeGiveawayDetailsPromptText(parts[2], locale), giveawayCreateCancelKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "invite_mode" && isInviteGiveawayMode(parts[2])) {
+    if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    giveawayInputDrafts.set(ctx.from.id, { chatId, type: "invite", inviteMode: parts[2], stage: "details" });
+    await editOrReply(ctx, inviteGiveawayDetailsPromptText(parts[2], locale), giveawayCreateCancelKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "report_continue") {
+    if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    giveawayInputDrafts.set(ctx.from.id, { chatId, type: "report", stage: "details" });
+    await editOrReply(ctx, reportGiveawayDetailsPromptText(locale), giveawayCreateCancelKeyboard(chatId, locale));
+    return;
+  }
+
+  if (action === "fun_mode" && isFunGiveawayMode(parts[2])) {
+    if (!ctx.from) return;
+    clearUserInputState(ctx.from.id);
+    giveawayInputDrafts.set(ctx.from.id, { chatId, type: "fun", funMode: parts[2], stage: "details" });
+    await editOrReply(ctx, funGiveawayDetailsPromptText(parts[2], locale), giveawayCreateCancelKeyboard(chatId, locale));
     return;
   }
 
@@ -7859,7 +7989,7 @@ async function handleGiveawayInputMessage(ctx: Context, config: AppConfig, local
     }
     draft.targetCount = targetCount;
     draft.stage = "details";
-    await ctx.reply(commonGiveawayDetailsPromptText(draft, locale), {
+    await ctx.reply(giveawayDetailsPromptText(draft, locale), {
       parse_mode: "HTML",
       reply_markup: giveawayCreateCancelKeyboard(draft.chatId, locale)
     });
@@ -7882,14 +8012,14 @@ async function handleGiveawayInputMessage(ctx: Context, config: AppConfig, local
     }
     draft.drawAt = drawAt;
     draft.stage = "details";
-    await ctx.reply(commonGiveawayDetailsPromptText(draft, locale), {
+    await ctx.reply(giveawayDetailsPromptText(draft, locale), {
       parse_mode: "HTML",
       reply_markup: giveawayCreateCancelKeyboard(draft.chatId, locale)
     });
     return true;
   }
 
-  const parsed = parseCommonGiveawayDetailsInput(text, locale);
+  const parsed = parseGiveawayDraftDetailsInput(draft, text, locale);
   if (!parsed.value) {
     await ctx.reply(parsed.error, {
       parse_mode: "HTML",
@@ -7898,14 +8028,6 @@ async function handleGiveawayInputMessage(ctx: Context, config: AppConfig, local
     return true;
   }
 
-  const drawAt = draft.drawMode === "timed" && draft.drawAt ? draft.drawAt : fallbackFullGiveawayDrawAt();
-  const joinRequirements: Prisma.InputJsonObject = {
-    type: draft.type,
-    entry: "keyword",
-    keyword: parsed.value.keyword,
-    drawMode: draft.drawMode ?? "timed",
-    ...(draft.targetCount ? { targetCount: draft.targetCount } : {})
-  };
   const creator = await upsertTelegramUser(ctx.from, config.defaultTimezone);
   const giveaway = await prisma.giveaway.create({
     data: {
@@ -7913,14 +8035,14 @@ async function handleGiveawayInputMessage(ctx: Context, config: AppConfig, local
       title: parsed.value.title,
       prize: parsed.value.prize,
       winnersCount: parsed.value.winnersCount,
-      joinRequirements,
-      drawAt,
+      joinRequirements: parsed.value.joinRequirements,
+      drawAt: parsed.value.drawAt,
       status: GiveawayStatus.ACTIVE,
       createdBy: creator.id
     }
   });
 
-  if (draft.drawMode === "timed") {
+  if (shouldEnqueueGiveawayDraw(parsed.value.joinRequirements)) {
     await enqueueGiveawayDraw(giveaway.id, giveaway.drawAt);
   }
   await prisma.auditLog.create({
@@ -7934,9 +8056,7 @@ async function handleGiveawayInputMessage(ctx: Context, config: AppConfig, local
         title: giveaway.title,
         prize: giveaway.prize,
         winnersCount: giveaway.winnersCount,
-        keyword: parsed.value.keyword,
-        drawMode: draft.drawMode,
-        targetCount: draft.targetCount,
+        requirements: parsed.value.joinRequirements,
         drawAt: giveaway.drawAt.toISOString()
       }
     }
@@ -8036,6 +8156,160 @@ function commonGiveawayDrawModeKeyboard(chatId: string, locale: Locale) {
     .text(locale === "zh-CN" ? "🔙返回选择抽奖类型" : "🔙 Back to types", `giveaway:types:${chatId}`);
 }
 
+function pointsGiveawayDrawModeText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "🎁创建<b>积分抽奖</b>",
+        "",
+        "Ⓜ️ 积分抽奖: 群员在群内点击按钮，消耗积分抽奖",
+        "",
+        "选择开奖方式:"
+      ].join("\n")
+    : [
+        "🎁 Create <b>Points Giveaway</b>",
+        "",
+        "Ⓜ️ Members spend points and join by tapping a button.",
+        "",
+        "Choose draw mode:"
+      ].join("\n");
+}
+
+function pointsGiveawayDrawModeKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "满人开奖" : "Draw when full", `giveaway:points_draw:full:${chatId}`)
+    .text(locale === "zh-CN" ? "定时开奖" : "Scheduled draw", `giveaway:points_draw:timed:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回选择抽奖类型" : "🔙 Back to types", `giveaway:types:${chatId}`);
+}
+
+function activeGiveawaySelectText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "🎁创建<b>群活跃抽奖</b>",
+        "",
+        "<b>群活跃抽奖:</b> 根据活跃排名抽奖，或达到活跃度参与随机抽奖",
+        "",
+        "<b>选择一个抽奖类型:</b>"
+      ].join("\n")
+    : [
+        "🎁 Create <b>Activity Giveaway</b>",
+        "",
+        "<b>Activity giveaway:</b> draw by activity ranking, or randomly from members who reach the activity requirement.",
+        "",
+        "<b>Choose a giveaway type:</b>"
+      ].join("\n");
+}
+
+function activeGiveawaySelectKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "根据群活跃排名抽奖" : "Draw by activity ranking", `giveaway:active_mode:ranking:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "达到发言次数随机抽奖" : "Random draw by message count", `giveaway:active_mode:speech_count:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回选择抽奖类型" : "🔙 Back to types", `giveaway:types:${chatId}`);
+}
+
+function inviteGiveawaySelectText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "🎁创建<b>邀请人数抽奖</b>",
+        "",
+        "邀请人数抽奖:根据邀请排名抽奖，或达到邀请人数参与随机抽奖",
+        "",
+        "<b>选择一个抽奖类型:</b>"
+      ].join("\n")
+    : [
+        "🎁 Create <b>Invite Giveaway</b>",
+        "",
+        "Invite giveaway: draw by invite ranking, or randomly from members who reach the invite requirement.",
+        "",
+        "<b>Choose a giveaway type:</b>"
+      ].join("\n");
+}
+
+function inviteGiveawaySelectKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "邀请排名抽奖" : "Invite ranking draw", `giveaway:invite_mode:ranking:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "邀请次数抽奖" : "Invite count draw", `giveaway:invite_mode:count:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回选择抽奖类型" : "🔙 Back to types", `giveaway:types:${chatId}`);
+}
+
+function reportGiveawayConfirmText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "🎁创建<b>指定群报道抽奖</b>",
+        "",
+        "指定群报道抽奖:A群成员进入B群回复指定关键词参与抽奖",
+        "",
+        "注意:两个群都需要将[机器人]添加在群组中",
+        "",
+        "<b>是否继续创建:</b>"
+      ].join("\n")
+    : [
+        "🎁 Create <b>Report-in Giveaway</b>",
+        "",
+        "Members from group A enter group B and reply with a keyword to join.",
+        "",
+        "Note: the bot must be added to both groups.",
+        "",
+        "<b>Continue creating?</b>"
+      ].join("\n");
+}
+
+function reportGiveawayConfirmKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "继续" : "Continue", `giveaway:report_continue:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回选择抽奖类型" : "🔙 Back to types", `giveaway:types:${chatId}`);
+}
+
+function funGiveawaySelectText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "🎁创建<b>娱乐抽奖</b>",
+        "",
+        "<b>模式一:</b>",
+        "管理员选择 🎲, 🎯, 🏀, ⚽, 🎳 其中一项创建抽奖，设置每人参加次数及开奖时间，",
+        "群成员发送该表情会获得相应得分，到达抽奖结束时间后，分数最高者获胜。",
+        "",
+        "<b>模式二:</b>",
+        "🎰 水果机最先摇出 \"777\" 的人中奖，中奖率:1.5%",
+        "",
+        "<b>是否继续创建:</b>"
+      ].join("\n")
+    : [
+        "🎁 Create <b>Fun Giveaway</b>",
+        "",
+        "<b>Mode 1:</b>",
+        "Admin chooses 🎲, 🎯, 🏀, ⚽, or 🎳, then sets per-user attempts and draw time.",
+        "Members send that emoji to score. When the giveaway ends, the highest score wins.",
+        "",
+        "<b>Mode 2:</b>",
+        "🎰 The first member to roll \"777\" wins. Win rate: 1.5%.",
+        "",
+        "<b>Continue creating?</b>"
+      ].join("\n");
+}
+
+function funGiveawaySelectKeyboard(chatId: string, locale: Locale) {
+  return new InlineKeyboard()
+    .text(locale === "zh-CN" ? "·抽奖模式一·" : "·Mode 1·", `giveaway:noop:${chatId}`)
+    .row()
+    .text("🎲", `giveaway:fun_mode:dice:${chatId}`)
+    .text("🎯", `giveaway:fun_mode:dart:${chatId}`)
+    .text("🏀", `giveaway:fun_mode:basketball:${chatId}`)
+    .text("⚽", `giveaway:fun_mode:football:${chatId}`)
+    .text("🎳", `giveaway:fun_mode:bowling:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "·抽奖模式二·" : "·Mode 2·", `giveaway:noop:${chatId}`)
+    .row()
+    .text("🎰", `giveaway:fun_mode:slot:${chatId}`)
+    .row()
+    .text(locale === "zh-CN" ? "🔙返回选择抽奖类型" : "🔙 Back to types", `giveaway:types:${chatId}`);
+}
+
 function giveawayTypeUnavailableText(type: GiveawayCreateType, locale: Locale) {
   const label = giveawayCreateTypeLabel(type, locale);
   return locale === "zh-CN"
@@ -8048,6 +8322,23 @@ function giveawayTypeUnavailableText(type: GiveawayCreateType, locale: Locale) {
         `<b>${label}</b>`,
         "",
         "This giveaway type is not wired yet. General giveaways are available now."
+      ].join("\n");
+}
+
+function giveawayOptionPendingText(type: GiveawayCreateType, locale: Locale) {
+  const label = giveawayCreateTypeLabel(type, locale);
+  return locale === "zh-CN"
+    ? [
+        `<b>${label}</b>`,
+        "",
+        "该分支页面已接入，后续参数配置和开奖逻辑暂未实现。",
+        "当前可完整创建并开奖的类型：通用抽奖。"
+      ].join("\n")
+    : [
+        `<b>${label}</b>`,
+        "",
+        "This branch page is wired, but its parameter setup and draw logic are not implemented yet.",
+        "General giveaways are fully available now."
       ].join("\n");
 }
 
@@ -8120,6 +8411,193 @@ function commonGiveawayDetailsPromptText(draft: GiveawayInputDraft, locale: Loca
       ].join("\n");
 }
 
+function giveawayDetailsPromptText(draft: GiveawayInputDraft, locale: Locale) {
+  if (draft.type === "points") return pointsGiveawayDetailsPromptText(draft, locale);
+  if (draft.type === "active" && draft.activeMode) return activeGiveawayDetailsPromptText(draft.activeMode, locale);
+  if (draft.type === "invite" && draft.inviteMode) return inviteGiveawayDetailsPromptText(draft.inviteMode, locale);
+  if (draft.type === "report") return reportGiveawayDetailsPromptText(locale);
+  if (draft.type === "fun" && draft.funMode) return funGiveawayDetailsPromptText(draft.funMode, locale);
+  return commonGiveawayDetailsPromptText(draft, locale);
+}
+
+function pointsGiveawayTargetCountPromptText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "🎁创建<b>积分抽奖</b>  ( <code>/cancel</code> 命令返回首页)",
+        "",
+        "👉 请回复参与多少人后开奖:"
+      ].join("\n")
+    : [
+        "🎁 Create <b>Points Giveaway</b>  (send <code>/cancel</code> to return home)",
+        "",
+        "👉 Send how many participants are needed before drawing:"
+      ].join("\n");
+}
+
+function pointsGiveawayDrawAtPromptText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "请回复<strong>开奖时间:</strong>",
+        "格式:年-月-日 时:分",
+        "例如:<code>2026-08-05 17:45:24</code>"
+      ].join("\n")
+    : [
+        "Send the <strong>draw time:</strong>",
+        "Format: year-month-day hour:minute",
+        "Example:<code>2026-08-05 17:45:24</code>"
+      ].join("\n");
+}
+
+function pointsGiveawayDetailsPromptText(draft: GiveawayInputDraft, locale: Locale) {
+  const modeLine = draft.drawMode === "full"
+    ? (locale === "zh-CN" ? `满 <b>${draft.targetCount}</b> 人开奖` : `Draw when <b>${draft.targetCount}</b> members join`)
+    : `${locale === "zh-CN" ? "开奖时间" : "Draw at"}: <b>${formatDateTimeForDisplay(draft.drawAt ?? new Date())}</b>`;
+  return locale === "zh-CN"
+    ? [
+        "🎁创建<b>积分抽奖</b>",
+        "",
+        modeLine,
+        "",
+        "请按以下格式发送：",
+        "<code>标题 | 奖品 | 中奖人数 | 消耗积分</code>",
+        "",
+        "示例：",
+        "<code>积分抽奖 | 100U | 1 | 10</code>"
+      ].join("\n")
+    : [
+        "🎁 Create <b>Points Giveaway</b>",
+        "",
+        modeLine,
+        "",
+        "Send in this format:",
+        "<code>Title | Prize | Winners | Point cost</code>",
+        "",
+        "Example:",
+        "<code>Points giveaway | 100U | 1 | 10</code>"
+      ].join("\n");
+}
+
+function activeGiveawayDetailsPromptText(mode: ActiveGiveawayMode, locale: Locale) {
+  if (mode === "ranking") {
+    return locale === "zh-CN"
+      ? [
+          "🎁创建<b>群活跃排名抽奖</b>",
+          "",
+          "请按以下格式发送：",
+          "<code>标题 | 奖品 | 中奖人数 | 统计天数 | 开奖时间</code>",
+          "示例：<code>活跃排名抽奖 | 100U | 3 | 7 | 2026-08-05 18:00</code>"
+        ].join("\n")
+      : [
+          "🎁 Create <b>Activity Ranking Giveaway</b>",
+          "",
+          "Send in this format:",
+          "<code>Title | Prize | Winners | Days | Draw time</code>"
+        ].join("\n");
+  }
+  return locale === "zh-CN"
+    ? [
+        "🎁创建<b>发言次数随机抽奖</b>",
+        "",
+        "请按以下格式发送：",
+        "<code>标题 | 奖品 | 中奖人数 | 统计天数 | 最少发言次数 | 开奖时间</code>",
+        "示例：<code>活跃随机抽奖 | 100U | 3 | 7 | 20 | 2026-08-05 18:00</code>"
+      ].join("\n")
+    : [
+        "🎁 Create <b>Message Count Giveaway</b>",
+        "",
+        "Send in this format:",
+        "<code>Title | Prize | Winners | Days | Minimum messages | Draw time</code>"
+      ].join("\n");
+}
+
+function inviteGiveawayDetailsPromptText(mode: InviteGiveawayMode, locale: Locale) {
+  if (mode === "ranking") {
+    return locale === "zh-CN"
+      ? [
+          "🎁创建<b>邀请排名抽奖</b>",
+          "",
+          "请按以下格式发送：",
+          "<code>标题 | 奖品 | 中奖人数 | 统计天数 | 开奖时间</code>",
+          "示例：<code>邀请排名抽奖 | 100U | 3 | 7 | 2026-08-05 18:00</code>"
+        ].join("\n")
+      : [
+          "🎁 Create <b>Invite Ranking Giveaway</b>",
+          "",
+          "Send in this format:",
+          "<code>Title | Prize | Winners | Days | Draw time</code>"
+        ].join("\n");
+  }
+  return locale === "zh-CN"
+    ? [
+        "🎁创建<b>邀请次数随机抽奖</b>",
+        "",
+        "请按以下格式发送：",
+        "<code>标题 | 奖品 | 中奖人数 | 统计天数 | 最少邀请人数 | 开奖时间</code>",
+        "示例：<code>邀请随机抽奖 | 100U | 3 | 7 | 5 | 2026-08-05 18:00</code>"
+      ].join("\n")
+    : [
+        "🎁 Create <b>Invite Count Giveaway</b>",
+        "",
+        "Send in this format:",
+        "<code>Title | Prize | Winners | Days | Minimum invites | Draw time</code>"
+      ].join("\n");
+}
+
+function reportGiveawayDetailsPromptText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "🎁创建<b>指定群报道抽奖</b>",
+        "",
+        "请按以下格式发送：",
+        "<code>来源群Telegram ID | 标题 | 奖品 | 中奖人数 | 参与关键词 | 开奖时间</code>",
+        "示例：<code>-1001234567890 | 报道抽奖 | 100U | 1 | 报道 | 2026-08-05 18:00</code>"
+      ].join("\n")
+    : [
+        "🎁 Create <b>Report-in Giveaway</b>",
+        "",
+        "Send in this format:",
+        "<code>Source Telegram chat ID | Title | Prize | Winners | Keyword | Draw time</code>"
+      ].join("\n");
+}
+
+function funGiveawayDetailsPromptText(mode: FunGiveawayMode, locale: Locale) {
+  const emoji = funGiveawayEmoji(mode);
+  if (mode === "slot") {
+    return locale === "zh-CN"
+      ? [
+          "🎁创建<b>水果机抽奖</b>",
+          "",
+          "群成员发送 🎰，最先摇出 777 的人中奖。",
+          "",
+          "请按以下格式发送：",
+          "<code>标题 | 奖品 | 每人次数</code>",
+          "示例：<code>水果机抽奖 | 100U | 3</code>"
+        ].join("\n")
+      : [
+          "🎁 Create <b>Slot Giveaway</b>",
+          "",
+          "Members send 🎰. The first 777 wins.",
+          "",
+          "Send in this format:",
+          "<code>Title | Prize | Attempts per user</code>"
+        ].join("\n");
+  }
+  return locale === "zh-CN"
+    ? [
+        `🎁创建<b>娱乐抽奖 ${emoji}</b>`,
+        "",
+        "请按以下格式发送：",
+        "<code>标题 | 奖品 | 中奖人数 | 每人次数 | 开奖时间</code>",
+        `示例：<code>${emoji} 娱乐抽奖 | 100U | 1 | 3 | 2026-08-05 18:00</code>`
+      ].join("\n")
+    : [
+        `🎁 Create <b>Fun Giveaway ${emoji}</b>`,
+        "",
+        "Send in this format:",
+        "<code>Title | Prize | Winners | Attempts per user | Draw time</code>"
+      ].join("\n");
+}
+
 function giveawayCreateCancelKeyboard(chatId: string, locale: Locale) {
   return new InlineKeyboard().text(locale === "zh-CN" ? "🔙 返回" : "🔙 Back", `giveaway:cancel:${chatId}`);
 }
@@ -8159,6 +8637,217 @@ function parseCommonGiveawayDetailsInput(input: string, locale: Locale): {
   return { value: { title, prize, winnersCount, keyword }, error: "" };
 }
 
+function parseGiveawayDraftDetailsInput(draft: GiveawayInputDraft, input: string, locale: Locale): {
+  value?: {
+    title: string;
+    prize: string;
+    winnersCount: number;
+    drawAt: Date;
+    joinRequirements: Prisma.InputJsonObject;
+  };
+  error: string;
+} {
+  if (draft.type === "common") {
+    const parsed = parseCommonGiveawayDetailsInput(input, locale);
+    if (!parsed.value) return { error: parsed.error };
+    const drawAt = draft.drawMode === "timed" && draft.drawAt ? draft.drawAt : fallbackFullGiveawayDrawAt();
+    return {
+      value: {
+        title: parsed.value.title,
+        prize: parsed.value.prize,
+        winnersCount: parsed.value.winnersCount,
+        drawAt,
+        joinRequirements: {
+          type: "common",
+          entry: "keyword",
+          keyword: parsed.value.keyword,
+          drawMode: draft.drawMode ?? "timed",
+          ...(draft.targetCount ? { targetCount: draft.targetCount } : {})
+        }
+      },
+      error: ""
+    };
+  }
+
+  if (draft.type === "points") {
+    const parsed = parsePipeParts(input, 4);
+    if (!parsed) return { error: pointsGiveawayDetailsPromptText(draft, locale) };
+    const base = parseGiveawayBaseFields(parsed, locale);
+    if (!base.value) return { error: base.error };
+    const cost = parsePositiveInteger(parsed[3] ?? "");
+    if (cost === null || cost > 1000000) {
+      return { error: locale === "zh-CN" ? "消耗积分必须是 1 到 1000000 的整数。" : "Point cost must be an integer from 1 to 1000000." };
+    }
+    return {
+      value: {
+        ...base.value,
+        drawAt: draft.drawMode === "timed" && draft.drawAt ? draft.drawAt : fallbackFullGiveawayDrawAt(),
+        joinRequirements: {
+          type: "points",
+          entry: "button",
+          cost,
+          drawMode: draft.drawMode ?? "timed",
+          ...(draft.targetCount ? { targetCount: draft.targetCount } : {})
+        }
+      },
+      error: ""
+    };
+  }
+
+  if (draft.type === "active" && draft.activeMode) {
+    const expected = draft.activeMode === "ranking" ? 5 : 6;
+    const parsed = parsePipeParts(input, expected);
+    if (!parsed) return { error: activeGiveawayDetailsPromptText(draft.activeMode, locale) };
+    const base = parseGiveawayBaseFields(parsed, locale);
+    if (!base.value) return { error: base.error };
+    const days = parsePositiveInteger(parsed[3] ?? "");
+    const drawAt = parseGiveawayDrawAt(parsed[expected - 1] ?? "");
+    if (days === null || days > 365) return { error: locale === "zh-CN" ? "统计天数必须是 1 到 365 的整数。" : "Days must be an integer from 1 to 365." };
+    if (!drawAt || drawAt.getTime() <= Date.now()) return { error: commonFutureDrawAtError(locale) };
+    const minCount = draft.activeMode === "speech_count" ? parsePositiveInteger(parsed[4] ?? "") : null;
+    if (draft.activeMode === "speech_count" && (minCount === null || minCount > 1000000)) {
+      return { error: locale === "zh-CN" ? "最少发言次数必须是 1 到 1000000 的整数。" : "Minimum messages must be an integer from 1 to 1000000." };
+    }
+    return {
+      value: {
+        ...base.value,
+        drawAt,
+        joinRequirements: {
+          type: "active",
+          mode: draft.activeMode,
+          days,
+          ...(minCount ? { minCount } : {})
+        }
+      },
+      error: ""
+    };
+  }
+
+  if (draft.type === "invite" && draft.inviteMode) {
+    const expected = draft.inviteMode === "ranking" ? 5 : 6;
+    const parsed = parsePipeParts(input, expected);
+    if (!parsed) return { error: inviteGiveawayDetailsPromptText(draft.inviteMode, locale) };
+    const base = parseGiveawayBaseFields(parsed, locale);
+    if (!base.value) return { error: base.error };
+    const days = parsePositiveInteger(parsed[3] ?? "");
+    const drawAt = parseGiveawayDrawAt(parsed[expected - 1] ?? "");
+    if (days === null || days > 365) return { error: locale === "zh-CN" ? "统计天数必须是 1 到 365 的整数。" : "Days must be an integer from 1 to 365." };
+    if (!drawAt || drawAt.getTime() <= Date.now()) return { error: commonFutureDrawAtError(locale) };
+    const minCount = draft.inviteMode === "count" ? parsePositiveInteger(parsed[4] ?? "") : null;
+    if (draft.inviteMode === "count" && (minCount === null || minCount > 1000000)) {
+      return { error: locale === "zh-CN" ? "最少邀请人数必须是 1 到 1000000 的整数。" : "Minimum invites must be an integer from 1 to 1000000." };
+    }
+    return {
+      value: {
+        ...base.value,
+        drawAt,
+        joinRequirements: {
+          type: "invite",
+          mode: draft.inviteMode,
+          days,
+          ...(minCount ? { minCount } : {})
+        }
+      },
+      error: ""
+    };
+  }
+
+  if (draft.type === "report") {
+    const parsed = parsePipeParts(input, 6);
+    if (!parsed) return { error: reportGiveawayDetailsPromptText(locale) };
+    const sourceChatId = parsed[0] ?? "";
+    const base = parseGiveawayBaseFields(parsed.slice(1), locale);
+    const keyword = parsed[4] ?? "";
+    const drawAt = parseGiveawayDrawAt(parsed[5] ?? "");
+    if (!/^-\d+$/.test(sourceChatId) && !/^\d+$/.test(sourceChatId)) return { error: locale === "zh-CN" ? "来源群 Telegram ID 格式不正确。" : "Source Telegram chat ID is invalid." };
+    if (!base.value) return { error: base.error };
+    if (!keyword || keyword.length > 64) return { error: locale === "zh-CN" ? "参与关键词不能为空，且不能超过 64 个字符。" : "Keyword is required and must be 64 characters or fewer." };
+    if (!drawAt || drawAt.getTime() <= Date.now()) return { error: commonFutureDrawAtError(locale) };
+    return {
+      value: {
+        ...base.value,
+        drawAt,
+        joinRequirements: {
+          type: "report",
+          sourceChatId,
+          keyword
+        }
+      },
+      error: ""
+    };
+  }
+
+  if (draft.type === "fun" && draft.funMode) {
+    const expected = draft.funMode === "slot" ? 3 : 5;
+    const parsed = parsePipeParts(input, expected);
+    if (!parsed) return { error: funGiveawayDetailsPromptText(draft.funMode, locale) };
+    const base = draft.funMode === "slot"
+      ? parseGiveawayBaseFields([parsed[0] ?? "", parsed[1] ?? "", "1"], locale)
+      : parseGiveawayBaseFields(parsed, locale);
+    if (!base.value) return { error: base.error };
+    const attempts = parsePositiveInteger(parsed[draft.funMode === "slot" ? 2 : 3] ?? "");
+    if (attempts === null || attempts > 1000) return { error: locale === "zh-CN" ? "每人次数必须是 1 到 1000 的整数。" : "Attempts must be an integer from 1 to 1000." };
+    const drawAt = draft.funMode === "slot" ? fallbackFullGiveawayDrawAt() : parseGiveawayDrawAt(parsed[4] ?? "");
+    if (!drawAt || drawAt.getTime() <= Date.now()) return { error: commonFutureDrawAtError(locale) };
+    return {
+      value: {
+        ...base.value,
+        drawAt,
+        joinRequirements: {
+          type: "fun",
+          mode: draft.funMode,
+          attempts
+        }
+      },
+      error: ""
+    };
+  }
+
+  return { error: locale === "zh-CN" ? "抽奖类型不正确，请返回重新选择。" : "Invalid giveaway type. Go back and choose again." };
+}
+
+function parsePipeParts(input: string, expected: number) {
+  const parts = input.split("|").map((item) => item.trim());
+  return parts.length === expected ? parts : null;
+}
+
+function parseGiveawayBaseFields(parts: string[], locale: Locale): {
+  value?: { title: string; prize: string; winnersCount: number };
+  error: string;
+} {
+  const [title = "", prize = "", winnersRaw = ""] = parts;
+  if (!title || title.length > 255) {
+    return { error: locale === "zh-CN" ? "标题不能为空，且不能超过 255 个字符。" : "Title is required and must be 255 characters or fewer." };
+  }
+  if (!prize || prize.length > 255) {
+    return { error: locale === "zh-CN" ? "奖品不能为空，且不能超过 255 个字符。" : "Prize is required and must be 255 characters or fewer." };
+  }
+  const winnersCount = parsePositiveInteger(winnersRaw);
+  if (winnersCount === null || winnersCount > 100) {
+    return { error: locale === "zh-CN" ? "中奖人数必须是 1 到 100 的整数。" : "Winners must be an integer from 1 to 100." };
+  }
+  return { value: { title, prize, winnersCount }, error: "" };
+}
+
+function parsePositiveInteger(input: string) {
+  if (!/^\d+$/.test(input.trim())) return null;
+  const value = Number(input.trim());
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function commonFutureDrawAtError(locale: Locale) {
+  return locale === "zh-CN"
+    ? "开奖时间必须是未来时间，例如 <code>2026-08-05 18:00</code>、<code>30分钟</code> 或 <code>2小时</code>。"
+    : "Draw time must be in the future, for example <code>2026-08-05 18:00</code>, <code>30 minutes</code>, or <code>2 hours</code>.";
+}
+
+function shouldEnqueueGiveawayDraw(requirements: Prisma.InputJsonObject) {
+  if (requirements.type === "common" || requirements.type === "points") {
+    return requirements.drawMode === "timed";
+  }
+  return !(requirements.type === "fun" && requirements.mode === "slot");
+}
+
 function parseGiveawayDrawAt(input: string) {
   const durationMinutes = parseScheduleDurationMinutes(input);
   if (durationMinutes) return new Date(Date.now() + durationMinutes * 60_000);
@@ -8184,14 +8873,41 @@ function isGiveawayDrawMode(value: string | undefined): value is GiveawayDrawMod
   return value === "full" || value === "timed";
 }
 
+function isActiveGiveawayMode(value: string | undefined): value is ActiveGiveawayMode {
+  return value === "ranking" || value === "speech_count";
+}
+
+function isInviteGiveawayMode(value: string | undefined): value is InviteGiveawayMode {
+  return value === "ranking" || value === "count";
+}
+
+function isFunGiveawayMode(value: string | undefined): value is FunGiveawayMode {
+  return value === "dice"
+    || value === "dart"
+    || value === "basketball"
+    || value === "football"
+    || value === "bowling"
+    || value === "slot";
+}
+
+function funGiveawayEmoji(mode: FunGiveawayMode) {
+  if (mode === "dice") return "🎲";
+  if (mode === "dart") return "🎯";
+  if (mode === "basketball") return "🏀";
+  if (mode === "football") return "⚽";
+  if (mode === "bowling") return "🎳";
+  return "🎰";
+}
+
 async function sendGiveawayAnnouncement(
   ctx: Context,
   chat: PrismaChat,
   giveaway: { id: string; title: string; prize: string; winnersCount: number; drawAt: Date; joinRequirements?: Prisma.JsonValue | null },
   locale: Locale
 ) {
-  const requirements = getCommonGiveawayRequirements(giveaway.joinRequirements);
-  const options = requirements
+  const requirements = getGiveawayRequirements(giveaway.joinRequirements);
+  const joinButton = !requirements || requirements.type === "points";
+  const options = !joinButton
     ? { parse_mode: "HTML" as const }
     : {
         parse_mode: "HTML" as const,
@@ -8206,19 +8922,17 @@ async function sendGiveawayAnnouncement(
 
 function giveawayAnnouncementText(
   giveaway: { title: string; prize: string; winnersCount: number; drawAt: Date },
-  requirements: CommonGiveawayRequirements | null,
+  requirements: GiveawayRequirements | null,
   locale: Locale
 ) {
-  const drawLine = requirements?.drawMode === "full" && requirements.targetCount
-    ? (locale === "zh-CN" ? `满 <b>${requirements.targetCount}</b> 人自动开奖` : `Draws when <b>${requirements.targetCount}</b> members join`)
-    : `${locale === "zh-CN" ? "开奖时间" : "Draw at"}: <b>${formatDateTimeForDisplay(giveaway.drawAt)}</b>`;
-  const joinLine = requirements
-    ? (
-        locale === "zh-CN"
-          ? `回复关键词 <code>${escapeHtml(requirements.keyword)}</code> 参与抽奖。`
-          : `Reply with <code>${escapeHtml(requirements.keyword)}</code> to join.`
-      )
-    : (locale === "zh-CN" ? "点击下方按钮参与抽奖。" : "Tap the button below to join.");
+  const drawMode = requirements && "drawMode" in requirements ? requirements.drawMode : undefined;
+  const targetCount = requirements && "targetCount" in requirements ? requirements.targetCount : undefined;
+  const drawLine = requirements?.type === "fun" && requirements.mode === "slot"
+    ? (locale === "zh-CN" ? "开奖方式: <b>最先摇出 777 即时开奖</b>" : "Draw mode: <b>first 777 wins instantly</b>")
+    : drawMode === "full" && targetCount
+      ? (locale === "zh-CN" ? `满 <b>${targetCount}</b> 人自动开奖` : `Draws when <b>${targetCount}</b> members join`)
+      : `${locale === "zh-CN" ? "开奖时间" : "Draw at"}: <b>${formatDateTimeForDisplay(giveaway.drawAt)}</b>`;
+  const joinLine = giveawayJoinInstruction(requirements, locale);
 
   return locale === "zh-CN"
     ? [
@@ -8239,6 +8953,97 @@ function giveawayAnnouncementText(
         "",
         joinLine
       ].join("\n");
+}
+
+function giveawayJoinInstruction(requirements: GiveawayRequirements | null, locale: Locale) {
+  if (!requirements) return locale === "zh-CN" ? "点击下方按钮参与抽奖。" : "Tap the button below to join.";
+  if (requirements.type === "common") {
+    return locale === "zh-CN"
+      ? `回复关键词 <code>${escapeHtml(requirements.keyword)}</code> 参与抽奖。`
+      : `Reply with <code>${escapeHtml(requirements.keyword)}</code> to join.`;
+  }
+  if (requirements.type === "points") {
+    return locale === "zh-CN"
+      ? `点击下方按钮参与抽奖，每次消耗 <b>${requirements.cost}</b> 积分。`
+      : `Tap the button below to join. Cost: <b>${requirements.cost}</b> points.`;
+  }
+  if (requirements.type === "active") {
+    return requirements.mode === "ranking"
+      ? (locale === "zh-CN" ? `开奖时从近 <b>${requirements.days}</b> 天活跃排名中抽取。` : `Winners are drawn from the ${requirements.days}-day activity ranking.`)
+      : (locale === "zh-CN" ? `开奖时从近 <b>${requirements.days}</b> 天发言达到 <b>${requirements.minCount}</b> 次的成员中随机抽取。` : `Winners are drawn from members with at least ${requirements.minCount} messages in ${requirements.days} day(s).`);
+  }
+  if (requirements.type === "invite") {
+    return requirements.mode === "ranking"
+      ? (locale === "zh-CN" ? `开奖时从近 <b>${requirements.days}</b> 天邀请排名中抽取。` : `Winners are drawn from the ${requirements.days}-day invite ranking.`)
+      : (locale === "zh-CN" ? `开奖时从近 <b>${requirements.days}</b> 天邀请达到 <b>${requirements.minCount}</b> 人的成员中随机抽取。` : `Winners are drawn from members with at least ${requirements.minCount} invites in ${requirements.days} day(s).`);
+  }
+  if (requirements.type === "report") {
+    return locale === "zh-CN"
+      ? `来源群成员在本群回复 <code>${escapeHtml(requirements.keyword)}</code> 参与抽奖。`
+      : `Members from the source group reply with <code>${escapeHtml(requirements.keyword)}</code> here to join.`;
+  }
+  if (requirements.type === "fun") {
+    return requirements.mode === "slot"
+      ? (locale === "zh-CN" ? `发送 ${funGiveawayEmoji(requirements.mode)} 参与，最先摇出 777 的人中奖。每人 ${requirements.attempts} 次。` : `Send ${funGiveawayEmoji(requirements.mode)} to join. First 777 wins. ${requirements.attempts} attempt(s) per user.`)
+      : (locale === "zh-CN" ? `发送 ${funGiveawayEmoji(requirements.mode)} 参与计分，每人 ${requirements.attempts} 次，开奖时最高分获胜。` : `Send ${funGiveawayEmoji(requirements.mode)} to score. ${requirements.attempts} attempt(s) per user. Highest score wins.`);
+  }
+}
+
+function getGiveawayRequirements(value: Prisma.JsonValue | null | undefined): GiveawayRequirements | null {
+  if (!isRecord(value) || typeof value.type !== "string") return null;
+  if (value.type === "common") return getCommonGiveawayRequirements(value);
+  if (value.type === "points") {
+    const cost = Number(value.cost);
+    const targetCount = Number(value.targetCount);
+    const drawMode = typeof value.drawMode === "string" ? value.drawMode : undefined;
+    if (value.entry !== "button" || !Number.isSafeInteger(cost) || cost <= 0 || !isGiveawayDrawMode(drawMode)) return null;
+    return {
+      type: "points",
+      entry: "button",
+      cost,
+      drawMode,
+      ...(Number.isSafeInteger(targetCount) && targetCount > 0 ? { targetCount } : {})
+    };
+  }
+  if (value.type === "active") {
+    const days = Number(value.days);
+    const minCount = Number(value.minCount);
+    const mode = typeof value.mode === "string" ? value.mode : undefined;
+    if (!isActiveGiveawayMode(mode) || !Number.isSafeInteger(days) || days <= 0) return null;
+    return {
+      type: "active",
+      mode,
+      days,
+      ...(Number.isSafeInteger(minCount) && minCount > 0 ? { minCount } : {})
+    };
+  }
+  if (value.type === "invite") {
+    const days = Number(value.days);
+    const minCount = Number(value.minCount);
+    const mode = typeof value.mode === "string" ? value.mode : undefined;
+    if (!isInviteGiveawayMode(mode) || !Number.isSafeInteger(days) || days <= 0) return null;
+    return {
+      type: "invite",
+      mode,
+      days,
+      ...(Number.isSafeInteger(minCount) && minCount > 0 ? { minCount } : {})
+    };
+  }
+  if (value.type === "report") {
+    if (typeof value.sourceChatId !== "string" || typeof value.keyword !== "string" || !value.keyword.trim()) return null;
+    return {
+      type: "report",
+      sourceChatId: value.sourceChatId,
+      keyword: value.keyword.trim()
+    };
+  }
+  if (value.type === "fun") {
+    const mode = typeof value.mode === "string" ? value.mode : undefined;
+    const attempts = Number(value.attempts);
+    if (!isFunGiveawayMode(mode) || !Number.isSafeInteger(attempts) || attempts <= 0) return null;
+    return { type: "fun", mode, attempts };
+  }
+  return null;
 }
 
 function getCommonGiveawayRequirements(value: Prisma.JsonValue | null | undefined): CommonGiveawayRequirements | null {
@@ -8273,27 +9078,129 @@ async function handleGiveawayKeywordEntry(ctx: Context, config: AppConfig, local
     take: 50
   });
   const matched = giveaways.filter((giveaway) => {
-    const requirements = getCommonGiveawayRequirements(giveaway.joinRequirements);
-    return requirements?.keyword === messageText;
+    const requirements = getGiveawayRequirements(giveaway.joinRequirements);
+    return (requirements?.type === "common" || requirements?.type === "report") && requirements.keyword === messageText;
   });
   if (!matched.length) return false;
 
   const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
+  let joinedCount = 0;
   for (const giveaway of matched) {
+    const requirements = getGiveawayRequirements(giveaway.joinRequirements);
+    if (requirements?.type === "report" && !(await canJoinReportGiveaway(ctx, requirements, ctx.from.id))) {
+      await ctx.reply(locale === "zh-CN" ? "你不在来源群内，不能参与该报道抽奖。" : "You are not in the source group for this report-in giveaway.").catch(() => undefined);
+      continue;
+    }
     await prisma.giveawayEntry.upsert({
       where: { giveawayId_userId: { giveawayId: giveaway.id, userId: user.id } },
       create: { giveawayId: giveaway.id, userId: user.id },
       update: { isValid: true }
     });
+    joinedCount += 1;
     await maybeDrawGiveawayWhenFull(ctx, giveaway.id, locale);
   }
 
+  if (!joinedCount) return true;
   await ctx.reply(
-    matched.length === 1
+    joinedCount === 1
       ? (locale === "zh-CN" ? "已参与抽奖。" : "Joined the giveaway.")
-      : (locale === "zh-CN" ? `已参与 ${matched.length} 个抽奖。` : `Joined ${matched.length} giveaways.`)
+      : (locale === "zh-CN" ? `已参与 ${joinedCount} 个抽奖。` : `Joined ${joinedCount} giveaways.`)
   ).catch(() => undefined);
   return true;
+}
+
+async function canJoinReportGiveaway(ctx: Context, requirements: Extract<GiveawayRequirements, { type: "report" }>, telegramUserId: number) {
+  const member = await ctx.api.getChatMember(Number(requirements.sourceChatId), telegramUserId).catch(() => null);
+  if (!member) return false;
+  return member.status !== "left" && member.status !== "kicked";
+}
+
+async function handleFunGiveawayDiceMessage(ctx: Context, config: AppConfig, locale: Locale) {
+  if (!ctx.chat || !ctx.from || !isGroupLike(ctx.chat) || !ctx.message || !("dice" in ctx.message) || !ctx.message.dice) return false;
+  const chat = await getActiveChatByTelegramId(ctx.chat.id);
+  if (!chat) return false;
+
+  const emoji = ctx.message.dice.emoji;
+  const value = ctx.message.dice.value;
+  const mode = funGiveawayModeFromEmoji(emoji);
+  if (!mode) return false;
+
+  const giveaways = await prisma.giveaway.findMany({
+    where: { chatId: chat.id, status: GiveawayStatus.ACTIVE },
+    orderBy: { createdAt: "desc" },
+    take: 50
+  });
+  const matched = giveaways.filter((giveaway) => {
+    const requirements = getGiveawayRequirements(giveaway.joinRequirements);
+    return requirements?.type === "fun" && requirements.mode === mode;
+  });
+  if (!matched.length) return false;
+
+  const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
+  let handled = false;
+  for (const giveaway of matched) {
+    const requirements = getGiveawayRequirements(giveaway.joinRequirements);
+    if (requirements?.type !== "fun") continue;
+
+    const attempts = await countFunGiveawayAttempts(giveaway.id, user.id);
+    if (attempts >= requirements.attempts) continue;
+
+    await prisma.giveawayEntry.upsert({
+      where: { giveawayId_userId: { giveawayId: giveaway.id, userId: user.id } },
+      create: { giveawayId: giveaway.id, userId: user.id },
+      update: { isValid: true }
+    });
+    await prisma.auditLog.create({
+      data: {
+        chatId: chat.id,
+        actorUserId: user.id,
+        action: "giveaway.fun_roll",
+        targetType: "giveaway",
+        targetId: giveaway.id,
+        metadata: {
+          userId: user.id,
+          telegramUserId: ctx.from.id,
+          mode,
+          emoji,
+          value,
+          messageId: ctx.message.message_id
+        }
+      }
+    });
+    handled = true;
+
+    if (mode === "slot" && value === 64) {
+      await drawGiveawayNow(ctx, giveaway.id, locale, [user.id], "slot_777");
+    }
+  }
+
+  if (handled) {
+    await ctx.reply(locale === "zh-CN" ? "娱乐抽奖成绩已记录。" : "Fun giveaway score recorded.").catch(() => undefined);
+  }
+  return handled;
+}
+
+function funGiveawayModeFromEmoji(emoji: string): FunGiveawayMode | null {
+  if (emoji === "🎲") return "dice";
+  if (emoji === "🎯") return "dart";
+  if (emoji === "🏀") return "basketball";
+  if (emoji === "⚽") return "football";
+  if (emoji === "🎳") return "bowling";
+  if (emoji === "🎰") return "slot";
+  return null;
+}
+
+async function countFunGiveawayAttempts(giveawayId: string, userId: string) {
+  const logs = await prisma.auditLog.findMany({
+    where: {
+      action: "giveaway.fun_roll",
+      targetType: "giveaway",
+      targetId: giveawayId,
+      actorUserId: userId
+    },
+    select: { id: true }
+  });
+  return logs.length;
 }
 
 async function maybeDrawGiveawayWhenFull(ctx: Context, giveawayId: string, locale: Locale) {
@@ -8301,15 +9208,19 @@ async function maybeDrawGiveawayWhenFull(ctx: Context, giveawayId: string, local
     where: { id: giveawayId },
     select: { joinRequirements: true }
   });
-  const requirements = getCommonGiveawayRequirements(giveaway?.joinRequirements);
-  if (requirements?.drawMode !== "full" || !requirements.targetCount) return;
+  const requirements = getGiveawayRequirements(giveaway?.joinRequirements);
+  if (
+    !(requirements?.type === "common" || requirements?.type === "points")
+    || requirements.drawMode !== "full"
+    || !requirements.targetCount
+  ) return;
 
   const count = await prisma.giveawayEntry.count({ where: { giveawayId, isValid: true } });
   if (count < requirements.targetCount) return;
   await drawGiveawayNow(ctx, giveawayId, locale);
 }
 
-async function drawGiveawayNow(ctx: Context, giveawayId: string, locale: Locale) {
+async function drawGiveawayNow(ctx: Context, giveawayId: string, locale: Locale, forcedWinnerUserIds: string[] | null = null, trigger = "target_count") {
   const giveaway = await prisma.giveaway.findUnique({
     where: { id: giveawayId },
     include: {
@@ -8323,14 +9234,16 @@ async function drawGiveawayNow(ctx: Context, giveawayId: string, locale: Locale)
   });
   if (!giveaway || giveaway.status !== GiveawayStatus.ACTIVE) return;
 
-  const winners = pickGiveawayWinners(giveaway.entries, giveaway.winnersCount);
+  const winners = forcedWinnerUserIds
+    ? giveaway.entries.filter((entry) => forcedWinnerUserIds.includes(entry.userId)).slice(0, giveaway.winnersCount)
+    : pickGiveawayWinners(giveaway.entries, giveaway.winnersCount);
   const drawResult: Prisma.InputJsonObject = {
     drawnAt: new Date().toISOString(),
     entryCount: giveaway.entries.length,
     winnerCount: winners.length,
     winnerUserIds: winners.map((entry) => entry.userId),
     winnerTelegramUserIds: winners.map((entry) => entry.user.telegramUserId.toString()),
-    trigger: "target_count"
+    trigger
   };
 
   const updated = await prisma.giveaway.updateMany({
@@ -8417,6 +9330,17 @@ async function handleGiveawayJoinCallback(ctx: Context, config: AppConfig) {
   }
 
   const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
+  const requirements = getGiveawayRequirements(giveaway.joinRequirements);
+  if (requirements?.type === "points") {
+    const spent = await spendGiveawayPoints(giveaway.chatId, user.id, requirements.cost, giveaway.id);
+    if (!spent.ok) {
+      await ctx.answerCallbackQuery({
+        text: `积分不足，当前积分：${spent.balance}`,
+        show_alert: true
+      }).catch(() => undefined);
+      return;
+    }
+  }
   await prisma.giveawayEntry.upsert({
     where: { giveawayId_userId: { giveawayId: id, userId: user.id } },
     create: { giveawayId: id, userId: user.id },
@@ -8424,6 +9348,36 @@ async function handleGiveawayJoinCallback(ctx: Context, config: AppConfig) {
   });
   await maybeDrawGiveawayWhenFull(ctx, id, await getLocale(ctx));
   await ctx.answerCallbackQuery({ text: "已参与" }).catch(() => undefined);
+}
+
+async function spendGiveawayPoints(chatId: string, userId: string, cost: number, giveawayId: string) {
+  return prisma.$transaction(async (tx) => {
+    const referenceKey = `giveaway:${giveawayId}:${userId}`;
+    const existing = await tx.chatPointTransaction.findUnique({ where: { referenceKey } });
+    if (existing) return { ok: true, balance: existing.balanceAfter ?? 0 };
+
+    const current = await tx.chatPointBalance.findUnique({ where: { chatId_userId: { chatId, userId } } });
+    const balance = current?.balance ?? 0;
+    if (balance < cost) return { ok: false, balance };
+
+    const next = await tx.chatPointBalance.upsert({
+      where: { chatId_userId: { chatId, userId } },
+      create: { chatId, userId, balance: -cost, lastTransactionAt: new Date() },
+      update: { balance: { decrement: cost }, lastTransactionAt: new Date() }
+    });
+    await tx.chatPointTransaction.create({
+      data: {
+        chatId,
+        userId,
+        type: PointTransactionType.LOTTERY,
+        delta: -cost,
+        balanceAfter: next.balance,
+        referenceKey,
+        metadata: { giveawayId, cost }
+      }
+    });
+    return { ok: true, balance: next.balance };
+  });
 }
 
 async function showManagedChats(ctx: Context, scope: "group" | "channel", locale: Locale, botUsername: string) {
@@ -9995,10 +10949,22 @@ async function getDailyPointDelta(chatId: string, userId: string, type: PointTra
   return result._sum.delta ?? 0;
 }
 
+async function botHasDeleteMessagePermission(ctx: Context, chat: PrismaChat) {
+  const botInfo = await ctx.api.getMe();
+  const member = await ctx.api.getChatMember(Number(chat.telegramChatId), botInfo.id);
+  if (member.status === "creator") return true;
+  if (member.status !== "administrator") return false;
+  return (member as unknown as Record<string, unknown>).can_delete_messages === true;
+}
+
 function scheduleTelegramMessageDelete(ctx: Context, chatId: number, messageId: number, seconds: number) {
-  setTimeout(() => {
-    void ctx.api.deleteMessage(chatId, messageId).catch(() => undefined);
-  }, seconds * 1000);
+  void enqueueSignInMessageDelete(chatId, messageId, seconds).catch((error) => {
+    console.warn("Failed to schedule sign-in message deletion", {
+      chatId,
+      messageId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
 }
 
 async function openGroupStatsPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
@@ -10953,7 +11919,7 @@ function bannedWordsMuteDurationPromptText(settings: BannedWordsSettings, locale
         "",
         `当前设置: 禁言${duration}`,
         "",
-        "👉 输入处罚禁言的时长 如 <strong>60</strong> 单位/分钟:"
+        "👉 输入处罚禁言时长，只需发送分钟数，例如 <strong>60</strong>。也支持 <code>60分钟</code>:"
       ].join("\n")
     : [
         "🔇 Banned words",
@@ -11500,6 +12466,15 @@ function parseBannedWordsInput(input: string) {
     .map(normalizeBannedWord)
     .filter(Boolean)
     .map((word) => word.slice(0, 128));
+}
+
+function parseBannedWordsMuteDurationMinutes(input: string) {
+  const text = input.trim().toLowerCase().replace(/\s+/g, "");
+  const match = text.match(/^(\d+)(?:分钟|分|单位\/?分钟|min|m)?$/i);
+  if (!match?.[1]) return null;
+  const minutes = Number(match[1]);
+  if (!Number.isSafeInteger(minutes) || minutes < 1 || minutes > 525600) return null;
+  return minutes;
 }
 
 function uniqueBannedWords(words: string[]) {

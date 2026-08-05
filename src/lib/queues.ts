@@ -13,10 +13,15 @@ export const membershipExpiryQueue = new Queue("membership-expiry", {
   connection: redis
 });
 
+export const signInMessageDeleteQueue = new Queue("sign-in-message-deletes", {
+  connection: redis
+});
+
 export async function closeQueues() {
   await Promise.all([
     scheduledMessagesQueue.close(),
     giveawayDrawQueue.close(),
-    membershipExpiryQueue.close()
+    membershipExpiryQueue.close(),
+    signInMessageDeleteQueue.close()
   ]);
 }

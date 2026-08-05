@@ -231,9 +231,11 @@ export async function handleAntiSpamInputMessage(ctx: Context, locale: Locale) {
   const text = getMessageText(ctx.message);
 
   if (draft.field === "maxMessageLength" || draft.field === "maxNicknameLength" || draft.field === "muteMinutes") {
-    const value = Number(text.trim());
+    const value = draft.field === "muteMinutes"
+      ? parseMuteDurationMinutes(text)
+      : Number(text.trim());
     const limit = antiSpamInputNumberLimit(draft.field);
-    if (!Number.isInteger(value) || value < limit.min || value > limit.max) {
+    if (value === null || !Number.isInteger(value) || value < limit.min || value > limit.max) {
       await ctx.reply(antiSpamInvalidNumberText(draft.field, settings, locale), {
         parse_mode: "HTML",
         reply_markup: antiSpamBackKeyboard(chat.id, locale)
@@ -629,7 +631,7 @@ function antiSpamMuteDurationPromptText(settings: AntiSpamSettings, locale: Loca
         "",
         `当前设置: 禁言 ${formatDuration(settings.muteMinutes, locale)}`,
         "",
-        "👉 输入处罚禁言的时长 如 <strong>60</strong> 单位/分钟:"
+        "👉 输入处罚禁言时长，只需发送分钟数，例如 <strong>60</strong>。也支持 <code>60分钟</code>:"
       ].join("\n")
     : [
         "📨 Anti-spam",
@@ -1019,6 +1021,15 @@ function formatDuration(minutes: number, locale: Locale) {
   if (minutes % 1440 === 0) return locale === "zh-CN" ? `${minutes / 1440} 天` : `${minutes / 1440}d`;
   if (minutes % 60 === 0) return locale === "zh-CN" ? `${minutes / 60} 小时` : `${minutes / 60}h`;
   return locale === "zh-CN" ? `${Math.round(minutes)} 分钟` : `${Math.round(minutes)}m`;
+}
+
+function parseMuteDurationMinutes(input: string) {
+  const text = input.trim().toLowerCase().replace(/\s+/g, "");
+  const match = text.match(/^(\d+)(?:分钟|分|单位\/?分钟|min|m)?$/i);
+  if (!match?.[1]) return null;
+  const minutes = Number(match[1]);
+  if (!Number.isSafeInteger(minutes) || minutes < 0 || minutes > 525600) return null;
+  return minutes;
 }
 
 async function editOrReply(ctx: Context, text: string, keyboard: InlineKeyboard) {
