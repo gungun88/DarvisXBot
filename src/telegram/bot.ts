@@ -364,6 +364,14 @@ type GiveawayRequirements =
       attempts: number;
     };
 
+type GiveawaySettings = {
+  pinAnnouncement: boolean;
+  pinResult: boolean;
+  deleteEntryCommand: boolean;
+  showPublicChannel: boolean;
+  pushPublicChannel: boolean;
+};
+
 type MemberStatsSnapshot = {
   date: string;
   count: number;
@@ -535,6 +543,14 @@ const defaultInviteLinkSettings: InviteLinkSettings = {
   createsJoinRequest: false,
   expireSeconds: 0,
   memberLimit: 0
+};
+
+const defaultGiveawaySettings: GiveawaySettings = {
+  pinAnnouncement: false,
+  pinResult: false,
+  deleteEntryCommand: false,
+  showPublicChannel: false,
+  pushPublicChannel: false
 };
 
 const autoDeleteEventKeys = ["join", "leave", "boost", "pin", "photo", "title"] as const satisfies readonly AutoDeleteEventKey[];
@@ -5880,23 +5896,62 @@ async function openGiveawayRecordsPanel(ctx: Context, locale: Locale, chat: Pris
 }
 
 async function openGiveawaySettingsPanel(ctx: Context, locale: Locale, chat: PrismaChat) {
+  const settings = await getGiveawaySettings(chat.id);
   await editOrReply(
     ctx,
-    locale === "zh-CN"
-      ? [
-          "<b>⚙ 抽奖设置</b>",
-          "",
-          "当前抽奖使用默认规则：用户点击按钮参与，到开奖时间自动随机开奖。",
-          "后续可在这里接入参与门槛、积分消耗和开奖提醒等配置。"
-        ].join("\n")
-      : [
-          "<b>⚙ Giveaway settings</b>",
-          "",
-          "Giveaways currently use the default rule: users join by button and winners are drawn automatically at the draw time.",
-          "Join requirements, point cost and reminders can be wired here later."
-        ].join("\n"),
-    giveawayBackKeyboard(chat.id, locale)
+    giveawaySettingsText(locale),
+    giveawaySettingsKeyboard(chat.id, settings, locale)
   );
+}
+
+function giveawaySettingsText(locale: Locale) {
+  return locale === "zh-CN"
+    ? [
+        "<strong>⚙ 抽奖设置</strong>",
+        "",
+        "<strong>发布置顶:</strong>",
+        "└ 发布抽奖消息群内置顶",
+        "<strong>结果置顶:</strong>",
+        "└ 中奖结果消息群内置顶",
+        "<strong>删除口令:</strong>",
+        "└ 5分钟后自动删除群成员参加抽奖发送的口令消息",
+        "<strong>显示抽奖频道:</strong>",
+        "└ 发布的抽奖消息显示公共抽奖频道",
+        "<strong>推送频道:</strong>",
+        "└ 发布的抽奖是否推送到机器人的公开抽奖频道"
+      ].join("\n")
+    : [
+        "<strong>⚙ Giveaway settings</strong>",
+        "",
+        "<strong>Pin announcement:</strong>",
+        "└ Pin giveaway announcement messages in the group",
+        "<strong>Pin result:</strong>",
+        "└ Pin winner result messages in the group",
+        "<strong>Delete command:</strong>",
+        "└ Delete keyword entry messages after 5 minutes",
+        "<strong>Show giveaway channel:</strong>",
+        "└ Show the public giveaway channel in announcements",
+        "<strong>Push channel:</strong>",
+        "└ Push giveaways to the bot public giveaway channel"
+      ].join("\n");
+}
+
+function giveawaySettingsKeyboard(chatId: string, settings: GiveawaySettings, locale: Locale) {
+  const row = (keyboard: InlineKeyboard, key: keyof GiveawaySettings, label: string) => {
+    keyboard
+      .text(label, `giveaway:settings_noop:${chatId}`)
+      .text(settings[key] ? "✅开启" : "开启", `giveaway:settings_set:${key}:on:${chatId}`)
+      .text(!settings[key] ? "✅关闭" : "关闭", `giveaway:settings_set:${key}:off:${chatId}`)
+      .row();
+  };
+
+  const keyboard = new InlineKeyboard();
+  row(keyboard, "pinAnnouncement", locale === "zh-CN" ? "🔝发布置顶" : "🔝Pin post");
+  row(keyboard, "pinResult", locale === "zh-CN" ? "🔝结果置顶" : "🔝Pin result");
+  row(keyboard, "deleteEntryCommand", locale === "zh-CN" ? "🧹删除口令" : "🧹Delete command");
+  row(keyboard, "showPublicChannel", locale === "zh-CN" ? "📢抽奖频道" : "📢Giveaway channel");
+  row(keyboard, "pushPublicChannel", locale === "zh-CN" ? "📤推送频道" : "📤Push channel");
+  return keyboard.text(locale === "zh-CN" ? "🔙返回到抽奖" : "🔙 Back to giveaway", `chat_feature:giveaway:${chatId}`);
 }
 
 function giveawayStatusLabel(status: GiveawayStatus, locale: Locale) {
@@ -6660,11 +6715,17 @@ async function handlePointsCallback(ctx: Context) {
   if (action === "product_codes" && value) {
     const settings = await getPointExchangeSettings(chatId);
     const product = settings.products.find((item) => item.id === value);
-    await editOrReply(
-      ctx,
-      pointProductCodesText(product, locale),
-      new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `points:product:${chatId}:${value}`)
-    );
+    if (!product) {
+      await editOrReply(ctx, "Product not found.", new InlineKeyboard().text("Back", `points:products:${chatId}`));
+      return;
+    }
+
+    const messages = pointProductCodesMessages(product, locale);
+    const backKeyboard = new InlineKeyboard().text("Back", `points:product:${chatId}:${value}`);
+    await editOrReply(ctx, messages[0] ?? pointProductCodesText(product, locale), backKeyboard);
+    for (const message of messages.slice(1)) {
+      await ctx.reply(message, { parse_mode: "HTML" }).catch(() => undefined);
+    }
     return;
   }
 
@@ -7744,12 +7805,18 @@ async function handlePointsCommand(ctx: Context, config: AppConfig) {
     const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
     const current = await prisma.chatPointBalance.findUnique({ where: { chatId_userId: { chatId: chat.id, userId: user.id } } });
     const name = escapeHtml(displayPrismaUser(user));
-    await ctx.reply(
+    const settings = await getPointsSettings(chat.id);
+    const sent = await ctx.reply(
       locale === "zh-CN"
         ? `<b>${name}</b> 的当前积分：${current?.balance ?? 0}`
         : `<b>${name}</b>'s current points: ${current?.balance ?? 0}`,
       { parse_mode: "HTML" }
     );
+    const canDeleteMessages = settings.deleteSignInMessage && await botHasDeleteMessagePermission(ctx, chat).catch(() => false);
+    if (settings.deleteSignInMessage && canDeleteMessages) {
+      scheduleTelegramMessageDelete(ctx, ctx.chat.id, sent.message_id, settings.deleteSignInSeconds);
+      if (ctx.message?.message_id) scheduleTelegramMessageDelete(ctx, ctx.chat.id, ctx.message.message_id, settings.deleteSignInSeconds);
+    }
     return;
   }
 
@@ -7958,6 +8025,16 @@ async function handleGiveawayCallback(ctx: Context, config: AppConfig) {
   }
 
   if (action === "settings") {
+    await openGiveawaySettingsPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (action === "settings_noop") return;
+
+  if (action === "settings_set" && isGiveawaySettingsKey(parts[2]) && (parts[3] === "on" || parts[3] === "off")) {
+    const settings = await getGiveawaySettings(chat.id);
+    settings[parts[2]] = parts[3] === "on";
+    await saveGiveawaySettings(chat.id, settings);
     await openGiveawaySettingsPanel(ctx, locale, chat);
     return;
   }
@@ -8906,6 +8983,7 @@ async function sendGiveawayAnnouncement(
   locale: Locale
 ) {
   const requirements = getGiveawayRequirements(giveaway.joinRequirements);
+  const settings = await getGiveawaySettings(chat.id);
   const joinButton = !requirements || requirements.type === "points";
   const options = !joinButton
     ? { parse_mode: "HTML" as const }
@@ -8913,17 +8991,22 @@ async function sendGiveawayAnnouncement(
         parse_mode: "HTML" as const,
         reply_markup: new InlineKeyboard().text(locale === "zh-CN" ? "🎁 参与抽奖" : "🎁 Join giveaway", `giveaway:join:${giveaway.id}`)
       };
-  await ctx.api.sendMessage(
+  const sent = await ctx.api.sendMessage(
     Number(chat.telegramChatId),
-    giveawayAnnouncementText(giveaway, requirements, locale),
+    giveawayAnnouncementText(giveaway, requirements, locale, settings),
     options
   );
+  if (settings.pinAnnouncement) {
+    await ctx.api.pinChatMessage(Number(chat.telegramChatId), sent.message_id, { disable_notification: true }).catch(() => undefined);
+  }
+  return sent;
 }
 
 function giveawayAnnouncementText(
   giveaway: { title: string; prize: string; winnersCount: number; drawAt: Date },
   requirements: GiveawayRequirements | null,
-  locale: Locale
+  locale: Locale,
+  settings?: GiveawaySettings
 ) {
   const drawMode = requirements && "drawMode" in requirements ? requirements.drawMode : undefined;
   const targetCount = requirements && "targetCount" in requirements ? requirements.targetCount : undefined;
@@ -8942,7 +9025,8 @@ function giveawayAnnouncementText(
         `中奖人数: <b>${giveaway.winnersCount}</b>`,
         drawLine,
         "",
-        joinLine
+        joinLine,
+        ...(settings?.showPublicChannel ? ["", "📢 公共抽奖频道: 暂未配置"] : [])
       ].join("\n")
     : [
         `🎁 <b>${escapeHtml(giveaway.title)}</b>`,
@@ -8951,7 +9035,8 @@ function giveawayAnnouncementText(
         `Winners: <b>${giveaway.winnersCount}</b>`,
         drawLine,
         "",
-        joinLine
+        joinLine,
+        ...(settings?.showPublicChannel ? ["", "📢 Public giveaway channel: not configured"] : [])
       ].join("\n");
 }
 
@@ -9085,6 +9170,7 @@ async function handleGiveawayKeywordEntry(ctx: Context, config: AppConfig, local
 
   const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
   let joinedCount = 0;
+  const settings = await getGiveawaySettings(chat.id);
   for (const giveaway of matched) {
     const requirements = getGiveawayRequirements(giveaway.joinRequirements);
     if (requirements?.type === "report" && !(await canJoinReportGiveaway(ctx, requirements, ctx.from.id))) {
@@ -9101,6 +9187,9 @@ async function handleGiveawayKeywordEntry(ctx: Context, config: AppConfig, local
   }
 
   if (!joinedCount) return true;
+  if (settings.deleteEntryCommand) {
+    scheduleTelegramMessageDelete(ctx, ctx.chat.id, message.message_id, 300);
+  }
   await ctx.reply(
     joinedCount === 1
       ? (locale === "zh-CN" ? "已参与抽奖。" : "Joined the giveaway.")
@@ -9266,11 +9355,15 @@ async function drawGiveawayNow(ctx: Context, giveawayId: string, locale: Locale,
     }
   });
 
-  await ctx.api.sendMessage(
+  const sent = await ctx.api.sendMessage(
     Number(giveaway.chat.telegramChatId),
     buildGiveawayDrawMessage(giveaway.title, giveaway.prize, winners.map((entry) => entry.user), locale),
     { parse_mode: "HTML" }
-  ).catch(() => undefined);
+  ).catch(() => null);
+  const settings = await getGiveawaySettings(giveaway.chatId);
+  if (sent && settings.pinResult) {
+    await ctx.api.pinChatMessage(Number(giveaway.chat.telegramChatId), sent.message_id, { disable_notification: true }).catch(() => undefined);
+  }
 }
 
 function pickGiveawayWinners<T>(entries: T[], winnersCount: number) {
@@ -9468,6 +9561,29 @@ async function getInviteLinkSettings(chatId: string) {
 
 async function saveInviteLinkSettings(chatId: string, settings: InviteLinkSettings) {
   await saveSetting(chatId, "invite_links", settingsToJson(settings));
+}
+
+async function getGiveawaySettings(chatId: string): Promise<GiveawaySettings> {
+  const raw = await getSettingRecord(chatId, "giveaway_settings");
+  return {
+    pinAnnouncement: typeof raw.pinAnnouncement === "boolean" ? raw.pinAnnouncement : defaultGiveawaySettings.pinAnnouncement,
+    pinResult: typeof raw.pinResult === "boolean" ? raw.pinResult : defaultGiveawaySettings.pinResult,
+    deleteEntryCommand: typeof raw.deleteEntryCommand === "boolean" ? raw.deleteEntryCommand : defaultGiveawaySettings.deleteEntryCommand,
+    showPublicChannel: typeof raw.showPublicChannel === "boolean" ? raw.showPublicChannel : defaultGiveawaySettings.showPublicChannel,
+    pushPublicChannel: typeof raw.pushPublicChannel === "boolean" ? raw.pushPublicChannel : defaultGiveawaySettings.pushPublicChannel
+  };
+}
+
+async function saveGiveawaySettings(chatId: string, settings: GiveawaySettings) {
+  await saveSetting(chatId, "giveaway_settings", settingsToJson(settings));
+}
+
+function isGiveawaySettingsKey(value: string | undefined): value is keyof GiveawaySettings {
+  return value === "pinAnnouncement"
+    || value === "pinResult"
+    || value === "deleteEntryCommand"
+    || value === "showPublicChannel"
+    || value === "pushPublicChannel";
 }
 
 async function getInviteLinkStats(chatId: string) {
@@ -12179,6 +12295,35 @@ function pointProductCodesText(product: PointProduct | undefined, locale: Locale
   if (!product) return locale === "zh-CN" ? "找不到商品。" : "Product not found.";
   const codes = product.codes.length ? product.codes.map((code) => `<code>${escapeHtml(code)}</code>`) : [locale === "zh-CN" ? "暂无卡密。" : "No codes."];
   return [locale === "zh-CN" ? "<b>查看卡密</b>" : "<b>Codes</b>", "", ...codes].join("\n");
+}
+
+function pointProductCodesMessages(product: PointProduct, locale: Locale, maxChunkLength = 3200) {
+  if (!product.codes.length) return [pointProductCodesText(product, locale)];
+
+  const header = locale === "zh-CN" ? "<b>Codes</b>" : "<b>Codes</b>";
+  const chunks: string[] = [];
+  let current: string[] = [];
+  let currentLength = header.length + 2;
+
+  for (const code of product.codes) {
+    const rendered = `<code>${escapeHtml(code)}</code>`;
+    const nextLength = currentLength + (current.length ? 1 : 0) + rendered.length;
+    if (current.length && nextLength > maxChunkLength) {
+      chunks.push([header, "", ...current].join("\n"));
+      current = [rendered];
+      currentLength = header.length + 2 + rendered.length;
+      continue;
+    }
+
+    current.push(rendered);
+    currentLength = nextLength;
+  }
+
+  if (current.length) {
+    chunks.push([header, "", ...current].join("\n"));
+  }
+
+  return chunks;
 }
 
 function parsePointProductCodes(text: string) {

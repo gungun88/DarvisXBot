@@ -62,11 +62,15 @@ export function startGiveawayDrawWorker(config: AppConfig) {
         }
       });
 
-      await bot.api.sendMessage(
+      const sent = await bot.api.sendMessage(
         Number(giveaway.chat.telegramChatId),
         buildDrawMessage(giveaway.title, giveaway.prize, winners.users),
         { parse_mode: "HTML" }
-      ).catch(() => undefined);
+      ).catch(() => null);
+      const settings = await getGiveawaySettings(giveaway.chatId);
+      if (sent && settings.pinResult) {
+        await bot.api.pinChatMessage(Number(giveaway.chat.telegramChatId), sent.message_id, { disable_notification: true }).catch(() => undefined);
+      }
     },
     { connection: redis }
   );
@@ -90,6 +94,10 @@ type GiveawayRequirements =
   | { type: "active"; mode: "ranking" | "speech_count"; days: number; minCount?: number }
   | { type: "invite"; mode: "ranking" | "count"; days: number; minCount?: number }
   | { type: "fun"; mode: "dice" | "dart" | "basketball" | "football" | "bowling" | "slot"; attempts: number };
+
+type GiveawaySettings = {
+  pinResult: boolean;
+};
 
 async function resolveGiveawayWinners(giveaway: WorkerGiveaway) {
   const requirements = parseGiveawayRequirements(giveaway.joinRequirements);
@@ -253,6 +261,16 @@ function formatDate(date: Date) {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function getGiveawaySettings(chatId: string): Promise<GiveawaySettings> {
+  const setting = await prisma.setting.findUnique({
+    where: { chatId_key: { chatId, key: "giveaway_settings" } }
+  });
+  const raw = isRecord(setting?.value) ? setting.value : {};
+  return {
+    pinResult: typeof raw.pinResult === "boolean" ? raw.pinResult : false
+  };
 }
 
 function pickWinners<T>(entries: T[], winnersCount: number) {
