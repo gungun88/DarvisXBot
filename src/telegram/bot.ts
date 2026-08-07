@@ -108,6 +108,27 @@ import {
   type JoinVerificationChallenge,
   type JoinVerifyMode
 } from "./join-verification.js";
+import {
+  clearChannelSyncDraft,
+  handleChannelSyncCallback,
+  handleChannelSyncChannelPost,
+  handleChannelSyncInputMessage,
+  openChannelSyncButtonMenu,
+  openChannelSyncMenu
+} from "./channel-sync.js";
+import {
+  clearChannelButtonsDraft,
+  handleChannelButtonsCallback,
+  handleChannelButtonsInputMessage,
+  openChannelButtonsMenu
+} from "./channel-buttons.js";
+import {
+  clearCommentSofaDraft,
+  handleCommentSofaCallback,
+  handleCommentSofaInputMessage,
+  handleCommentSofaMessage,
+  openCommentSofaMenu
+} from "./comment-sofa.js";
 
 type Locale = "zh-CN" | "en";
 
@@ -670,6 +691,7 @@ const importableSettingKeys = [
   "point_exchange",
   "member_stats",
   "group_members",
+  "comment_sofa",
   "new_member_limit",
   "open_close",
   "adult_check",
@@ -851,6 +873,18 @@ export function createBot(config: AppConfig) {
     await handleChatFeatureCallback(ctx, config);
   });
 
+  bot.callbackQuery(/^channel_sync:/, async (ctx) => {
+    await handleChannelSyncCallback(ctx, config.botUsername, await getLocale(ctx));
+  });
+
+  bot.callbackQuery(/^channel_buttons:/, async (ctx) => {
+    await handleChannelButtonsCallback(ctx, await getLocale(ctx));
+  });
+
+  bot.callbackQuery(/^comment_sofa:/, async (ctx) => {
+    await handleCommentSofaCallback(ctx, await getLocale(ctx));
+  });
+
   bot.callbackQuery(/^import_config:/, async (ctx) => {
     await handleImportConfigCallback(ctx);
   });
@@ -964,6 +998,9 @@ export function createBot(config: AppConfig) {
     if (await handleInviteLinkInputMessage(ctx, locale)) return;
     if (await handleGiveawayInputMessage(ctx, config, locale)) return;
     if (await handleImportConfigInputMessage(ctx, locale)) return;
+    if (await handleChannelButtonsInputMessage(ctx, locale)) return;
+    if (await handleCommentSofaInputMessage(ctx, locale)) return;
+    if (await handleChannelSyncInputMessage(ctx, config.botUsername, locale)) return;
     if (await handleTimezoneInputMessage(ctx, config, locale)) return;
     if (await handleScheduledInputMessage(ctx, locale)) return;
     if (await handlePublishInputMessage(ctx, locale)) return;
@@ -975,9 +1012,14 @@ export function createBot(config: AppConfig) {
     if (await handleOpenCloseGroupMessage(ctx)) return;
     if (await handleSpeechCheckMessage(ctx, locale)) return;
     if (await handleAdultCheckMessage(ctx, locale)) return;
+    if (await handleCommentSofaMessage(ctx)) return;
     if (await handleGiveawayKeywordEntry(ctx, config, locale)) return;
     if (await handleFunGiveawayDiceMessage(ctx, config, locale)) return;
     await handleIncomingMessage(ctx, config);
+  });
+
+  bot.on("channel_post", async (ctx) => {
+    await handleChannelSyncChannelPost(ctx);
   });
 
   bot.on("edited_message", async (ctx) => {
@@ -1100,6 +1142,9 @@ function clearUserInputState(userId: number) {
   inviteLinkInputDrafts.delete(userId);
   giveawayInputDrafts.delete(userId);
   importConfigDrafts.delete(userId);
+  clearChannelSyncDraft(userId);
+  clearChannelButtonsDraft(userId);
+  clearCommentSofaDraft(userId);
   clearAntiSpamDraft(userId);
   clearSpeechCheckDraft(userId);
   const publishDraft = publishDrafts.get(userId);
@@ -5183,6 +5228,22 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
     return;
   }
 
+  if (feature === "sync") {
+    await openChannelSyncMenu(ctx, config.botUsername, locale, chat);
+    return;
+  }
+
+  if (feature === "auto_button") {
+    await openChannelSyncButtonMenu(ctx, config.botUsername, locale, chat);
+    return;
+  }
+
+  if (feature === "edit_button") {
+    if (ctx.from) clearUserInputState(ctx.from.id);
+    await openChannelButtonsMenu(ctx, locale, chat);
+    return;
+  }
+
   if (feature === "scheduled") {
     await openScheduledMessagePanel(ctx, locale, chat);
     return;
@@ -5195,6 +5256,11 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
 
   if (feature === "member_stats") {
     await openMemberStatsPanel(ctx, locale, chat);
+    return;
+  }
+
+  if (feature === "comment_sofa") {
+    await openCommentSofaMenu(ctx, locale, chat);
     return;
   }
 
@@ -5233,7 +5299,7 @@ async function handleChatFeatureCallback(ctx: Context, config: AppConfig) {
     return;
   }
 
-  if (feature === "schedule" || feature === "sync") {
+  if (feature === "schedule") {
     await editOrReply(
       ctx,
       locale === "zh-CN"
@@ -5887,9 +5953,15 @@ function isConfigurationFeature(feature: string) {
     "adult_check",
     "speech_check",
     "anti_spam",
+    "night_mode",
+    "sync",
+    "auto_button",
+    "edit_button",
     "scheduled",
     "invite",
     "giveaway",
+    "points",
+    "import",
     "member_stats",
     "members"
   ].includes(feature);
