@@ -9,6 +9,8 @@ bot.log
 bot.err.log
 dev-server*.log
 *.tsbuildinfo
+.codex/
+backups/
 *.bak
 *.backup.ts
 .bot*.ts

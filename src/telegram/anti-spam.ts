@@ -3,6 +3,7 @@ import type { Context } from "grammy";
 import type { Chat, Message, MessageEntity, User } from "grammy/types";
 import { ChatStatus, Prisma, type Chat as PrismaChat } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
+import { recordModerationEvent } from "../moderation/moderation-event.service.js";
 import { canConfigureChat, isUserChatAdmin } from "./permissions.js";
 
 type Locale = "zh-CN" | "en";
@@ -326,7 +327,16 @@ async function handleAntiSpamViolation(
     });
   });
 
-  await applyAntiSpamPunishment(ctx, chat, user, reason, settings, locale);
+  const action = await applyAntiSpamPunishment(ctx, chat, user, reason, settings, locale);
+  await recordModerationEvent({
+    chatId: chat.id,
+    telegramUserId: user?.id,
+    eventType: "anti_spam",
+    action,
+    reason,
+    messageId: message.message_id,
+    metadata: { mode, configuredPunishment: settings.punishment, warningLimit: settings.warningLimit }
+  }).catch((error) => console.error("Failed to record anti-spam moderation event", error));
   return true;
 }
 
@@ -371,19 +381,19 @@ async function applyAntiSpamPunishment(
   const telegramChatId = Number(chat.telegramChatId);
   if (!user) {
     await sendAntiSpamNotice(ctx, telegramChatId, antiSpamNoticeText(undefined, reason, "delete_only", settings, locale), settings);
-    return;
+    return "delete_only" as const;
   }
 
   if (settings.punishment === "delete_only") {
     await sendAntiSpamNotice(ctx, telegramChatId, antiSpamNoticeText(user, reason, "delete_only", settings, locale), settings);
-    return;
+    return "delete_only" as const;
   }
 
   if (settings.punishment !== "warn") {
     await applyFinalPunishment(ctx, telegramChatId, user.id, settings.punishment, settings.muteMinutes);
     clearWarning(chat.id, user.id);
     await sendAntiSpamNotice(ctx, telegramChatId, antiSpamNoticeText(user, reason, settings.punishment, settings, locale), settings);
-    return;
+    return settings.punishment;
   }
 
   const count = incrementWarning(chat.id, user.id);
@@ -396,10 +406,11 @@ async function applyAntiSpamPunishment(
       antiSpamWarningLimitNoticeText(user, reason, settings, locale),
       settings
     );
-    return;
+    return settings.warningPunishment;
   }
 
   await sendAntiSpamNotice(ctx, telegramChatId, antiSpamWarningNoticeText(user, reason, count, settings, locale), settings);
+  return "warn" as const;
 }
 
 async function applyFinalPunishment(

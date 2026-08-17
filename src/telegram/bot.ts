@@ -57,6 +57,27 @@ import {
   cancelGiveawayDrawJob,
   enqueueGiveawayDraw
 } from "../giveaways/giveaway.service.js";
+import {
+  PointExchangeError,
+  createPointProduct as createPointProductRecord,
+  deletePointProduct,
+  listPendingPointRedemptionDeliveries,
+  listPointProducts,
+  markPointRedemptionDelivered,
+  markPointRedemptionDeliveryFailed,
+  redeemPointProduct,
+  replacePointProductCodes,
+  updatePointProduct
+} from "../points/point-exchange.service.js";
+import {
+  createMembershipPaymentOrder,
+  getBotFeatureLimitsForChat,
+  getBotSubscription,
+  getMembershipPlan,
+  hasActiveBotSubscriptionForChat,
+  paymentsConfigured
+} from "../subscriptions/subscription.service.js";
+import { recordModerationEvent } from "../moderation/moderation-event.service.js";
 import { enqueueSignInMessageDelete } from "./sign-in-delete.service.js";
 import {
   handleAdultCheckAction,
@@ -300,6 +321,7 @@ type PointProduct = {
   codes: string[];
   soldCount: number;
   dailyLimit: number;
+  reservedCount?: number;
 };
 
 type PointExchangeSettings = {
@@ -866,7 +888,7 @@ export function createBot(config: AppConfig) {
   });
 
   bot.callbackQuery(/^membership:/, async (ctx) => {
-    await handleMembershipCallback(ctx);
+    await handleMembershipCallback(ctx, config);
   });
 
   bot.callbackQuery(/^chat_feature:/, async (ctx) => {
@@ -1056,6 +1078,9 @@ export async function registerBotCommands(bot: Bot) {
 async function handleStartCommand(ctx: Context, config: AppConfig) {
   const locale = await getLocale(ctx);
   if (ctx.from) clearUserInputState(ctx.from.id);
+  if (ctx.from && ctx.chat?.type === "private") {
+    await deliverPendingPointRedemptions(ctx, locale, BigInt(ctx.from.id));
+  }
   const payload = extractStartPayload(ctx);
   if (payload === "_CommandHelp") {
     await ctx.reply(commandHelpText(locale), { parse_mode: "HTML" });
@@ -1685,12 +1710,19 @@ function publishMediaPromptText(locale: Locale) {
     : "Reply with a photo, video, GIF, or sticker to set media.";
 }
 
-function membershipPanelText(locale: Locale) {
+function membershipPanelText(
+  locale: Locale,
+  subscription: { status: string; expiresAt: Date } | null = null
+) {
+  const active = subscription?.status === "ACTIVE" && subscription.expiresAt > new Date();
+  const expiration = active && subscription
+    ? subscription.expiresAt.toISOString().replace("T", " ").slice(0, 16) + " UTC"
+    : (locale === "zh-CN" ? "未开通" : "Not active");
   return locale === "zh-CN"
     ? [
         "💎 <b>高级会员专属功能</b>",
         "",
-        "<b>到期时间：</b>未开通",
+        `<b>到期时间：</b>${expiration}`,
         "",
         "<b>开通会员，解锁全面进阶功能，助你高效管理频道与群组！</b>",
         "",
@@ -1710,14 +1742,14 @@ function membershipPanelText(locale: Locale) {
         "🛡 自动识别并屏蔽短时间内反复进退群用户",
         "💡 防止刷屏干扰，维护群组秩序",
         "",
-        "🔹 <b>5. 任务优先处理机制</b>",
-        "⚙️ 会员任务将被系统优先处理",
-        "⚡️ 响应更快，服务更稳定"
+        "🔹 <b>5. 订阅频道检测数量提升</b>",
+        "📍 免费：最多检测 1 个频道/群组",
+        "🚀 会员：最多检测 3 个频道/群组"
       ].join("\n")
     : [
         "💎 <b>Premium features</b>",
         "",
-        "<b>Expiration:</b> Not active",
+        `<b>Expiration:</b> ${expiration}`,
         "",
         "<b>Unlock advanced tools for efficient channel and group management.</b>",
         "",
@@ -1737,9 +1769,9 @@ function membershipPanelText(locale: Locale) {
         "🛡 Detect and block users who repeatedly join and leave quickly",
         "💡 Reduce spam noise and keep the group orderly",
         "",
-        "🔹 <b>5. Priority task processing</b>",
-        "⚙️ Premium tasks are processed first",
-        "⚡️ Faster responses and more stable service"
+        "🔹 <b>5. More required-channel checks</b>",
+        "📍 Free: up to 1 channel/group",
+        "🚀 Premium: up to 3 channels/groups"
       ].join("\n");
 }
 
@@ -1862,11 +1894,23 @@ function blocklistLeaveDurationKeyboard(chatId: string, locale: Locale) {
     .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `blocklist:menu:leave:${chatId}`);
 }
 
-function blocklistPremiumKeyboard(chatId: string, locale: Locale) {
-  return new InlineKeyboard()
-    .text(locale === "zh-CN" ? "💎订阅会员" : "💎 Memberships", "menu:memberships")
-    .row()
-    .text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `blocklist:back:${chatId}`);
+function blocklistPremiumKeyboard(
+  chatId: string,
+  feature: "flash" | "raid",
+  enabled: boolean,
+  premium: boolean,
+  locale: Locale
+) {
+  const keyboard = new InlineKeyboard();
+  if (premium) {
+    keyboard
+      .text(`${!enabled ? "✅" : ""}${locale === "zh-CN" ? "关闭" : "Off"}`, `blocklist:premium:${chatId}:${feature}:off`)
+      .text(`${enabled ? "✅" : ""}${locale === "zh-CN" ? "开启" : "On"}`, `blocklist:premium:${chatId}:${feature}:on`)
+      .row();
+  } else {
+    keyboard.text(locale === "zh-CN" ? "💎订阅会员" : "💎 Memberships", "menu:memberships").row();
+  }
+  return keyboard.text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `blocklist:back:${chatId}`);
 }
 
 function inviteLinkKeyboard(chatId: string, settings: InviteLinkSettings, locale: Locale) {
@@ -2699,7 +2743,10 @@ async function handleMenuCallback(ctx: Context, config: AppConfig) {
   }
 
   if (action === "memberships") {
-    await editOrReply(ctx, membershipPanelText(locale), membershipPanelKeyboard(locale));
+    const subscription = ctx.from
+      ? await upsertTelegramUser(ctx.from, config.defaultTimezone).then((user) => getBotSubscription(user.id))
+      : null;
+    await editOrReply(ctx, membershipPanelText(locale, subscription), membershipPanelKeyboard(locale));
     return;
   }
 
@@ -2816,7 +2863,7 @@ async function handlePublishCallback(ctx: Context, config: AppConfig) {
   await renderPublishHome(ctx, locale);
 }
 
-async function handleMembershipCallback(ctx: Context) {
+async function handleMembershipCallback(ctx: Context, config: AppConfig) {
   await ctx.answerCallbackQuery().catch(() => undefined);
   const locale = await getLocale(ctx);
   const plan = ctx.callbackQuery?.data?.split(":")[2] ?? "";
@@ -2827,11 +2874,32 @@ async function handleMembershipCallback(ctx: Context) {
     "12m": "100U 1年"
   };
   const label = labels[plan] ?? (locale === "zh-CN" ? "会员套餐" : "Membership plan");
+  if (ctx.from && getMembershipPlan(plan)) {
+    if (!paymentsConfigured(config)) {
+      await editOrReply(ctx, locale === "zh-CN"
+        ? `💎 <b>${escapeHtml(label)}</b>\n\n支付服务尚未配置，当前暂不能创建订单。请联系管理员。`
+        : `💎 <b>${escapeHtml(label)}</b>\n\nPayments are not configured yet. Please contact the administrator.`, membershipPanelKeyboard(locale));
+      return;
+    }
+    try {
+      const user = await upsertTelegramUser(ctx.from, config.defaultTimezone);
+      const order = await createMembershipPaymentOrder(user.id, plan, config);
+      const keyboard = new InlineKeyboard();
+      if (order.payUrl) keyboard.url(locale === "zh-CN" ? "打开支付页面" : "Open payment", order.payUrl).row();
+      keyboard.text(locale === "zh-CN" ? "🔙 返回套餐" : "🔙 Plans", "menu:memberships");
+      await editOrReply(ctx, locale === "zh-CN"
+        ? [`💎 <b>${escapeHtml(label)}</b>`, "", `订单号：<code>${order.id}</code>`, "请在支付页面完成付款。付款确认后会员会自动开通。"].join("\n")
+        : [`💎 <b>${escapeHtml(label)}</b>`, "", `Order: <code>${order.id}</code>`, "Complete payment on the payment page. Membership activates after confirmation."].join("\n"), keyboard);
+    } catch (error) {
+      await editOrReply(ctx, error instanceof Error ? error.message : (locale === "zh-CN" ? "创建支付订单失败。" : "Could not create payment order."), membershipPanelKeyboard(locale));
+    }
+    return;
+  }
   await editOrReply(
     ctx,
     locale === "zh-CN"
-      ? `💎 <b>${escapeHtml(label)}</b>\n\n该套餐按钮已接入菜单，支付和自动开通流程后续可继续配置。`
-      : `💎 <b>${escapeHtml(label)}</b>\n\nThis plan button is wired. Payment and auto-activation can be configured next.`,
+      ? "会员套餐不存在，请返回后重新选择。"
+      : "That membership plan is unavailable. Go back and select another plan.",
     membershipPanelKeyboard(locale)
   );
 }
@@ -2881,6 +2949,22 @@ async function handleScheduledCallback(ctx: Context) {
   if (action === "add") {
     const chat = await prisma.chat.findUnique({ where: { id } });
     if (!chat) return;
+    if (ctx.from) {
+      const limits = await getBotFeatureLimitsForChat(chat.id);
+      const existing = await prisma.scheduledMessage.count({
+        where: { chatId: chat.id, status: { not: ScheduledMessageStatus.CANCELLED } }
+      });
+      if (existing >= limits.scheduledMessagesPerChat) {
+        await editOrReply(
+          ctx,
+          locale === "zh-CN"
+            ? `当前套餐每个群组最多 ${limits.scheduledMessagesPerChat} 条定时消息。请删除或取消不再使用的任务后重试。`
+            : `Your plan allows up to ${limits.scheduledMessagesPerChat} scheduled messages per chat. Remove or cancel an unused task and try again.`,
+          new InlineKeyboard().text(locale === "zh-CN" ? "🔙 返回列表" : "🔙 Back", `scheduled:list:${chat.id}`)
+        );
+        return;
+      }
+    }
     const repeatRule = defaultScheduledRepeatRule();
     const sendAt = nextScheduledRun(repeatRule, new Date()) ?? new Date(Date.now() + repeatRule.intervalMinutes * 60_000);
     const scheduled = await prisma.scheduledMessage.create({
@@ -4480,6 +4564,18 @@ async function finalizeAutoReplyRule(
   if (!ctx.from || !draft.keyword || !draft.matchType || (!draft.response && !draft.mediaFileId)) return;
 
   const settings = await getAutoReplySettings(draft.chatId);
+  const limits = await getBotFeatureLimitsForChat(draft.chatId);
+  if (settings.rules.length >= limits.autoReplyRulesPerChat) {
+    autoReplyInputDrafts.delete(ctx.from.id);
+    await ctx.reply(
+      locale === "zh-CN"
+        ? `当前套餐每个群组最多 ${limits.autoReplyRulesPerChat} 条自动回复规则。`
+        : `Your plan allows up to ${limits.autoReplyRulesPerChat} auto-reply rules per chat.`,
+      { parse_mode: "HTML", reply_markup: autoReplyDoneKeyboard(draft.chatId, locale) }
+    );
+    return;
+  }
+
   const rule: AutoReplyRule = {
     id: createAutoReplyRuleId(),
     keyword: draft.keyword,
@@ -6356,6 +6452,25 @@ async function handleBlocklistCallback(ctx: Context) {
     return;
   }
 
+  if (action === "premium") {
+    const chatId = parts[2];
+    const feature = parts[3];
+    const value = parts[4];
+    if (!chatId || (feature !== "flash" && feature !== "raid") || (value !== "on" && value !== "off")) return;
+    const chat = await ensureControlPermissionForChatId(ctx, chatId, locale);
+    if (!chat) return;
+    const settings = await getBlocklistSettings(chat.id);
+    if (!(await hasActiveBotSubscriptionForChat(chat.id))) {
+      await renderBlocklistPanel(ctx, chat.id, feature, settings, locale);
+      return;
+    }
+    if (feature === "flash") settings.blockFlashJoinLeave = value === "on";
+    else settings.blockFollowerRaid = value === "on";
+    await saveBlocklistSettings(chat.id, settings);
+    await renderBlocklistPanel(ctx, chat.id, feature, settings, locale);
+    return;
+  }
+
   if (action === "leave_duration") {
     const chatId = parts[2];
     if (!chatId || !ctx.from) return;
@@ -6421,11 +6536,21 @@ async function renderBlocklistPanel(
     return;
   }
   if (panel === "flash") {
-    await editOrReply(ctx, blocklistFlashText(locale), blocklistPremiumKeyboard(chatId, locale));
+    const premium = await hasActiveBotSubscriptionForChat(chatId);
+    await editOrReply(
+      ctx,
+      blocklistFlashText(settings, premium, locale),
+      blocklistPremiumKeyboard(chatId, "flash", settings.blockFlashJoinLeave, premium, locale)
+    );
     return;
   }
   if (panel === "raid") {
-    await editOrReply(ctx, blocklistRaidText(locale), blocklistPremiumKeyboard(chatId, locale));
+    const premium = await hasActiveBotSubscriptionForChat(chatId);
+    await editOrReply(
+      ctx,
+      blocklistRaidText(settings, premium, locale),
+      blocklistPremiumKeyboard(chatId, "raid", settings.blockFollowerRaid, premium, locale)
+    );
   }
 }
 
@@ -6965,11 +7090,8 @@ async function handlePointsCallback(ctx: Context) {
   }
 
   if (action === "product_add") {
-    const settings = await getPointExchangeSettings(chatId);
-    const product = createPointProduct();
-    settings.products.push(product);
-    await savePointExchangeSettings(chatId, settings);
-    await openProductPanel(ctx, locale, chat, product.id);
+    const productId = await createPointProductRecord(chatId);
+    await openProductPanel(ctx, locale, chat, productId);
     return;
   }
 
@@ -6990,23 +7112,13 @@ async function handlePointsCallback(ctx: Context) {
   }
 
   if (action === "product_delete_confirm" && value) {
-    const settings = await getPointExchangeSettings(chatId);
-    const nextProducts = settings.products.filter((item) => item.id !== value);
-    if (nextProducts.length !== settings.products.length) {
-      settings.products = nextProducts;
-      await savePointExchangeSettings(chatId, settings);
-    }
+    await deletePointProduct(chatId, value);
     await openProductsPanel(ctx, locale, chat);
     return;
   }
 
   if (action === "product_listed" && value) {
-    const settings = await getPointExchangeSettings(chatId);
-    const product = settings.products.find((item) => item.id === value);
-    if (product) {
-      product.listed = rawNext === "on";
-      await savePointExchangeSettings(chatId, settings);
-    }
+    await updatePointProduct(chatId, value, { listed: rawNext === "on" });
     await openProductPanel(ctx, locale, chat, value);
     return;
   }
@@ -7155,26 +7267,25 @@ async function handlePointsInputMessage(ctx: Context, config: AppConfig, locale:
   }
 
   if (draft.kind === "product_name") {
-    product.name = text.slice(0, 64);
+    await updatePointProduct(draft.chatId, draft.productId, { name: text.slice(0, 64) });
   } else if (draft.kind === "product_cost") {
     const cost = parseNonNegativeInteger(text);
     if (cost === null || cost <= 0) {
       await ctx.reply(productInputPromptText(draft.kind, locale), { parse_mode: "HTML", reply_markup: new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `points:product:${draft.chatId}:${draft.productId}`) });
       return true;
     }
-    product.cost = clampNumber(cost, 1, 1000000);
+    await updatePointProduct(draft.chatId, draft.productId, { cost: clampNumber(cost, 1, 1000000) });
   } else if (draft.kind === "product_daily_limit") {
     const dailyLimit = parseNonNegativeInteger(text);
     if (dailyLimit === null) {
       await ctx.reply(productInputPromptText(draft.kind, locale), { parse_mode: "HTML", reply_markup: new InlineKeyboard().text(locale === "zh-CN" ? "🔙返回" : "🔙 Back", `points:product:${draft.chatId}:${draft.productId}`) });
       return true;
     }
-    product.dailyLimit = clampNumber(dailyLimit, 0, 1000000);
+    await updatePointProduct(draft.chatId, draft.productId, { dailyLimit: clampNumber(dailyLimit, 0, 1000000) });
   } else if (draft.kind === "product_codes") {
-    product.codes = parsePointProductCodes(text);
+    await replacePointProductCodes(draft.chatId, draft.productId, parsePointProductCodes(text));
   }
 
-  await savePointExchangeSettings(draft.chatId, settings);
   pointsInputDrafts.delete(ctx.from.id);
   await ctx.reply(locale === "zh-CN" ? "商品设置已更新。" : "Product updated.", {
     parse_mode: "HTML",
@@ -7342,12 +7453,28 @@ async function handleBlocklistNewMember(ctx: Context, chat: PrismaChat, member: 
 
   if (settings.blockBots && member.is_bot) {
     await banUser(ctx, Number(chat.telegramChatId), member.id);
+    await recordModerationEvent({
+      chatId: chat.id,
+      telegramUserId: member.id,
+      eventType: "blocklist",
+      action: "ban",
+      reason: "机器人账号加入",
+      metadata: { subtype: "blocked_bot" }
+    }).catch((error) => console.error("Failed to record blocked-bot event", error));
     await applyBlocklistBotAdderPunishment(ctx, chat, member, settings);
     return true;
   }
 
-  if (settings.blockFollowerRaid && isRaidJoin(chat.id, now, settings)) {
+  if (settings.blockFollowerRaid && await hasActiveBotSubscriptionForChat(chat.id) && isRaidJoin(chat.id, now, settings)) {
     await banUser(ctx, Number(chat.telegramChatId), member.id);
+    await recordModerationEvent({
+      chatId: chat.id,
+      telegramUserId: member.id,
+      eventType: "blocklist",
+      action: "ban",
+      reason: "检测到集中入群攻击",
+      metadata: { subtype: "join_raid", windowSeconds: settings.raidWindowSeconds, threshold: settings.raidJoinThreshold }
+    }).catch((error) => console.error("Failed to record join-raid event", error));
     return true;
   }
 
@@ -7360,11 +7487,27 @@ async function handleBlocklistJoinRequest(ctx: Context, chat: PrismaChat, reques
 
   if (settings.blockBotPunishment !== "off" && request.from.is_bot) {
     await declineJoinRequest(ctx, request);
+    await recordModerationEvent({
+      chatId: chat.id,
+      telegramUserId: request.from.id,
+      eventType: "blocklist",
+      action: "decline_join_request",
+      reason: "机器人账号申请入群",
+      metadata: { subtype: "blocked_bot_request" }
+    }).catch((error) => console.error("Failed to record blocked-bot request", error));
     return true;
   }
 
-  if (settings.blockFollowerRaid && isRaidJoin(chat.id, now, settings)) {
+  if (settings.blockFollowerRaid && await hasActiveBotSubscriptionForChat(chat.id) && isRaidJoin(chat.id, now, settings)) {
     await declineJoinRequest(ctx, request);
+    await recordModerationEvent({
+      chatId: chat.id,
+      telegramUserId: request.from.id,
+      eventType: "blocklist",
+      action: "decline_join_request",
+      reason: "集中入群攻击期间拒绝申请",
+      metadata: { subtype: "join_raid_request", windowSeconds: settings.raidWindowSeconds, threshold: settings.raidJoinThreshold }
+    }).catch((error) => console.error("Failed to record join-raid request", error));
     return true;
   }
 
@@ -7382,15 +7525,32 @@ async function handleBlocklistLeftChatMember(ctx: Context, member: User) {
 
   if (settings.banAfterLeave) {
     await banUser(ctx, ctx.chat.id, member.id, settings.banAfterLeaveSeconds);
+    await recordModerationEvent({
+      chatId: chat.id,
+      telegramUserId: member.id,
+      eventType: "blocklist",
+      action: "ban",
+      reason: "退群后自动封禁",
+      metadata: { subtype: "leave_ban", durationSeconds: settings.banAfterLeaveSeconds }
+    }).catch((error) => console.error("Failed to record leave-ban event", error));
     return;
   }
 
   if (
     settings.blockFlashJoinLeave &&
+    await hasActiveBotSubscriptionForChat(chat.id) &&
     joinedAt &&
     Date.now() - joinedAt <= settings.flashWindowSeconds * 1000
   ) {
     await banUser(ctx, ctx.chat.id, member.id);
+    await recordModerationEvent({
+      chatId: chat.id,
+      telegramUserId: member.id,
+      eventType: "blocklist",
+      action: "ban",
+      reason: "短时间内进群后退出",
+      metadata: { subtype: "flash_join_leave", windowSeconds: settings.flashWindowSeconds }
+    }).catch((error) => console.error("Failed to record flash-join event", error));
   }
 }
 
@@ -7410,20 +7570,21 @@ async function applyBlocklistBotAdderPunishment(
       `${displayName(actor)} 添加了机器人 ${displayName(botUser)}，已警告。`,
       { parse_mode: "HTML" }
     ).catch(() => undefined);
-    return;
-  }
-
-  if (settings.blockBotPunishment === "mute") {
+  } else if (settings.blockBotPunishment === "mute") {
     await muteUser(ctx, telegramChatId, actor.id, 60);
-    return;
-  }
-
-  if (settings.blockBotPunishment === "kick") {
+  } else if (settings.blockBotPunishment === "kick") {
     await kickUser(ctx, telegramChatId, actor.id);
-    return;
+  } else {
+    await banUser(ctx, telegramChatId, actor.id);
   }
-
-  await banUser(ctx, telegramChatId, actor.id);
+  await recordModerationEvent({
+    chatId: chat.id,
+    telegramUserId: actor.id,
+    eventType: "blocklist",
+    action: settings.blockBotPunishment,
+    reason: "添加机器人账号",
+    metadata: { subtype: "bot_adder", botUserId: botUser.id }
+  }).catch((error) => console.error("Failed to record bot-adder event", error));
 }
 
 async function handleVerificationCallback(ctx: Context) {
@@ -7453,6 +7614,18 @@ async function handleVerificationCallback(ctx: Context) {
 
   const expectedAnswer = pending?.answer ?? stored?.answer ?? "button";
   if (expectedAnswer !== answer) {
+    const managedChat = stored?.chatId ? null : await getActiveChatByTelegramId(chatId);
+    const managedChatId = stored?.chatId ?? managedChat?.id;
+    if (managedChatId) {
+      await recordModerationEvent({
+        chatId: managedChatId,
+        telegramUserId: userId,
+        eventType: "join_verification",
+        action: "retry",
+        reason: "进群验证答案错误",
+        metadata: { subtype: "wrong_answer" }
+      }).catch((error) => console.error("Failed to record verification failure", error));
+    }
     await ctx.answerCallbackQuery({ text: "验证答案不正确，请重试。", show_alert: true }).catch(() => undefined);
     return;
   }
@@ -7465,6 +7638,18 @@ async function handleVerificationCallback(ctx: Context) {
     }
 
     if (!(await userJoinedJoinVerifyChannel(ctx.api, requiredChannel, userId))) {
+      const managedChat = stored?.chatId ? null : await getActiveChatByTelegramId(chatId);
+      const managedChatId = stored?.chatId ?? managedChat?.id;
+      if (managedChatId) {
+        await recordModerationEvent({
+          chatId: managedChatId,
+          telegramUserId: userId,
+          eventType: "join_verification",
+          action: "retry",
+          reason: "未加入进群验证指定频道",
+          metadata: { subtype: "required_channel", requiredChannel }
+        }).catch((error) => console.error("Failed to record channel verification failure", error));
+      }
       await ctx.answerCallbackQuery({ text: "请先加入指定频道后再点击验证。", show_alert: true }).catch(() => undefined);
       return;
     }
@@ -7704,6 +7889,15 @@ async function expireStoredJoinVerification(api: TelegramApi, row: StoredJoinVer
   if (pending) clearTimeout(pending.timeout);
   pendingVerifications.delete(key);
   await punishUnverifiedMember(api, telegramChatId, telegramUserId, row.punishment);
+  await recordModerationEvent({
+    chatId: row.chatId,
+    telegramUserId,
+    eventType: "join_verification",
+    action: row.punishment,
+    reason: "进群验证超时",
+    messageId: row.messageId,
+    metadata: { subtype: "timeout", mode: row.mode }
+  }).catch((error) => console.error("Failed to record verification timeout", error));
   await api.deleteMessage(telegramChatId, row.messageId).catch(() => undefined);
 }
 
@@ -10506,60 +10700,20 @@ async function savePointsSettings(chatId: string, settings: PointsSettings) {
 
 async function getPointExchangeSettings(chatId: string): Promise<PointExchangeSettings> {
   const raw = await getSettingRecord(chatId, "point_exchange");
-  const products = Array.isArray(raw.products)
-    ? raw.products.map(parsePointProduct).filter((item): item is PointProduct => Boolean(item)).slice(0, 100)
-    : [];
   return {
     enabled: typeof raw.enabled === "boolean" ? raw.enabled : defaultPointExchangeSettings.enabled,
     keyword: typeof raw.keyword === "string" && raw.keyword.trim()
       ? raw.keyword.trim().slice(0, 32)
       : defaultPointExchangeSettings.keyword,
-    products
+    products: await listPointProducts(chatId)
   };
 }
 
 async function savePointExchangeSettings(chatId: string, settings: PointExchangeSettings) {
   await saveSetting(chatId, "point_exchange", settingsToJson({
     enabled: settings.enabled,
-    keyword: settings.keyword,
-    products: settings.products.map((product) => ({
-      id: product.id,
-      name: product.name,
-      cost: product.cost,
-      listed: product.listed,
-      codes: product.codes,
-      soldCount: product.soldCount,
-      dailyLimit: product.dailyLimit
-    }))
+    keyword: settings.keyword
   }));
-}
-
-function parsePointProduct(value: unknown): PointProduct | null {
-  if (!isRecord(value)) return null;
-  const id = typeof value.id === "string" && value.id.trim() ? value.id.trim().slice(0, 16) : "";
-  if (!id) return null;
-  const rawCodes = Array.isArray(value.codes) ? value.codes : [];
-  return {
-    id,
-    name: typeof value.name === "string" ? value.name.slice(0, 64) : "",
-    cost: clampNumber(Number(value.cost ?? 1), 1, 1000000),
-    listed: typeof value.listed === "boolean" ? value.listed : false,
-    codes: rawCodes.filter((item): item is string => typeof item === "string" && Boolean(item.trim())).map((item) => item.trim()).slice(0, 10000),
-    soldCount: clampNumber(Number(value.soldCount ?? 0), 0, 100000000),
-    dailyLimit: clampNumber(Number(value.dailyLimit ?? 0), 0, 1000000)
-  };
-}
-
-function createPointProduct(): PointProduct {
-  return {
-    id: String(Math.floor(1000 + Math.random() * 9000)),
-    name: "",
-    cost: 1,
-    listed: false,
-    codes: [],
-    soldCount: 0,
-    dailyLimit: 0
-  };
 }
 
 function isPointsRuleField(value: unknown): value is PointsRuleField {
@@ -10963,6 +11117,16 @@ async function maybeHandleBannedWords(ctx: Context, chat: PrismaChat, message: M
   });
 
   await applyBannedWordsPunishment(ctx, chat, ctx.from, matched, settings);
+  await recordModerationEvent({
+    chatId: chat.id,
+    telegramUserId: ctx.from.id,
+    eventType: "banned_word",
+    action: settings.punishment,
+    reason: "触发违禁词规则",
+    matchedPattern: matched,
+    messageId: message.message_id,
+    metadata: { warningLimit: settings.warningLimit, muteMinutes: settings.muteMinutes }
+  }).catch((error) => console.error("Failed to record moderation event", error));
   return true;
 }
 
@@ -11223,64 +11387,39 @@ async function handlePointExchangeRedeem(ctx: Context, locale: Locale, chat: Pri
     return;
   }
 
-  const product = settings.products.find((item) => item.id === productId);
-  if (!product || !product.listed) {
-    await ctx.answerCallbackQuery({ text: locale === "zh-CN" ? "商品不可兑换。" : "Product unavailable.", show_alert: true }).catch(() => undefined);
-    return;
-  }
-  if (!product.codes.length) {
-    await ctx.answerCallbackQuery({ text: locale === "zh-CN" ? "库存不足。" : "Out of stock.", show_alert: true }).catch(() => undefined);
-    return;
-  }
-
   const user = await upsertTelegramUser(ctx.from, chat.timezone);
-  const balance = await prisma.chatPointBalance.findUnique({ where: { chatId_userId: { chatId: chat.id, userId: user.id } } });
-  if ((balance?.balance ?? 0) < product.cost) {
-    await ctx.answerCallbackQuery({ text: locale === "zh-CN" ? "积分不足。" : "Not enough points.", show_alert: true }).catch(() => undefined);
+  const dayKey = formatDate(new Date());
+  let redemption: Awaited<ReturnType<typeof redeemPointProduct>>;
+  try {
+    redemption = await redeemPointProduct({ chatId: chat.id, externalId: productId, userId: user.id, dayKey });
+  } catch (error) {
+    const labels = {
+      PRODUCT_UNAVAILABLE: locale === "zh-CN" ? "商品不可兑换。" : "Product unavailable.",
+      OUT_OF_STOCK: locale === "zh-CN" ? "库存不足。" : "Out of stock.",
+      INSUFFICIENT_POINTS: locale === "zh-CN" ? "积分不足。" : "Not enough points.",
+      DAILY_LIMIT: locale === "zh-CN" ? "今日兑换次数已达上限。" : "Daily exchange limit reached."
+    };
+    const message = error instanceof PointExchangeError
+      ? labels[error.code]
+      : (locale === "zh-CN" ? "兑换失败，请稍后重试。" : "Redemption failed. Try again later.");
+    await ctx.answerCallbackQuery({ text: message, show_alert: true }).catch(() => undefined);
     return;
   }
-
-  const dayKey = formatDate(new Date());
-  if (product.dailyLimit > 0) {
-    const todayCount = await prisma.chatPointTransaction.count({
-      where: {
-        chatId: chat.id,
-        userId: user.id,
-        type: PointTransactionType.EXCHANGE,
-        dayKey,
-        referenceKey: { startsWith: `exchange:${product.id}:` }
-      }
-    });
-    if (todayCount >= product.dailyLimit) {
-      await ctx.answerCallbackQuery({ text: locale === "zh-CN" ? "今日兑换次数已达上限。" : "Daily exchange limit reached.", show_alert: true }).catch(() => undefined);
-      return;
-    }
-  }
-
-  const code = product.codes.shift();
-  if (!code) return;
-  product.soldCount += 1;
-  await savePointExchangeSettings(chat.id, settings);
-  const currentBalance = await addPoints(
-    chat.id,
-    user.id,
-    -product.cost,
-    PointTransactionType.EXCHANGE,
-    `exchange:${product.id}:${user.id}:${Date.now()}`,
-    null,
-    dayKey
-  );
 
   await ctx.answerCallbackQuery({ text: locale === "zh-CN" ? "兑换成功。" : "Redeemed." }).catch(() => undefined);
-  await ctx.api.sendMessage(
-    ctx.from.id,
-    locale === "zh-CN"
-      ? [`兑换成功：${escapeHtml(product.name || "未命名商品")}`, `卡密：<code>${escapeHtml(code)}</code>`, `当前积分：${currentBalance}`].join("\n")
-      : [`Redeemed: ${escapeHtml(product.name || "Unnamed product")}`, `Code: <code>${escapeHtml(code)}</code>`, `Current points: ${currentBalance}`].join("\n"),
-    { parse_mode: "HTML" }
-  ).catch(async () => {
+  try {
+    await ctx.api.sendMessage(
+      ctx.from.id,
+      locale === "zh-CN"
+        ? [`兑换成功：${escapeHtml(redemption.productName || "未命名商品")}`, `卡密：<code>${escapeHtml(redemption.code)}</code>`, `当前积分：${redemption.currentBalance}`].join("\n")
+        : [`Redeemed: ${escapeHtml(redemption.productName || "Unnamed product")}`, `Code: <code>${escapeHtml(redemption.code)}</code>`, `Current points: ${redemption.currentBalance}`].join("\n"),
+      { parse_mode: "HTML" }
+    );
+    await markPointRedemptionDelivered(redemption.redemptionId);
+  } catch (error) {
+    await markPointRedemptionDeliveryFailed(redemption.redemptionId, error);
     await ctx.reply(locale === "zh-CN" ? "兑换成功，请先私聊机器人 /start 后再领取卡密。" : "Redeemed. Start a private chat with the bot to receive the code.").catch(() => undefined);
-  });
+  }
 }
 
 async function findPointTargetUser(chatId: string, input: string) {
@@ -12102,39 +12241,43 @@ function blocklistLeaveDurationPromptText(settings: BlocklistSettings, locale: L
       ].join("\n");
 }
 
-function blocklistFlashText(locale: Locale) {
+function blocklistFlashText(settings: BlocklistSettings, premium: boolean, locale: Locale) {
+  const status = premium
+    ? (locale === "zh-CN" ? onOffZh(settings.blockFlashJoinLeave) : onOff(settings.blockFlashJoinLeave))
+    : (locale === "zh-CN" ? "需开通会员" : "Membership required");
   return locale === "zh-CN"
     ? [
         "🏃‍♂️ <b>屏蔽闪进闪退</b>",
         "",
-        "如果用户加入群组(频道)几秒钟内离开，服务消息和欢迎消息将被删除。",
-        "您还可以对此类用户设置惩罚",
-        "<strong>该功能开通会员可用</strong>"
+        `用户加入后在 ${settings.flashWindowSeconds} 秒内离开时将被封禁。`,
+        `状态：<strong>${status}</strong>`
       ].join("\n")
     : [
         "🏃‍♂️ <b>Block flash join/leave</b>",
         "",
-        "If users leave a group or channel seconds after joining, service and welcome messages are deleted.",
-        "You can also set punishment for these users.",
-        "<strong>This feature requires a membership.</strong>"
+        `Users who leave within ${settings.flashWindowSeconds} seconds of joining are banned.`,
+        `Status: <strong>${status}</strong>`
       ].join("\n");
 }
 
-function blocklistRaidText(locale: Locale) {
+function blocklistRaidText(settings: BlocklistSettings, premium: boolean, locale: Locale) {
+  const status = premium
+    ? (locale === "zh-CN" ? onOffZh(settings.blockFollowerRaid) : onOff(settings.blockFollowerRaid))
+    : (locale === "zh-CN" ? "需开通会员" : "Membership required");
   return locale === "zh-CN"
     ? [
         "👨‍👩‍👧‍👦 <b>屏蔽刷粉攻击</b>",
         "",
-        "如果在 2 秒内有 4 个用户加入该群组(频道)，则给予惩罚。",
+        `如果在 ${settings.raidWindowSeconds} 秒内有 ${settings.raidJoinThreshold} 个用户加入，新加入用户将被封禁。`,
         "",
-        "状态: <strong>该功能开通会员可用</strong>"
+        `状态：<strong>${status}</strong>`
       ].join("\n")
     : [
         "👨‍👩‍👧‍👦 <b>Block join raids</b>",
         "",
-        "If 4 users join the group or channel within 2 seconds, a punishment is applied.",
+        `When ${settings.raidJoinThreshold} users join within ${settings.raidWindowSeconds} seconds, new joiners are banned.`,
         "",
-        "Status: <strong>This feature requires a membership.</strong>"
+        `Status: <strong>${status}</strong>`
       ].join("\n");
 }
 
@@ -13028,6 +13171,28 @@ async function banUser(ctx: Context, chatId: number, userId: number, seconds = 0
   await ctx.api.banChatMember(chatId, userId, options).catch((error) => {
     console.error("Failed to ban member", { chatId, userId, seconds, error });
   });
+}
+
+async function deliverPendingPointRedemptions(ctx: Context, locale: Locale, telegramUserId: bigint) {
+  const pending = await listPendingPointRedemptionDeliveries(telegramUserId).catch((error) => {
+    console.error("Failed to load pending point redemptions", error);
+    return [];
+  });
+  for (const redemption of pending) {
+    try {
+      await ctx.api.sendMessage(
+        Number(telegramUserId),
+        locale === "zh-CN"
+          ? [`兑换成功：${escapeHtml(redemption.product.name || "未命名商品")}`, `卡密：<code>${escapeHtml(redemption.code.value)}</code>`].join("\n")
+          : [`Redeemed: ${escapeHtml(redemption.product.name || "Unnamed product")}`, `Code: <code>${escapeHtml(redemption.code.value)}</code>`].join("\n"),
+        { parse_mode: "HTML" }
+      );
+      await markPointRedemptionDelivered(redemption.id);
+    } catch (error) {
+      await markPointRedemptionDeliveryFailed(redemption.id, error).catch(() => undefined);
+      break;
+    }
+  }
 }
 
 async function declineJoinRequest(ctx: Context, request: ChatJoinRequest) {

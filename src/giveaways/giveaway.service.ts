@@ -1,4 +1,5 @@
 import { giveawayDrawQueue } from "../lib/queues.js";
+import { DEFAULT_JOB_ATTEMPTS } from "../lib/job-reliability.js";
 
 export function giveawayDrawJobId(id: string) {
   return `giveaway-draw-${id}`;
@@ -14,6 +15,8 @@ export async function enqueueGiveawayDraw(id: string, drawAt: Date) {
     {
       jobId,
       delay: Math.max(0, drawAt.getTime() - Date.now()),
+      attempts: DEFAULT_JOB_ATTEMPTS,
+      backoff: { type: "exponential", delay: 3000 },
       removeOnComplete: true,
       removeOnFail: 100
     }

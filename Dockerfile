@@ -1,7 +1,7 @@
 FROM node:22-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm install
+RUN npm ci
 
 FROM node:22-alpine AS build
 WORKDIR /app
@@ -13,9 +13,10 @@ RUN npm run build
 FROM node:22-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
+RUN apk add --no-cache postgresql16-client
 COPY package.json ./package.json
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/prisma ./prisma
 EXPOSE 3000
-CMD ["node", "dist/src/index.js"]
+CMD ["sh", "-c", "npm run prisma:deploy && node dist/src/index.js"]

@@ -5,16 +5,27 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
-    "test": "tsx --test src/telegram/*.test.ts",
+    "dev:admin-api": "tsx watch src/admin/standalone.ts",
+    "dev:admin": "vite --config admin-ui/vite.config.ts",
+    "build": "npm run build:server && npm run build:admin",
+    "build:server": "tsc -p tsconfig.json",
+    "build:admin": "vite build --config admin-ui/vite.config.ts",
+    "start": "prisma migrate deploy && node dist/src/index.js",
+    "test": "tsx --test src/telegram/*.test.ts src/admin/*.test.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy",
     "prisma:studio": "prisma studio",
-    "lint": "tsc -p tsconfig.json --noEmit"
+    "db:backup": "tsx src/operations/backup.cli.ts",
+    "db:backup:prod": "node dist/src/operations/backup.cli.js",
+    "db:restore:verify": "tsx src/operations/restore-verify.cli.ts",
+    "db:restore:verify:prod": "node dist/src/operations/restore-verify.cli.js",
+    "lint": "tsc -p tsconfig.json --noEmit && tsc -p admin-ui/tsconfig.json --noEmit"
   },
   "dependencies": {
     "@fastify/helmet": "^13.0.1",
+    "@fastify/jwt": "^10.2.2",
+    "@fastify/static": "^10.1.3",
     "@grammyjs/runner": "^2.0.3",
     "@prisma/client": "^6.13.0",
     "bullmq": "^5.56.7",
@@ -23,12 +34,20 @@
     "geo-tz": "^8.1.8",
     "grammy": "^1.37.0",
     "ioredis": "^5.6.1",
+    "lucide-react": "^0.468.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "react-router-dom": "^7.18.2",
     "zod": "^4.0.14"
   },
   "devDependencies": {
     "@types/node": "^24.1.0",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^4.6.0",
     "prisma": "^6.13.0",
     "tsx": "^4.20.3",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vite": "^7.1.2"
   }
 }

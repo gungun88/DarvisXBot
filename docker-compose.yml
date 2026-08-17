@@ -43,8 +43,11 @@ services:
     environment:
       DATABASE_URL: postgresql://darvisxbot:darvisxbot@postgres:5432/darvisxbot?schema=public
       REDIS_URL: redis://redis:6379
+      BACKUP_DIR: /app/backups
     ports:
       - "3000:3000"
+    volumes:
+      - ./backups:/app/backups
 
 volumes:
   postgres-data:

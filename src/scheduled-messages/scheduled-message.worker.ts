@@ -2,6 +2,7 @@ import { Bot, InlineKeyboard } from "grammy";
 import { Worker } from "bullmq";
 import { ScheduledMessageStatus } from "@prisma/client";
 import type { AppConfig } from "../lib/config.js";
+import { isFinalJobAttempt, jobErrorMessage } from "../lib/job-reliability.js";
 import { prisma } from "../lib/prisma.js";
 import { redis } from "../lib/redis.js";
 import {
@@ -22,55 +23,78 @@ export function startScheduledMessageWorker(config: AppConfig) {
       const scheduledMessageId = String(job.data?.scheduledMessageId ?? "");
       if (!scheduledMessageId) return;
 
-      const scheduled = await prisma.scheduledMessage.findUnique({
-        where: { id: scheduledMessageId },
-        include: { chat: true }
-      });
+      try {
+        const scheduled = await prisma.scheduledMessage.findUnique({
+          where: { id: scheduledMessageId },
+          include: { chat: true }
+        });
 
-      if (!scheduled || scheduled.status !== ScheduledMessageStatus.PENDING) return;
-      if (scheduled.sendAt.getTime() > Date.now() + 1000) {
-        await enqueueScheduledMessage(scheduled.id, scheduled.sendAt);
-        return;
-      }
+        if (!scheduled || scheduled.status !== ScheduledMessageStatus.PENDING) return;
+        if (scheduled.sendAt.getTime() > Date.now() + 1000) {
+          await enqueueScheduledMessage(scheduled.id, scheduled.sendAt);
+          return;
+        }
 
-      const content = parseScheduledContent(scheduled.content);
-      const repeatRule = parseScheduledRepeatRule(scheduled.repeatRule);
-
-      if (!hasScheduledMessageContent(content)) {
         await prisma.scheduledMessage.update({
           where: { id: scheduled.id },
-          data: { status: ScheduledMessageStatus.DRAFT }
+          data: { attemptCount: { increment: 1 }, lastAttemptAt: new Date(), lastError: null }
         });
-        return;
-      }
 
-      const telegramChatId = Number(scheduled.chat.telegramChatId);
-      const previousMessageIds = content.lastMessageIds?.length
-        ? content.lastMessageIds
-        : content.lastMessageId
-          ? [content.lastMessageId]
-          : [];
-      if (content.deletePrevious && previousMessageIds.length) {
-        await Promise.all(previousMessageIds.map((messageId) => bot.api.deleteMessage(telegramChatId, messageId).catch(() => undefined)));
-      }
+        const content = parseScheduledContent(scheduled.content);
+        const repeatRule = scheduled.repeatRule ? parseScheduledRepeatRule(scheduled.repeatRule) : null;
 
-      const replyMarkup = buildScheduledInlineKeyboard(scheduled.buttons);
-      const sentMessages = await sendScheduledMessage(bot, telegramChatId, content, replyMarkup);
-      const sent = sentMessages[sentMessages.length - 1];
-      if (!sent) return;
+        if (!hasScheduledMessageContent(content)) {
+          await prisma.scheduledMessage.update({
+            where: { id: scheduled.id },
+            data: { status: ScheduledMessageStatus.DRAFT }
+          });
+          return;
+        }
 
-      if (content.pin) {
-        await bot.api.pinChatMessage(telegramChatId, sent.message_id, {
-          disable_notification: true
-        }).catch(() => undefined);
-      }
+        const telegramChatId = Number(scheduled.chat.telegramChatId);
+        const previousMessageIds = content.lastMessageIds?.length
+          ? content.lastMessageIds
+          : content.lastMessageId
+            ? [content.lastMessageId]
+            : [];
+        if (content.deletePrevious && previousMessageIds.length) {
+          await Promise.all(previousMessageIds.map((messageId) => bot.api.deleteMessage(telegramChatId, messageId).catch(() => undefined)));
+        }
 
-      const nextRun = nextScheduledRun(repeatRule, new Date());
-      if (!nextRun) {
+        const replyMarkup = buildScheduledInlineKeyboard(scheduled.buttons);
+        const sentMessages = await sendScheduledMessage(bot, telegramChatId, content, replyMarkup);
+        const sent = sentMessages[sentMessages.length - 1];
+        if (!sent) throw new Error("Telegram 未返回发送结果");
+
+        if (content.pin) {
+          await bot.api.pinChatMessage(telegramChatId, sent.message_id, {
+            disable_notification: true
+          }).catch(() => undefined);
+        }
+
+        const nextRun = repeatRule ? nextScheduledRun(repeatRule, new Date()) : null;
+        if (!nextRun) {
+          await prisma.scheduledMessage.update({
+            where: { id: scheduled.id },
+            data: {
+              status: ScheduledMessageStatus.SENT,
+              lastError: null,
+              content: scheduledContentToJson({
+                ...content,
+                lastMessageId: sent.message_id,
+                lastMessageIds: sentMessages.map((message) => message.message_id)
+              })
+            }
+          });
+          return;
+        }
+
         await prisma.scheduledMessage.update({
           where: { id: scheduled.id },
           data: {
-            status: ScheduledMessageStatus.SENT,
+            sendAt: nextRun,
+            attemptCount: 0,
+            lastError: null,
             content: scheduledContentToJson({
               ...content,
               lastMessageId: sent.message_id,
@@ -78,21 +102,18 @@ export function startScheduledMessageWorker(config: AppConfig) {
             })
           }
         });
-        return;
+        await enqueueScheduledMessage(scheduled.id, nextRun);
+      } catch (error) {
+        await prisma.scheduledMessage.updateMany({
+          where: { id: scheduledMessageId, status: ScheduledMessageStatus.PENDING },
+          data: {
+            lastError: jobErrorMessage(error),
+            lastAttemptAt: new Date(),
+            ...(isFinalJobAttempt(job) ? { status: ScheduledMessageStatus.FAILED } : {})
+          }
+        }).catch(() => undefined);
+        throw error;
       }
-
-      await prisma.scheduledMessage.update({
-        where: { id: scheduled.id },
-        data: {
-          sendAt: nextRun,
-          content: scheduledContentToJson({
-            ...content,
-            lastMessageId: sent.message_id,
-            lastMessageIds: sentMessages.map((message) => message.message_id)
-          })
-        }
-      });
-      await enqueueScheduledMessage(scheduled.id, nextRun);
     },
     { connection: redis }
   );

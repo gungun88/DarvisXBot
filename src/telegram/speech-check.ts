@@ -1,8 +1,10 @@
-import { ChatStatus, MembershipStatus, Prisma, type Chat as PrismaChat } from "@prisma/client";
+import { ChatStatus, Prisma, type Chat as PrismaChat } from "@prisma/client";
 import { InlineKeyboard, type Context } from "grammy";
 import type { ChatPermissions, User } from "grammy/types";
 import { prisma } from "../lib/prisma.js";
+import { recordModerationEvent } from "../moderation/moderation-event.service.js";
 import { canConfigureChat, isUserChatAdmin } from "./permissions.js";
+import { getBotFeatureLimitsForChat } from "../subscriptions/subscription.service.js";
 
 type Locale = "zh-CN" | "en";
 
@@ -276,6 +278,15 @@ export async function handleSpeechCheckMessage(ctx: Context, locale: Locale) {
 
   await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => undefined);
   await applySpeechCheckPunishment(ctx, ctx.chat.id, ctx.from.id, settings);
+  await recordModerationEvent({
+    chatId: chat.id,
+    telegramUserId: ctx.from.id,
+    eventType: "speech_check",
+    action: settings.punishment,
+    reason: reasons.join(", "),
+    messageId: ctx.message.message_id,
+    metadata: { permanentMute: settings.permanentMute, punishmentMinutes: settings.punishmentMinutes }
+  }).catch((error) => console.error("Failed to record speech-check moderation event", error));
 
   const notice = await ctx.reply(buildViolationNotice(ctx.from, reasons, settings, locale), { parse_mode: "HTML" }).catch(() => null);
   if (notice && settings.noticeDeleteSeconds > 0) {
@@ -714,7 +725,7 @@ async function parseSpeechCheckInput(
       return { ok: false, message: locale === "zh-CN" ? "频道/群组格式不正确，请发送 <code>https://t.me/example</code>、<code>t.me/example</code> 或 <code>@example</code>。" : "Invalid channel/group. Send https://t.me/example, t.me/example, or @example." };
     }
 
-    const limit = await requiredChannelLimit(ctx.from?.id);
+    const limit = await requiredChannelLimit(chatId);
     const nextChannels = [...settings.requiredChannels.filter((item) => item !== channel), channel];
     if (nextChannels.length > limit) {
       return { ok: false, message: locale === "zh-CN" ? `当前账号最多支持检测 ${limit} 个频道/群组。` : `This account can check up to ${limit} channel/group(s).` };
@@ -744,19 +755,9 @@ async function parseSpeechCheckInput(
   return { ok: true, value: { punishment: "mute", punishmentMinutes: minutes, permanentMute: false } };
 }
 
-async function requiredChannelLimit(telegramUserId: number | undefined) {
-  if (!telegramUserId) return 1;
-  const user = await prisma.user.findUnique({ where: { telegramUserId: BigInt(telegramUserId) } });
-  if (!user) return 1;
-  const activeMembership = await prisma.membership.findFirst({
-    where: {
-      userId: user.id,
-      status: MembershipStatus.ACTIVE,
-      expiresAt: { gt: new Date() }
-    },
-    select: { id: true }
-  });
-  return activeMembership ? 3 : 1;
+async function requiredChannelLimit(chatId: string) {
+  const limits = await getBotFeatureLimitsForChat(chatId);
+  return limits.requiredChannelSubscriptions;
 }
 
 async function canBotReadRequiredChannel(ctx: Context, channel: string) {

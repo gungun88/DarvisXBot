@@ -1,5 +1,6 @@
 import { Prisma, ScheduledMessageStatus } from "@prisma/client";
 import { scheduledMessagesQueue } from "../lib/queues.js";
+import { DEFAULT_JOB_ATTEMPTS } from "../lib/job-reliability.js";
 
 export type ScheduledMessageContent = {
   name?: string;
@@ -158,6 +159,8 @@ export async function enqueueScheduledMessage(id: string, sendAt: Date) {
     {
       jobId,
       delay: Math.max(0, sendAt.getTime() - Date.now()),
+      attempts: DEFAULT_JOB_ATTEMPTS,
+      backoff: { type: "exponential", delay: 3000 },
       removeOnComplete: true,
       removeOnFail: 100
     }

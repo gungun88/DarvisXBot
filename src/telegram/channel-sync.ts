@@ -3,6 +3,7 @@ import { ChatStatus, Prisma, type Chat as PrismaChat } from "@prisma/client";
 import type { Message } from "grammy/types";
 import { listManagedChats } from "../chats/chat.service.js";
 import { prisma } from "../lib/prisma.js";
+import { getBotFeatureLimitsForChat } from "../subscriptions/subscription.service.js";
 import { canConfigureChat } from "./permissions.js";
 
 type Locale = "zh-CN" | "en";
@@ -219,7 +220,20 @@ export async function handleChannelSyncCallback(
 
     const selected = new Set(settings.targetChatIds);
     if (selected.has(target.id)) selected.delete(target.id);
-    else selected.add(target.id);
+    else {
+      const limit = (await getBotFeatureLimitsForChat(sourceChat.id)).channelSyncTargetsPerSource;
+      if (selected.size >= limit) {
+        await renderMenu(
+          ctx,
+          locale === "zh-CN"
+            ? `当前套餐每个来源最多同步 ${limit} 个目标。请先取消一个已选目标。`
+            : `Your plan allows up to ${limit} sync targets per source. Deselect an existing target first.`,
+          channelSyncInputKeyboard(sourceChat.id, locale)
+        );
+        return;
+      }
+      selected.add(target.id);
+    }
     settings.targetChatIds = [...selected];
     await saveSettings(sourceChat.id, settings);
     await renderTargetPanel(ctx, locale, sourceChat, settings, scope, botUsername);

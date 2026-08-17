@@ -47,12 +47,29 @@ enum GiveawayStatus {
   ACTIVE
   DRAWN
   CANCELLED
+  FAILED
 }
 
 enum MembershipStatus {
   ACTIVE
   EXPIRED
   CANCELLED
+}
+
+enum BotSubscriptionStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+}
+
+enum PaymentOrderStatus {
+  PENDING
+  WAITING
+  CONFIRMED
+  FINISHED
+  FAILED
+  EXPIRED
+  REFUNDED
 }
 
 enum ChatStatsEventType {
@@ -68,6 +85,20 @@ enum PointTransactionType {
   MANUAL
   LOTTERY
   EXCHANGE
+}
+
+enum PointProductCodeStatus {
+  AVAILABLE
+  RESERVED
+  DELIVERED
+  VOID
+}
+
+enum PointRedemptionStatus {
+  DELIVERY_PENDING
+  FULFILLED
+  REFUNDED
+  CANCELLED
 }
 
 model User {
@@ -92,6 +123,9 @@ model User {
   pointBalances      ChatPointBalance[]
   pointTransactions  ChatPointTransaction[] @relation("PointTransactionUser")
   actedPointTransactions ChatPointTransaction[] @relation("PointTransactionActor")
+  pointRedemptions   PointRedemption[]
+  botSubscription    BotSubscription?
+  paymentOrders      PaymentOrder[]
 
   @@map("users")
 }
@@ -123,6 +157,9 @@ model Chat {
   joinVerifications JoinVerification[]
   pointBalances     ChatPointBalance[]
   pointTransactions ChatPointTransaction[]
+  pointProducts     PointProduct[]
+  pointRedemptions  PointRedemption[]
+  moderationEvents ModerationEvent[]
 
   @@map("chats")
 }
@@ -173,17 +210,40 @@ model ModerationRule {
   @@map("moderation_rules")
 }
 
+model ModerationEvent {
+  id             String   @id @default(cuid())
+  chatId         String   @map("chat_id")
+  telegramUserId BigInt?  @map("telegram_user_id")
+  eventType      String   @map("event_type") @db.VarChar(64)
+  action         String   @db.VarChar(64)
+  reason         String?  @db.VarChar(255)
+  matchedPattern String?  @map("matched_pattern") @db.VarChar(255)
+  messageId      Int?     @map("message_id")
+  metadata       Json     @default("{}")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  chat Chat @relation(fields: [chatId], references: [id], onDelete: Cascade)
+
+  @@index([chatId, createdAt])
+  @@index([eventType, action, createdAt])
+  @@index([telegramUserId, createdAt])
+  @@map("moderation_events")
+}
+
 model ScheduledMessage {
-  id          String                 @id @default(cuid())
-  chatId      String                 @map("chat_id")
-  contentType String                 @map("content_type") @db.VarChar(32)
-  content     Json
-  buttons     Json?
-  sendAt      DateTime               @map("send_at")
-  repeatRule  Json?                  @map("repeat_rule")
-  status      ScheduledMessageStatus @default(PENDING)
-  createdAt   DateTime               @default(now()) @map("created_at")
-  updatedAt   DateTime               @updatedAt @map("updated_at")
+  id            String                 @id @default(cuid())
+  chatId        String                 @map("chat_id")
+  contentType   String                 @map("content_type") @db.VarChar(32)
+  content       Json
+  buttons       Json?
+  sendAt        DateTime               @map("send_at")
+  repeatRule    Json?                  @map("repeat_rule")
+  status        ScheduledMessageStatus @default(PENDING)
+  lastError     String?                @map("last_error")
+  attemptCount  Int                    @default(0) @map("attempt_count")
+  lastAttemptAt DateTime?              @map("last_attempt_at")
+  createdAt     DateTime               @default(now()) @map("created_at")
+  updatedAt     DateTime               @updatedAt @map("updated_at")
 
   chat Chat @relation(fields: [chatId], references: [id], onDelete: Cascade)
 
@@ -202,6 +262,9 @@ model Giveaway {
   drawResult       Json?          @map("draw_result")
   drawAt           DateTime       @map("draw_at")
   status           GiveawayStatus @default(DRAFT)
+  lastError        String?        @map("last_error")
+  attemptCount     Int            @default(0) @map("attempt_count")
+  lastAttemptAt    DateTime?      @map("last_attempt_at")
   createdBy        String         @map("created_by")
   createdAt        DateTime       @default(now()) @map("created_at")
   updatedAt        DateTime       @updatedAt @map("updated_at")
@@ -246,6 +309,44 @@ model Membership {
   @@map("memberships")
 }
 
+model BotSubscription {
+  id        String                 @id @default(cuid())
+  userId    String                 @unique @map("user_id")
+  expiresAt DateTime               @map("expires_at")
+  status    BotSubscriptionStatus  @default(ACTIVE)
+  source    String                 @default("manual") @db.VarChar(64)
+  createdAt DateTime               @default(now()) @map("created_at")
+  updatedAt DateTime               @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([status, expiresAt])
+  @@map("bot_subscriptions")
+}
+
+model PaymentOrder {
+  id                String            @id @default(cuid())
+  userId            String            @map("user_id")
+  provider          String            @default("nowpayments") @db.VarChar(32)
+  planKey           String            @map("plan_key") @db.VarChar(16)
+  months            Int
+  amountUsd         Decimal           @map("amount_usd") @db.Decimal(18, 8)
+  payCurrency       String?           @map("pay_currency") @db.VarChar(32)
+  providerPaymentId String?           @unique @map("provider_payment_id") @db.VarChar(128)
+  payUrl            String?           @map("pay_url") @db.VarChar(1024)
+  status            PaymentOrderStatus @default(PENDING)
+  rawPayload        Json?             @map("raw_payload")
+  paidAt            DateTime?         @map("paid_at")
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status, createdAt])
+  @@index([status, updatedAt])
+  @@map("payment_orders")
+}
+
 model AuditLog {
   id          String   @id @default(cuid())
   chatId      String?  @map("chat_id")
@@ -261,6 +362,36 @@ model AuditLog {
 
   @@index([chatId, createdAt])
   @@map("audit_logs")
+}
+
+model AdminSession {
+  id        String    @id @default(cuid())
+  jti       String    @unique @db.VarChar(64)
+  username  String    @db.VarChar(128)
+  role      String    @default("owner") @db.VarChar(32)
+  ipAddress String?   @map("ip_address") @db.VarChar(64)
+  userAgent String?   @map("user_agent") @db.VarChar(512)
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([username, revokedAt, expiresAt])
+  @@map("admin_sessions")
+}
+
+model AdminAccount {
+  id               String    @id @default(cuid())
+  username         String    @unique @db.VarChar(128)
+  passwordHash     String    @map("password_hash") @db.VarChar(255)
+  role             String    @default("operator") @db.VarChar(32)
+  enabled          Boolean   @default(true)
+  bootstrapManaged Boolean   @default(false) @map("bootstrap_managed")
+  lastLoginAt      DateTime? @map("last_login_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  @@index([enabled, role])
+  @@map("admin_accounts")
 }
 
 model ChatDailyMessageStat {
@@ -386,9 +517,77 @@ model ChatPointTransaction {
   chat  Chat @relation(fields: [chatId], references: [id], onDelete: Cascade)
   user  User @relation("PointTransactionUser", fields: [userId], references: [id], onDelete: Cascade)
   actor User? @relation("PointTransactionActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+  redemption PointRedemption?
 
   @@index([chatId, userId, createdAt])
   @@index([chatId, userId, type, dayKey])
   @@index([chatId, type, createdAt])
   @@map("chat_point_transactions")
+}
+
+model PointProduct {
+  id          String    @id @default(cuid())
+  chatId      String    @map("chat_id")
+  externalId  String    @map("external_id") @db.VarChar(16)
+  name        String    @db.VarChar(64)
+  cost        Int
+  listed      Boolean   @default(false)
+  dailyLimit  Int       @default(0) @map("daily_limit")
+  soldCount   Int       @default(0) @map("sold_count")
+  archivedAt  DateTime? @map("archived_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  chat        Chat               @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  codes       PointProductCode[]
+  redemptions PointRedemption[]
+
+  @@unique([chatId, externalId])
+  @@index([chatId, listed, archivedAt])
+  @@map("point_products")
+}
+
+model PointProductCode {
+  id          String                 @id @default(cuid())
+  productId   String                 @map("product_id")
+  value       String                 @db.VarChar(255)
+  status      PointProductCodeStatus @default(AVAILABLE)
+  reservedAt  DateTime?              @map("reserved_at")
+  deliveredAt DateTime?              @map("delivered_at")
+  createdAt   DateTime               @default(now()) @map("created_at")
+
+  product    PointProduct     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  redemption PointRedemption?
+
+  @@unique([productId, value])
+  @@index([productId, status, createdAt])
+  @@map("point_product_codes")
+}
+
+model PointRedemption {
+  id            String                @id @default(cuid())
+  chatId        String                @map("chat_id")
+  productId     String                @map("product_id")
+  codeId        String                @unique @map("code_id")
+  userId        String                @map("user_id")
+  transactionId String                @unique @map("transaction_id")
+  cost          Int
+  dayKey        String                @map("day_key") @db.VarChar(10)
+  status        PointRedemptionStatus @default(DELIVERY_PENDING)
+  deliveryError String?               @map("delivery_error")
+  deliveredAt   DateTime?             @map("delivered_at")
+  refundedAt    DateTime?             @map("refunded_at")
+  createdAt     DateTime              @default(now()) @map("created_at")
+  updatedAt     DateTime              @updatedAt @map("updated_at")
+
+  chat        Chat                 @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  product     PointProduct         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  code        PointProductCode     @relation(fields: [codeId], references: [id], onDelete: Restrict)
+  user        User                 @relation(fields: [userId], references: [id], onDelete: Restrict)
+  transaction ChatPointTransaction @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+
+  @@index([chatId, status, createdAt])
+  @@index([chatId, userId, dayKey])
+  @@index([productId, createdAt])
+  @@map("point_redemptions")
 }

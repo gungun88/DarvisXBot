@@ -1,0 +1,14 @@
+import { History } from "lucide-react";
+import { useSearchParams } from "react-router-dom";
+import { useResource } from "../hooks/useResource";
+import { EmptyState, ErrorState, formatDate, LoadingState, PageHeader, Pagination, RefreshButton, SearchBox } from "../components/Ui";
+import type { AuditLog, PageResult } from "../types";
+
+export function AuditPage() {
+  const [params, setParams] = useSearchParams(); const page = Number(params.get("page") ?? 1); const search = params.get("search") ?? "";
+  const state = useResource<PageResult<AuditLog>>(`/api/admin/audit-logs?page=${page}&pageSize=30&search=${encodeURIComponent(search)}`);
+  const setFilter = (key: string, value: string) => { const next = new URLSearchParams(params); value ? next.set(key, value) : next.delete(key); if (key !== "page") next.delete("page"); setParams(next, { replace: true }); };
+  return <><PageHeader title="审计日志" description="管理员与机器人关键操作记录" actions={<RefreshButton onClick={state.reload} spinning={state.refreshing} />} /><section className="panel table-panel"><div className="filter-bar"><SearchBox value={search} onChange={(value) => setFilter("search", value)} placeholder="动作、对象 ID 或群组" /></div>{state.loading ? <LoadingState /> : state.error || !state.data ? <ErrorState message={state.error ?? "暂无数据"} retry={state.reload} /> : state.data.items.length === 0 ? <EmptyState title="暂无审计事件" /> : <><div className="table-scroll"><table><thead><tr><th>动作</th><th>群组</th><th>操作者</th><th>目标</th><th>详情</th><th>时间</th></tr></thead><tbody>{state.data.items.map((item) => <tr key={item.id}><td><span className="inline-icon"><History size={15} />{actionLabel(item.action)}</span></td><td>{item.chat?.title ?? "系统"}</td><td>{item.actor?.username ? `@${item.actor.username}` : item.actor?.firstName ?? "后台管理员"}</td><td><code>{item.targetType ?? "-"} {item.targetId ?? ""}</code></td><td><code className="metadata-code">{JSON.stringify(item.metadata)}</code></td><td>{formatDate(item.createdAt)}</td></tr>)}</tbody></table></div><Pagination page={state.data.page} pageSize={state.data.pageSize} total={state.data.total} onPage={(value) => setFilter("page", String(value))} /></>}</section></>;
+}
+
+function actionLabel(action: string) { return ({ "admin.chat.updated": "更新群组", "admin.setting.updated": "更新设置", "admin.points.adjusted": "调整积分", "admin.scheduled_message.cancelled": "取消定时消息", "admin.giveaway.cancelled": "取消抽奖", "giveaway.created": "创建抽奖", "giveaway.drawn": "抽奖开奖", "admin.auth.login_succeeded": "管理员登录成功", "admin.auth.login_failed": "管理员登录失败", "admin.auth.logout": "管理员退出登录", "admin.auth.session_revoked": "撤销管理会话", "admin.account.created": "创建管理员账号", "admin.account.updated": "更新管理员账号", "admin.payment_order.reconciled": "支付订单对账", "admin.payment_order.retried": "重试支付订单", "admin.payment_order.refunded": "记录支付退款" } as Record<string, string>)[action] ?? action; }

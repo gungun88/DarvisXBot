@@ -3,6 +3,7 @@ import { Worker } from "bullmq";
 import { GiveawayStatus, Prisma } from "@prisma/client";
 import type { User } from "@prisma/client";
 import type { AppConfig } from "../lib/config.js";
+import { isFinalJobAttempt, jobErrorMessage } from "../lib/job-reliability.js";
 import { prisma } from "../lib/prisma.js";
 import { redis } from "../lib/redis.js";
 import { enqueueGiveawayDraw } from "./giveaway.service.js";
@@ -16,60 +17,84 @@ export function startGiveawayDrawWorker(config: AppConfig) {
       const giveawayId = String(job.data?.giveawayId ?? "");
       if (!giveawayId) return;
 
-      const giveaway = await prisma.giveaway.findUnique({
-        where: { id: giveawayId },
-        include: {
-          chat: true,
-          entries: {
-            where: { isValid: true },
-            include: { user: true },
-            orderBy: { joinedAt: "asc" }
+      try {
+        const giveaway = await prisma.giveaway.findUnique({
+          where: { id: giveawayId },
+          include: {
+            chat: true,
+            entries: {
+              where: { isValid: true },
+              include: { user: true },
+              orderBy: { joinedAt: "asc" }
+            }
           }
+        });
+
+        if (!giveaway || giveaway.status !== GiveawayStatus.ACTIVE) return;
+        if (giveaway.drawAt.getTime() > Date.now() + 1000) {
+          await enqueueGiveawayDraw(giveaway.id, giveaway.drawAt);
+          return;
         }
-      });
 
-      if (!giveaway || giveaway.status !== GiveawayStatus.ACTIVE) return;
-      if (giveaway.drawAt.getTime() > Date.now() + 1000) {
-        await enqueueGiveawayDraw(giveaway.id, giveaway.drawAt);
-        return;
-      }
+        await prisma.giveaway.update({
+          where: { id: giveaway.id },
+          data: { attemptCount: { increment: 1 }, lastAttemptAt: new Date(), lastError: null }
+        });
 
-      const winners = await resolveGiveawayWinners(giveaway);
-      const drawResult: Prisma.InputJsonObject = {
-        drawnAt: new Date().toISOString(),
-        entryCount: winners.entryCount,
-        winnerCount: winners.length,
-        winnerUserIds: winners.users.map((user) => user.id),
-        winnerTelegramUserIds: winners.users.map((user) => user.telegramUserId.toString()),
-        source: winners.source
-      };
+        const winners = await resolveGiveawayWinners(giveaway);
+        const drawResult: Prisma.InputJsonObject = {
+          drawnAt: new Date().toISOString(),
+          entryCount: winners.entryCount,
+          winnerCount: winners.length,
+          winnerUserIds: winners.users.map((user) => user.id),
+          winnerTelegramUserIds: winners.users.map((user) => user.telegramUserId.toString()),
+          source: winners.source
+        };
 
-      await prisma.giveaway.update({
-        where: { id: giveaway.id },
-        data: {
-          status: GiveawayStatus.DRAWN,
-          drawResult
+        await prisma.giveaway.update({
+          where: { id: giveaway.id },
+          data: {
+            status: GiveawayStatus.DRAWN,
+            lastError: null,
+            drawResult
+          }
+        });
+
+        await prisma.auditLog.create({
+          data: {
+            chatId: giveaway.chatId,
+            action: "giveaway.drawn",
+            targetType: "giveaway",
+            targetId: giveaway.id,
+            metadata: drawResult
+          }
+        });
+
+        const sent = await bot.api.sendMessage(
+          Number(giveaway.chat.telegramChatId),
+          buildDrawMessage(giveaway.title, giveaway.prize, winners.users),
+          { parse_mode: "HTML" }
+        ).catch(async (error) => {
+          await prisma.giveaway.update({
+            where: { id: giveaway.id },
+            data: { lastError: `开奖结果发送失败：${jobErrorMessage(error)}` }
+          }).catch(() => undefined);
+          return null;
+        });
+        const settings = await getGiveawaySettings(giveaway.chatId);
+        if (sent && settings.pinResult) {
+          await bot.api.pinChatMessage(Number(giveaway.chat.telegramChatId), sent.message_id, { disable_notification: true }).catch(() => undefined);
         }
-      });
-
-      await prisma.auditLog.create({
-        data: {
-          chatId: giveaway.chatId,
-          action: "giveaway.drawn",
-          targetType: "giveaway",
-          targetId: giveaway.id,
-          metadata: drawResult
-        }
-      });
-
-      const sent = await bot.api.sendMessage(
-        Number(giveaway.chat.telegramChatId),
-        buildDrawMessage(giveaway.title, giveaway.prize, winners.users),
-        { parse_mode: "HTML" }
-      ).catch(() => null);
-      const settings = await getGiveawaySettings(giveaway.chatId);
-      if (sent && settings.pinResult) {
-        await bot.api.pinChatMessage(Number(giveaway.chat.telegramChatId), sent.message_id, { disable_notification: true }).catch(() => undefined);
+      } catch (error) {
+        await prisma.giveaway.updateMany({
+          where: { id: giveawayId, status: GiveawayStatus.ACTIVE },
+          data: {
+            lastError: jobErrorMessage(error),
+            lastAttemptAt: new Date(),
+            ...(isFinalJobAttempt(job) ? { status: GiveawayStatus.FAILED } : {})
+          }
+        }).catch(() => undefined);
+        throw error;
       }
     },
     { connection: redis }
