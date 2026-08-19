@@ -32,6 +32,7 @@ export function App() {
       <Route path="/users" element={<UsersPage />} />
       <Route path="/users/:id" element={<UserDetailPage />} />
       <Route path="/memberships" element={<MembershipsPage />} />
+      <Route path="/commercialization/payment" element={<MembershipsPage />} />
       <Route path="/moderation" element={<ModerationPage />} />
       <Route path="/scheduled" element={<ScheduledPage />} />
       <Route path="/giveaways" element={<GiveawaysPage />} />

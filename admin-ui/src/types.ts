@@ -109,16 +109,53 @@ export type BotSubscription = {
 
 export type PaymentOrder = {
   id: string;
+  userId: string;
   planKey: string;
   months: number;
   amountUsd: string;
   provider: string;
+  payCurrency: string | null;
   providerPaymentId: string | null;
   payUrl: string | null;
   status: string;
   paidAt: string | null;
   createdAt: string;
+  updatedAt: string;
   user: { id: string; telegramUserId: string; username: string | null; firstName: string | null };
+};
+
+export type MembershipUiSettings = {
+  plansTabLabel: string;
+};
+
+export type MembershipOverview = {
+  checkedAt: string;
+  paymentConfigured: boolean;
+  metrics: {
+    activeMembers: number;
+    expiringMembers: number;
+    waitingPayments: number;
+    paidOrders30d: number;
+    failedPayments30d: number;
+    refundedOrders30d: number;
+    revenue30dUsd: string;
+  };
+  plans: Array<{ key: string; months: number; amountUsd: string; label: string }>;
+  featureLimits: {
+    free: Record<string, number>;
+    premium: Record<string, number>;
+  };
+  recentOrders: PaymentOrder[];
+};
+
+export type PaymentSettings = {
+  provider: string;
+  configured: boolean;
+  mode: string;
+  webhookPath: string;
+  webhookUrl: string | null;
+  fields: Array<{ key: string; label: string; value: string | null; configured: boolean; secret: boolean }>;
+  checklist: Array<{ label: string; done: boolean }>;
 };
 
 export type ModerationEvent = {

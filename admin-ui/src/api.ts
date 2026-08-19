@@ -59,7 +59,7 @@ async function request<T>(path: string, options: RequestInit, authenticated: boo
   if (!response.ok) {
     if (authenticated && response.status === 401) {
       clearToken();
-      window.location.hash = "#/login";
+      window.location.href = "/admin/login";
     }
     throw new ApiError(payload.error ?? `请求失败 (${response.status})`, response.status);
   }

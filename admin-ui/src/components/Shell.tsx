@@ -79,11 +79,11 @@ export function Shell() {
         [adminUser?.role],
     );
     const current = useMemo(
-        () => items.find((item) => location.pathname.startsWith(item.to)),
+        () => items.find((item) => location.pathname.startsWith(item.to) || (item.to === "/memberships" && location.pathname.startsWith("/commercialization/payment"))),
         [items, location.pathname],
     );
     const currentSection = useMemo(
-        () => navigation.find((group) => group.items.some((item) => location.pathname.startsWith(item.to)))?.label,
+        () => navigation.find((group) => group.items.some((item) => location.pathname.startsWith(item.to) || (item.to === "/memberships" && location.pathname.startsWith("/commercialization/payment"))))?.label,
         [location.pathname],
     );
     const searchResults = useMemo(() => {
@@ -162,7 +162,7 @@ export function Shell() {
                         key={to}
                         to={to}
                         title={collapsed ? label : description}
-                        className={({ isActive }) => `nav-item ${isActive ? "active" : ""}`}
+                        className={({ isActive }) => `nav-item ${isActive || (to === "/memberships" && location.pathname.startsWith("/commercialization/payment")) ? "active" : ""}`}
                     >
                         <Icon size={19} />
                         <span>{label}</span>

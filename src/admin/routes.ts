@@ -321,6 +321,14 @@ export async function registerAdminApi(app: FastifyInstance, config: AppConfig) 
     return result ?? reply.code(404).send({ error: "兑换记录不存在" });
   });
 
+  app.get("/api/admin/membership-overview", { onRequest: requireAdmin }, async () => adminService.membershipOverview(config));
+  app.get("/api/admin/membership-ui", { onRequest: requireAdmin }, async () => adminService.membershipUiSettings());
+  app.put("/api/admin/membership-ui", { onRequest: requireAdmin }, async (request, reply) => {
+    const body = parseOrReply(z.object({ plansTabLabel: z.string().trim().min(1).max(24) }), request.body, reply);
+    if (!body) return;
+    return runAction(reply, () => adminService.updateMembershipUiSettings(body, adminName(request)));
+  });
+  app.get("/api/admin/payment-settings", { onRequest: requireAdmin }, async () => adminService.paymentSettings(config));
   app.get("/api/admin/subscriptions", { onRequest: requireAdmin }, async (request, reply) => {
     const query = parseOrReply(listQuerySchema.extend({ subscriptionStatus: z.string().optional() }), request.query, reply);
     if (!query) return;

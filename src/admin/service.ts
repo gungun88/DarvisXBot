@@ -25,7 +25,7 @@ import {
   replacePointProductCodes,
   updatePointProduct
 } from "../points/point-exchange.service.js";
-import { cancelSubscription, grantManualSubscription } from "../subscriptions/subscription.service.js";
+import { botFeatureLimits, cancelSubscription, grantManualSubscription, membershipPlans, paymentsConfigured } from "../subscriptions/subscription.service.js";
 import {
   markPaymentOrderRefunded,
   reconcileNowPaymentsOrder,
@@ -49,6 +49,16 @@ export type PointProductInput = {
   dailyLimit: number;
   listed: boolean;
   codes?: string[] | undefined;
+};
+
+const membershipUiSettingsKey = "membership_ui";
+
+type MembershipUiSettings = {
+  plansTabLabel: string;
+};
+
+const defaultMembershipUiSettings: MembershipUiSettings = {
+  plansTabLabel: "套餐权益"
 };
 
 export class AdminService {
@@ -818,6 +828,99 @@ export class AdminService {
     return { items: items.map((item) => ({ ...item, telegramUserId: item.telegramUserId?.toString() ?? null })), total, page: input.page, pageSize: input.pageSize };
   }
 
+  async membershipOverview(config: AppConfig) {
+    const now = new Date();
+    const sevenDaysFromNow = new Date(now);
+    sevenDaysFromNow.setUTCDate(sevenDaysFromNow.getUTCDate() + 7);
+    const thirtyDaysAgo = new Date(now);
+    thirtyDaysAgo.setUTCDate(thirtyDaysAgo.getUTCDate() - 30);
+    const [activeMembers, expiringMembers, waitingPayments, failedPayments, paidOrders, refundedOrders, revenue, recentOrders] = await Promise.all([
+      prisma.botSubscription.count({ where: { status: BotSubscriptionStatus.ACTIVE, expiresAt: { gt: now } } }),
+      prisma.botSubscription.count({ where: { status: BotSubscriptionStatus.ACTIVE, expiresAt: { gt: now, lte: sevenDaysFromNow } } }),
+      prisma.paymentOrder.count({ where: { status: { in: [PaymentOrderStatus.PENDING, PaymentOrderStatus.WAITING, PaymentOrderStatus.CONFIRMED] } } }),
+      prisma.paymentOrder.count({ where: { status: PaymentOrderStatus.FAILED, updatedAt: { gte: thirtyDaysAgo } } }),
+      prisma.paymentOrder.count({ where: { status: PaymentOrderStatus.FINISHED, paidAt: { gte: thirtyDaysAgo } } }),
+      prisma.paymentOrder.count({ where: { status: PaymentOrderStatus.REFUNDED, updatedAt: { gte: thirtyDaysAgo } } }),
+      prisma.paymentOrder.aggregate({ where: { status: PaymentOrderStatus.FINISHED, paidAt: { gte: thirtyDaysAgo } }, _sum: { amountUsd: true } }),
+      prisma.paymentOrder.findMany({
+        orderBy: { createdAt: "desc" },
+        take: 6,
+        include: { user: { select: { id: true, telegramUserId: true, username: true, firstName: true } } }
+      })
+    ]);
+    return {
+      checkedAt: now.toISOString(),
+      paymentConfigured: paymentsConfigured(config),
+      metrics: {
+        activeMembers,
+        expiringMembers,
+        waitingPayments,
+        paidOrders30d: paidOrders,
+        failedPayments30d: failedPayments,
+        refundedOrders30d: refundedOrders,
+        revenue30dUsd: revenue._sum.amountUsd?.toString() ?? "0"
+      },
+      plans: Object.entries(membershipPlans).map(([key, plan]) => ({ key, ...plan })),
+      featureLimits: botFeatureLimits,
+      recentOrders: recentOrders.map((order) => {
+        const { rawPayload: _rawPayload, ...safeOrder } = order;
+        return {
+          ...safeOrder,
+          amountUsd: order.amountUsd.toString(),
+          user: { ...order.user, telegramUserId: order.user.telegramUserId.toString() }
+        };
+      })
+    };
+  }
+
+  paymentSettings(config: AppConfig) {
+    const publicBaseUrl = config.publicBaseUrl?.replace(/\/$/, "") ?? null;
+    const webhookUrl = publicBaseUrl ? `${publicBaseUrl}/api/payments/nowpayments/ipn` : null;
+    const fields = [
+      { key: "NOWPAYMENTS_API_BASE", label: "API 地址", value: config.nowPaymentsApiBase, configured: Boolean(config.nowPaymentsApiBase), secret: false },
+      { key: "NOWPAYMENTS_API_KEY", label: "API Key", value: this.maskSecret(config.nowPaymentsApiKey), configured: Boolean(config.nowPaymentsApiKey), secret: true },
+      { key: "NOWPAYMENTS_IPN_SECRET", label: "IPN Secret", value: this.maskSecret(config.nowPaymentsIpnSecret), configured: Boolean(config.nowPaymentsIpnSecret), secret: true },
+      { key: "PUBLIC_BASE_URL", label: "公网域名", value: publicBaseUrl, configured: Boolean(publicBaseUrl), secret: false }
+    ];
+    return {
+      provider: "NOWPayments",
+      configured: paymentsConfigured(config),
+      mode: config.nodeEnv,
+      webhookPath: "/api/payments/nowpayments/ipn",
+      webhookUrl,
+      fields,
+      checklist: [
+        { label: "NOWPayments API Key", done: Boolean(config.nowPaymentsApiKey) },
+        { label: "NOWPayments IPN Secret", done: Boolean(config.nowPaymentsIpnSecret) },
+        { label: "PUBLIC_BASE_URL 公网 HTTPS 地址", done: Boolean(publicBaseUrl?.startsWith("https://")) },
+        { label: "支付商后台 Webhook URL", done: Boolean(webhookUrl) }
+      ]
+    };
+  }
+
+  async membershipUiSettings() {
+    return this.loadMembershipUiSettings();
+  }
+
+  async updateMembershipUiSettings(input: MembershipUiSettings, adminUsername: string) {
+    const current = await this.loadMembershipUiSettings();
+    const next = normalizeMembershipUiSettings(input);
+    await prisma.appSetting.upsert({
+      where: { key: membershipUiSettingsKey },
+      create: { key: membershipUiSettingsKey, value: next },
+      update: { value: next }
+    });
+    await prisma.auditLog.create({
+      data: {
+        action: "admin.membership_ui.updated",
+        targetType: "app_setting",
+        targetId: membershipUiSettingsKey,
+        metadata: { adminUsername, changes: { before: current, after: next } }
+      }
+    });
+    return next;
+  }
+
   async listSubscriptions(input: ListInput & { subscriptionStatus?: string | undefined }) {
     const where: Prisma.BotSubscriptionWhereInput = {};
     if (input.subscriptionStatus && Object.values(BotSubscriptionStatus).includes(input.subscriptionStatus as BotSubscriptionStatus)) where.status = input.subscriptionStatus as BotSubscriptionStatus;
@@ -846,7 +949,15 @@ export class AdminService {
       prisma.paymentOrder.findMany({ where, skip: (input.page - 1) * input.pageSize, take: input.pageSize, orderBy: { createdAt: "desc" }, include: { user: { select: { id: true, telegramUserId: true, username: true, firstName: true } } } }),
       prisma.paymentOrder.count({ where })
     ]);
-    return { items: items.map((item) => ({ ...item, amountUsd: item.amountUsd.toString(), user: { ...item.user, telegramUserId: item.user.telegramUserId.toString() } })), total, page: input.page, pageSize: input.pageSize };
+    return {
+      items: items.map((item) => {
+        const { rawPayload: _rawPayload, ...safeItem } = item;
+        return { ...safeItem, amountUsd: item.amountUsd.toString(), user: { ...item.user, telegramUserId: item.user.telegramUserId.toString() } };
+      }),
+      total,
+      page: input.page,
+      pageSize: input.pageSize
+    };
   }
 
   async reconcilePaymentOrder(id: string, config: AppConfig, adminUsername: string) {
@@ -903,6 +1014,11 @@ export class AdminService {
     return date.toISOString().slice(0, 10);
   }
 
+  private async loadMembershipUiSettings(): Promise<MembershipUiSettings> {
+    const record = await prisma.appSetting.findUnique({ where: { key: membershipUiSettingsKey } });
+    return normalizeMembershipUiSettings(record?.value);
+  }
+
   private async writeAdminAudit(chatId: string, action: string, targetType: string, targetId: string, adminUsername: string, metadata: Record<string, unknown> = {}) {
     await prisma.auditLog.create({
       data: { chatId, action, targetType, targetId, metadata: { adminUsername, ...metadata } }
@@ -912,6 +1028,23 @@ export class AdminService {
   private escapeHtml(value: string) {
     return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
   }
+
+  private maskSecret(value: string | undefined) {
+    if (!value) return null;
+    if (value.length <= 8) return "••••";
+    return `${value.slice(0, 4)}••••${value.slice(-4)}`;
+  }
+}
+
+function normalizeMembershipUiSettings(value: unknown): MembershipUiSettings {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return defaultMembershipUiSettings;
+  const source = value as Record<string, unknown>;
+  const plansTabLabel = typeof source.plansTabLabel === "string"
+    ? source.plansTabLabel.trim()
+    : "";
+  return {
+    plansTabLabel: plansTabLabel || defaultMembershipUiSettings.plansTabLabel
+  };
 }
 
 export const adminService = new AdminService();

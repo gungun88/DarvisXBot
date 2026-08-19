@@ -22,4 +22,10 @@ export async function registerAdminUi(app: FastifyInstance) {
 
   await app.register(fastifyStatic, { root, prefix: "/admin/" });
   app.get("/admin", async (_request, reply) => reply.redirect("/admin/"));
+  app.setNotFoundHandler((request, reply) => {
+    if (request.url.startsWith("/admin/")) {
+      return reply.type("text/html").sendFile("index.html");
+    }
+    return reply.code(404).send({ error: "Not Found" });
+  });
 }
