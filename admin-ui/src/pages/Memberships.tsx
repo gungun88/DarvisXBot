@@ -1,11 +1,12 @@
-import { AlertTriangle, BadgeDollarSign, CalendarClock, CheckCircle2, Copy, CreditCard, Crown, Eye, ExternalLink, KeyRound, PackageCheck, Plus, ReceiptText, RefreshCw, RotateCcw, Save, Server, ShieldCheck, SlidersHorizontal, UserRound, X } from "lucide-react";
+import { AlertTriangle, BadgeDollarSign, CalendarClock, CheckCircle2, CreditCard, Crown, Eye, ExternalLink, PackageCheck, Plus, ReceiptText, RefreshCw, RotateCcw, Save, ShieldCheck, SlidersHorizontal, UserRound, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { api } from "../api";
+import { PaymentProvidersPanel } from "../components/payment/PaymentProvidersPanel";
 import { useToast } from "../components/Toast";
 import { EmptyState, ErrorState, formatDate, LoadingState, PageHeader, Pagination, RefreshButton, SearchBox, StatusBadge } from "../components/Ui";
 import { useResource } from "../hooks/useResource";
-import type { BotSubscription, MembershipOverview, MembershipUiSettings, PageResult, PaymentOrder, PaymentSettings, User } from "../types";
+import type { BotSubscription, MembershipOverview, MembershipUiSettings, PageResult, PaymentOrder, User } from "../types";
 
 type Tab = "overview" | "subscriptions" | "orders" | "plans" | "config";
 type MemberUser = Pick<User, "id" | "telegramUserId" | "username" | "firstName"> & { lastName?: string | null };
@@ -28,7 +29,7 @@ export function MembershipsPage() {
   return <>
     <PageHeader title="会员与支付" description="会员有效期、订单状态、套餐权益和人工授权" />
     <nav className="page-tabs">{tabs.map(({ value, label, icon: Icon }) => <button key={value} className={tab === value ? "active" : ""} onClick={() => setTab(value)}><Icon size={15} />{label}</button>)}</nav>
-    {tab === "overview" ? <OverviewView /> : tab === "subscriptions" ? <SubscriptionsView /> : tab === "orders" ? <PaymentOrdersView /> : tab === "plans" ? <PlansView plansTabLabel={plansTabLabel} onSettingsSaved={uiState.reload} /> : <PaymentConfigView />}
+    {tab === "overview" ? <OverviewView /> : tab === "subscriptions" ? <SubscriptionsView /> : tab === "orders" ? <PaymentOrdersView /> : tab === "plans" ? <PlansView plansTabLabel={plansTabLabel} onSettingsSaved={uiState.reload} /> : <PaymentProvidersPanel />}
   </>;
 }
 
@@ -47,43 +48,9 @@ function OverviewView() {
     <div className="metric-grid membership-metrics">{metrics.map(({ label, value, detail, icon: Icon, tone }) => <div className="metric-card" key={label}><span className={`metric-icon ${tone}`}><Icon size={19} /></span><span className="metric-label">{label}</span><strong>{value}</strong><span>{detail}</span></div>)}</div>
     <div className="dashboard-grid membership-overview-grid">
       <section className="panel"><div className="panel-header"><div><h2>最近订单</h2><p>优先处理待支付、失败和退款记录</p></div><Link className="text-link" to="/memberships?tab=orders">查看全部</Link></div>{data.recentOrders.length ? <div className="table-scroll"><table><thead><tr><th>订单</th><th>用户</th><th>套餐</th><th>金额</th><th>状态</th><th>时间</th></tr></thead><tbody>{data.recentOrders.map((item) => <tr key={item.id}><td><code>{shortId(item.id)}</code></td><td>{userName(item.user)}</td><td>{item.planKey} · {item.months} 个月</td><td>{item.amountUsd} USD</td><td><StatusBadge value={item.status} /></td><td>{formatDate(item.createdAt)}</td></tr>)}</tbody></table></div> : <EmptyState title="暂无订单记录" />}</section>
-      <section className="panel"><div className="panel-header"><div><h2>需要关注</h2><p>来自当前会员和支付数据的提醒</p></div><ShieldCheck size={19} /></div><div className="attention-list membership-attention"><Link to="/memberships?tab=subscriptions&status=ACTIVE"><span className="attention-icon warning"><CalendarClock size={17} /></span><div><strong>即将到期会员</strong><small>未来 7 天内需要续费提醒</small></div><b>{data.metrics.expiringMembers}</b></Link><Link to="/memberships?tab=orders&status=FAILED"><span className={`attention-icon ${data.metrics.failedPayments30d ? "danger" : "success"}`}><AlertTriangle size={17} /></span><div><strong>支付失败订单</strong><small>可尝试重新创建支付单</small></div><b>{data.metrics.failedPayments30d}</b></Link><div className="membership-config"><span className={`status-dot ${data.paymentConfigured ? "is-success" : "is-warning"}`} /><div><strong>{data.paymentConfigured ? "支付服务已配置" : "支付服务未配置"}</strong><small>{data.paymentConfigured ? "NOWPayments 回调可用" : "配置环境变量后才能创建新订单"}</small></div></div></div></section>
+      <section className="panel"><div className="panel-header"><div><h2>需要关注</h2><p>来自当前会员和支付数据的提醒</p></div><ShieldCheck size={19} /></div><div className="attention-list membership-attention"><Link to="/memberships?tab=subscriptions&status=ACTIVE"><span className="attention-icon warning"><CalendarClock size={17} /></span><div><strong>即将到期会员</strong><small>未来 7 天内需要续费提醒</small></div><b>{data.metrics.expiringMembers}</b></Link><Link to="/memberships?tab=orders&status=FAILED"><span className={`attention-icon ${data.metrics.failedPayments30d ? "danger" : "success"}`}><AlertTriangle size={17} /></span><div><strong>支付失败订单</strong><small>可尝试重新创建支付单</small></div><b>{data.metrics.failedPayments30d}</b></Link><div className="membership-config"><span className={`status-dot ${data.paymentConfigured ? "is-success" : "is-warning"}`} /><div><strong>{data.paymentConfigured ? "支付服务已配置" : "支付服务未配置"}</strong><small>{data.paymentConfigured ? "已有启用的支付服务商，可正常创建订单" : "到「支付配置」页添加并启用服务商后才能创建订单"}</small></div></div></div></section>
     </div>
   </>;
-}
-
-function PaymentConfigView() {
-  const state = useResource<PaymentSettings>("/api/admin/payment-settings");
-  const toast = useToast();
-  const copy = async (value: string | null) => {
-    if (!value) return;
-    await navigator.clipboard.writeText(value);
-    toast.notify("已复制");
-  };
-  if (state.loading) return <LoadingState />;
-  if (state.error || !state.data) return <ErrorState message={state.error ?? "暂无配置数据"} retry={state.reload} />;
-  const data = state.data;
-  return <div className="payment-config-grid">
-    <section className="panel payment-provider-panel">
-      <div className="panel-header"><div><h2>服务商状态</h2><p>当前会员支付使用 NOWPayments 发票收款</p></div><Server size={19} /></div>
-      <div className="payment-provider-card">
-        <div className="payment-provider-title"><span className={`status-dot ${data.configured ? "is-success" : "is-warning"}`} /><div><strong>{data.provider}</strong><small>{data.configured ? "创建订单与回调处理已具备必要配置" : "缺少必要环境变量，前台不会创建新支付订单"}</small></div><StatusBadge value={data.configured ? "ACTIVE" : "disabled"} /></div>
-        <div className="payment-config-list">{data.fields.map((field) => <div key={field.key}><span>{field.label}</span><strong>{field.value || "未配置"}</strong><StatusBadge value={field.configured ? "ACTIVE" : "disabled"} /></div>)}</div>
-      </div>
-    </section>
-    <section className="panel payment-provider-panel">
-      <div className="panel-header"><div><h2>回调配置</h2><p>复制到 NOWPayments 后台的 Instant payment notifications</p></div><KeyRound size={19} /></div>
-      <div className="payment-webhook-box">
-        <label><span>Webhook URL</span><div><code>{data.webhookUrl ?? "配置 PUBLIC_BASE_URL 后生成"}</code><button className="icon-button small" title="复制 Webhook URL" disabled={!data.webhookUrl} onClick={() => void copy(data.webhookUrl)}><Copy size={14} /></button></div></label>
-        <label><span>接口路径</span><div><code>{data.webhookPath}</code><button className="icon-button small" title="复制接口路径" onClick={() => void copy(data.webhookPath)}><Copy size={14} /></button></div></label>
-      </div>
-    </section>
-    <section className="panel payment-config-wide">
-      <div className="panel-header"><div><h2>上线检查</h2><p>支付配置来自服务端环境变量，修改后需要重启服务生效</p></div><ShieldCheck size={19} /></div>
-      <div className="payment-checklist">{data.checklist.map((item) => <div key={item.label}><StatusBadge value={item.done ? "ACTIVE" : "disabled"} /><span>{item.label}</span></div>)}</div>
-      <div className="payment-env-snippet"><code>NOWPAYMENTS_API_BASE=https://api.nowpayments.io/v1</code><code>NOWPAYMENTS_API_KEY=你的_API_KEY</code><code>NOWPAYMENTS_IPN_SECRET=你的_IPN_SECRET</code><code>PUBLIC_BASE_URL=https://你的域名</code></div>
-    </section>
-  </div>;
 }
 
 function SubscriptionsView() {

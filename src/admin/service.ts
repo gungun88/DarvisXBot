@@ -25,7 +25,15 @@ import {
   replacePointProductCodes,
   updatePointProduct
 } from "../points/point-exchange.service.js";
-import { botFeatureLimits, cancelSubscription, grantManualSubscription, membershipPlans, paymentsConfigured } from "../subscriptions/subscription.service.js";
+import { botFeatureLimits, cancelSubscription, grantManualSubscription, membershipPlans, paymentsAvailable } from "../subscriptions/subscription.service.js";
+import {
+  createPaymentProvider,
+  deletePaymentProvider,
+  getPaymentProvider,
+  listPaymentProviders,
+  updatePaymentProvider,
+  type PaymentProviderInput
+} from "../payments/payment-provider.service.js";
 import {
   markPaymentOrderRefunded,
   reconcileNowPaymentsOrder,
@@ -850,7 +858,7 @@ export class AdminService {
     ]);
     return {
       checkedAt: now.toISOString(),
-      paymentConfigured: paymentsConfigured(config),
+      paymentConfigured: await paymentsAvailable(config),
       metrics: {
         activeMembers,
         expiringMembers,
@@ -873,29 +881,64 @@ export class AdminService {
     };
   }
 
-  paymentSettings(config: AppConfig) {
-    const publicBaseUrl = config.publicBaseUrl?.replace(/\/$/, "") ?? null;
-    const webhookUrl = publicBaseUrl ? `${publicBaseUrl}/api/payments/nowpayments/ipn` : null;
-    const fields = [
-      { key: "NOWPAYMENTS_API_BASE", label: "API 地址", value: config.nowPaymentsApiBase, configured: Boolean(config.nowPaymentsApiBase), secret: false },
-      { key: "NOWPAYMENTS_API_KEY", label: "API Key", value: this.maskSecret(config.nowPaymentsApiKey), configured: Boolean(config.nowPaymentsApiKey), secret: true },
-      { key: "NOWPAYMENTS_IPN_SECRET", label: "IPN Secret", value: this.maskSecret(config.nowPaymentsIpnSecret), configured: Boolean(config.nowPaymentsIpnSecret), secret: true },
-      { key: "PUBLIC_BASE_URL", label: "公网域名", value: publicBaseUrl, configured: Boolean(publicBaseUrl), secret: false }
-    ];
-    return {
-      provider: "NOWPayments",
-      configured: paymentsConfigured(config),
-      mode: config.nodeEnv,
-      webhookPath: "/api/payments/nowpayments/ipn",
-      webhookUrl,
-      fields,
-      checklist: [
-        { label: "NOWPayments API Key", done: Boolean(config.nowPaymentsApiKey) },
-        { label: "NOWPayments IPN Secret", done: Boolean(config.nowPaymentsIpnSecret) },
-        { label: "PUBLIC_BASE_URL 公网 HTTPS 地址", done: Boolean(publicBaseUrl?.startsWith("https://")) },
-        { label: "支付商后台 Webhook URL", done: Boolean(webhookUrl) }
-      ]
-    };
+  async listPaymentProviders() {
+    return { items: await listPaymentProviders(false) };
+  }
+
+  async getPaymentProviderDetail(id: number, revealSecret: boolean, adminUsername: string) {
+    const provider = await getPaymentProvider(id, revealSecret);
+    if (provider && revealSecret) {
+      await this.writePaymentProviderAudit("admin.payment_provider.secret_revealed", provider.id, adminUsername, { providerKey: provider.providerKey });
+    }
+    return provider;
+  }
+
+  async createPaymentProviderEntry(input: PaymentProviderInput, adminUsername: string) {
+    const provider = await createPaymentProvider(input);
+    await this.writePaymentProviderAudit("admin.payment_provider.created", provider.id, adminUsername, {
+      providerKey: provider.providerKey,
+      name: provider.name,
+      enabled: provider.enabled,
+      supportedTypes: provider.supportedTypes,
+      configuredFields: Object.keys(input.config ?? {})
+    });
+    return provider;
+  }
+
+  async updatePaymentProviderEntry(id: number, input: PaymentProviderInput, adminUsername: string) {
+    const provider = await updatePaymentProvider(id, input);
+    if (!provider) return null;
+    await this.writePaymentProviderAudit("admin.payment_provider.updated", provider.id, adminUsername, {
+      providerKey: provider.providerKey,
+      name: provider.name,
+      enabled: provider.enabled,
+      supportedTypes: provider.supportedTypes,
+      changedFields: Object.keys(input),
+      configuredFields: Object.keys(input.config ?? {})
+    });
+    return provider;
+  }
+
+  async deletePaymentProviderEntry(id: number, adminUsername: string) {
+    const provider = await getPaymentProvider(id, false);
+    if (!provider) return null;
+    await deletePaymentProvider(id);
+    await this.writePaymentProviderAudit("admin.payment_provider.deleted", id, adminUsername, {
+      providerKey: provider.providerKey,
+      name: provider.name
+    });
+    return { deleted: true };
+  }
+
+  private async writePaymentProviderAudit(action: string, providerId: number, adminUsername: string, metadata: Record<string, unknown>) {
+    await prisma.auditLog.create({
+      data: {
+        action,
+        targetType: "payment_provider",
+        targetId: String(providerId),
+        metadata: { adminUsername, ...metadata }
+      }
+    });
   }
 
   async membershipUiSettings() {
@@ -1027,12 +1070,6 @@ export class AdminService {
 
   private escapeHtml(value: string) {
     return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
-  }
-
-  private maskSecret(value: string | undefined) {
-    if (!value) return null;
-    if (value.length <= 8) return "••••";
-    return `${value.slice(0, 4)}••••${value.slice(-4)}`;
   }
 }
 

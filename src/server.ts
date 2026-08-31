@@ -7,6 +7,7 @@ import { prisma } from "./lib/prisma.js";
 import { redis } from "./lib/redis.js";
 import { registerAdminApi } from "./admin/routes.js";
 import { registerAdminUi } from "./admin/static.js";
+import { registerPaymentRoutes } from "./payments/routes.js";
 import { processNowPaymentsIpn } from "./subscriptions/subscription.service.js";
 
 export async function createServer(config: AppConfig, bot?: Bot) {
@@ -14,6 +15,7 @@ export async function createServer(config: AppConfig, bot?: Bot) {
   await app.register(helmet);
   await registerAdminApi(app, config);
   await registerAdminUi(app);
+  await registerPaymentRoutes(app, config);
 
   app.post("/api/payments/nowpayments/ipn", async (request, reply) => {
     const signatureHeader = request.headers["x-nowpayments-sig"];

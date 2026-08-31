@@ -8,6 +8,7 @@ import { prisma } from "../lib/prisma.js";
 import { adminRoles, adminSessionExpiresAt, requireAdmin, requireFinancialAdmin, requireOwner, type AdminRole, type AdminToken } from "./auth.js";
 import { hashAdminPassword, verifyAdminPassword, verifyTotpCode } from "./password.js";
 import { adminService } from "./service.js";
+import { paymentProviderKeys } from "../payments/payment-provider.service.js";
 
 const loginSchema = z.object({ username: z.string().min(1), password: z.string().min(1), code: z.string().regex(/^\d{6}$/).optional() });
 const listQuerySchema = z.object({
@@ -328,7 +329,48 @@ export async function registerAdminApi(app: FastifyInstance, config: AppConfig) 
     if (!body) return;
     return runAction(reply, () => adminService.updateMembershipUiSettings(body, adminName(request)));
   });
-  app.get("/api/admin/payment-settings", { onRequest: requireAdmin }, async () => adminService.paymentSettings(config));
+  const paymentProviderBaseSchema = z.object({
+    name: z.string().trim().min(1).max(64),
+    providerKey: z.enum(paymentProviderKeys),
+    enabled: z.boolean().optional(),
+    refundEnabled: z.boolean().optional(),
+    supportedTypes: z.array(z.string().trim().min(1).max(32)).min(1).max(8).optional(),
+    config: z.record(z.string().max(64), z.string().max(8192)).optional(),
+    limits: z.union([
+      z.string().max(4096),
+      z.record(z.string().max(32), z.record(z.string().max(32), z.union([z.number(), z.string().max(32)])))
+    ]).optional(),
+    publicBaseUrl: z.string().trim().max(255).optional(),
+    sortOrder: z.number().int().min(0).max(100000).optional()
+  });
+  const paymentProviderPatchSchema = paymentProviderBaseSchema.partial().refine((value) => Object.keys(value).length > 0, "至少提供一个字段");
+  const paymentProviderIdSchema = z.object({ id: z.coerce.number().int().positive() });
+  app.get("/api/admin/payment-providers", { onRequest: requireAdmin }, async () => adminService.listPaymentProviders());
+  app.get("/api/admin/payment-providers/:id", { onRequest: requireFinancialAdmin }, async (request, reply) => {
+    const params = parseOrReply(paymentProviderIdSchema, request.params, reply);
+    const query = parseOrReply(z.object({ reveal: z.preprocess((value) => value === "true" || value === true, z.boolean()).default(false) }), request.query, reply);
+    if (!params || !query) return;
+    const provider = await adminService.getPaymentProviderDetail(params.id, query.reveal, adminName(request));
+    return provider ?? reply.code(404).send({ error: "支付服务商不存在" });
+  });
+  app.post("/api/admin/payment-providers", { onRequest: requireFinancialAdmin }, async (request, reply) => {
+    const body = parseOrReply(paymentProviderBaseSchema, request.body, reply);
+    if (!body) return;
+    return runAction(reply, () => adminService.createPaymentProviderEntry(body, adminName(request)));
+  });
+  app.patch("/api/admin/payment-providers/:id", { onRequest: requireFinancialAdmin }, async (request, reply) => {
+    const params = parseOrReply(paymentProviderIdSchema, request.params, reply);
+    const body = parseOrReply(paymentProviderPatchSchema, request.body, reply);
+    if (!params || !body) return;
+    const result = await runAction(reply, () => adminService.updatePaymentProviderEntry(params.id, body, adminName(request)));
+    return result ?? (reply.sent ? undefined : reply.code(404).send({ error: "支付服务商不存在" }));
+  });
+  app.delete("/api/admin/payment-providers/:id", { onRequest: requireFinancialAdmin }, async (request, reply) => {
+    const params = parseOrReply(paymentProviderIdSchema, request.params, reply);
+    if (!params) return;
+    const result = await runAction(reply, () => adminService.deletePaymentProviderEntry(params.id, adminName(request)));
+    return result ?? (reply.sent ? undefined : reply.code(404).send({ error: "支付服务商不存在" }));
+  });
   app.get("/api/admin/subscriptions", { onRequest: requireAdmin }, async (request, reply) => {
     const query = parseOrReply(listQuerySchema.extend({ subscriptionStatus: z.string().optional() }), request.query, reply);
     if (!query) return;

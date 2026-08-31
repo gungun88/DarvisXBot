@@ -203,6 +203,24 @@ model AppSetting {
   @@map("app_settings")
 }
 
+model PaymentProvider {
+  id             Int      @id @default(autoincrement())
+  name           String   @db.VarChar(64)
+  providerKey    String   @map("provider_key") @db.VarChar(32)
+  enabled        Boolean  @default(true)
+  refundEnabled  Boolean  @default(true) @map("refund_enabled")
+  supportedTypes Json     @default("[]") @map("supported_types")
+  config         Json     @default("{}")
+  limits         Json     @default("{}")
+  publicBaseUrl  String   @default("") @map("public_base_url") @db.VarChar(255)
+  sortOrder      Int      @default(0) @map("sort_order")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@index([enabled, sortOrder])
+  @@map("payment_providers")
+}
+
 model ModerationRule {
   id        String     @id @default(cuid())
   chatId    String     @map("chat_id")

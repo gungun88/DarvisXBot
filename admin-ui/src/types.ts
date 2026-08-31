@@ -148,14 +148,26 @@ export type MembershipOverview = {
   recentOrders: PaymentOrder[];
 };
 
-export type PaymentSettings = {
-  provider: string;
-  configured: boolean;
-  mode: string;
+export type PaymentProviderKey = "easypay" | "alipay" | "wxpay" | "stripe" | "airwallex" | "nowpayments";
+
+export type PaymentLimitRule = { singleMin?: number; singleMax?: number; dailyLimit?: number };
+
+export type PaymentProvider = {
+  id: number;
+  name: string;
+  providerKey: PaymentProviderKey;
+  enabled: boolean;
+  refundEnabled: boolean;
+  supportedTypes: string[];
+  config: Record<string, string>;
+  limits: Record<string, PaymentLimitRule>;
+  publicBaseUrl: string;
+  sortOrder: number;
+  secretConfigured: boolean;
+  secretMasked: string;
   webhookPath: string;
-  webhookUrl: string | null;
-  fields: Array<{ key: string; label: string; value: string | null; configured: boolean; secret: boolean }>;
-  checklist: Array<{ label: string; done: boolean }>;
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type ModerationEvent = {

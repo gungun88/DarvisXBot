@@ -75,7 +75,7 @@ import {
   getBotSubscription,
   getMembershipPlan,
   hasActiveBotSubscriptionForChat,
-  paymentsConfigured
+  paymentsAvailable
 } from "../subscriptions/subscription.service.js";
 import { recordModerationEvent } from "../moderation/moderation-event.service.js";
 import { enqueueSignInMessageDelete } from "./sign-in-delete.service.js";
@@ -2875,7 +2875,7 @@ async function handleMembershipCallback(ctx: Context, config: AppConfig) {
   };
   const label = labels[plan] ?? (locale === "zh-CN" ? "会员套餐" : "Membership plan");
   if (ctx.from && getMembershipPlan(plan)) {
-    if (!paymentsConfigured(config)) {
+    if (!(await paymentsAvailable(config))) {
       await editOrReply(ctx, locale === "zh-CN"
         ? `💎 <b>${escapeHtml(label)}</b>\n\n支付服务尚未配置，当前暂不能创建订单。请联系管理员。`
         : `💎 <b>${escapeHtml(label)}</b>\n\nPayments are not configured yet. Please contact the administrator.`, membershipPanelKeyboard(locale));

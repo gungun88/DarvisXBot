@@ -2,6 +2,14 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { BotSubscriptionStatus, PaymentOrderStatus, Prisma } from "@prisma/client";
 import type { AppConfig } from "../lib/config.js";
 import { prisma } from "../lib/prisma.js";
+import {
+  createNowPaymentsInvoice,
+  createPaymentIntentWithProvider,
+  minorUnitsFromUsd,
+  nowPaymentsAccessFromProvider,
+  type NowPaymentsAccess
+} from "../payments/payment-gateway.service.js";
+import { findEnabledProvider, selectPaymentProvider } from "../payments/payment-provider.service.js";
 
 export const membershipPlans = {
   "1m": { months: 1, amountUsd: "10", label: "10U 1个月" },
@@ -37,6 +45,22 @@ export function getMembershipPlan(value: string): { key: MembershipPlanKey; mont
 
 export function paymentsConfigured(config: AppConfig) {
   return Boolean(config.nowPaymentsApiKey && config.nowPaymentsIpnSecret && config.publicBaseUrl);
+}
+
+export async function paymentsAvailable(config: AppConfig) {
+  if (paymentsConfigured(config)) return true;
+  return (await prisma.paymentProvider.count({ where: { enabled: true } })) > 0;
+}
+
+async function resolveNowPaymentsAccess(config: AppConfig): Promise<NowPaymentsAccess | null> {
+  const provider = await findEnabledProvider("nowpayments");
+  return nowPaymentsAccessFromProvider(provider, config);
+}
+
+async function nowPaymentsIpnSecrets(config: AppConfig): Promise<string[]> {
+  const provider = await findEnabledProvider("nowpayments");
+  const secrets = [String(provider?.config.ipnSecret ?? "").trim(), config.nowPaymentsIpnSecret ?? ""];
+  return [...new Set(secrets.filter(Boolean))];
 }
 
 export async function getBotSubscription(userId: string) {
@@ -96,7 +120,9 @@ export async function hasActiveBotSubscriptionByTelegramUserId(telegramUserId: n
 export async function createMembershipPaymentOrder(userId: string, planKey: string, config: AppConfig) {
   const plan = getMembershipPlan(planKey);
   if (!plan) throw new Error("会员套餐不存在");
-  if (!paymentsConfigured(config)) throw new Error("支付服务尚未配置，请联系管理员");
+  const selection = await selectPaymentProvider();
+  const envAccess = selection ? null : (paymentsConfigured(config) ? await resolveNowPaymentsAccess(config) : null);
+  if (!selection && !envAccess) throw new Error("支付服务尚未配置，请联系管理员");
 
   const order = await prisma.paymentOrder.create({
     data: {
@@ -104,31 +130,22 @@ export async function createMembershipPaymentOrder(userId: string, planKey: stri
       planKey: plan.key,
       months: plan.months,
       amountUsd: new Prisma.Decimal(plan.amountUsd),
-      provider: "nowpayments",
+      provider: selection ? selection.provider.providerKey : "nowpayments",
       status: PaymentOrderStatus.PENDING
     }
   });
   try {
-    const response = await fetch(`${config.nowPaymentsApiBase}/invoice`, {
-      method: "POST",
-      headers: { "x-api-key": config.nowPaymentsApiKey!, "content-type": "application/json" },
-      body: JSON.stringify({
-        price_amount: Number(plan.amountUsd),
-        price_currency: "usd",
-        order_id: order.id,
-        order_description: `DarvisXBot ${plan.label}`,
-        ipn_callback_url: `${config.publicBaseUrl!.replace(/\/$/, "")}/api/payments/nowpayments/ipn`
-      })
-    });
-    const payload = await response.json() as { id?: string | number; invoice_url?: string; message?: string };
-    if (!response.ok || !payload.id) throw new Error(payload.message || `支付服务请求失败 (${response.status})`);
+    const intentOrder = { id: order.id, amountUsd: plan.amountUsd, planLabel: plan.label, userId };
+    const intent = selection
+      ? await createPaymentIntentWithProvider(intentOrder, selection.provider, selection.payType, config)
+      : await createNowPaymentsInvoice(envAccess!, intentOrder);
     return prisma.paymentOrder.update({
       where: { id: order.id },
       data: {
         status: PaymentOrderStatus.WAITING,
-        providerPaymentId: String(payload.id),
-        payUrl: payload.invoice_url ?? null,
-        rawPayload: payload
+        providerPaymentId: intent.providerOrderId || null,
+        payUrl: intent.paymentUrl || null,
+        rawPayload: toJson(intent.raw ?? { intent: { providerKey: intent.providerKey, payType: intent.payType } })
       }
     });
   } catch (error) {
@@ -141,21 +158,23 @@ export async function createMembershipPaymentOrder(userId: string, planKey: stri
 }
 
 export async function processNowPaymentsIpn(rawBody: string | Record<string, unknown>, signature: string | undefined, config: AppConfig) {
-  if (!config.nowPaymentsIpnSecret) throw new Error("支付回调密钥未配置");
+  const secrets = await nowPaymentsIpnSecrets(config);
+  if (!secrets.length) throw new Error("支付回调密钥未配置");
   const payload = typeof rawBody === "string" ? JSON.parse(rawBody) as Record<string, unknown> : rawBody;
-  if (!signature || !verifyPayloadSignature(payload, signature, config.nowPaymentsIpnSecret)) throw new Error("支付回调签名无效");
+  if (!signature || !secrets.some((secret) => verifyPayloadSignature(payload, signature, secret))) throw new Error("支付回调签名无效");
   const orderId = typeof payload.order_id === "string" ? payload.order_id : "";
   if (!orderId) throw new Error("支付回调缺少订单信息");
   return applyNowPaymentsPayload(orderId, payload, "nowpayments");
 }
 
 export async function reconcileNowPaymentsOrder(orderId: string, config: AppConfig) {
-  if (!config.nowPaymentsApiKey) throw new Error("支付服务尚未配置");
+  const access = await resolveNowPaymentsAccess(config);
+  if (!access) throw new Error("支付服务尚未配置");
   const order = await prisma.paymentOrder.findUnique({ where: { id: orderId } });
   if (!order) throw new Error("支付订单不存在");
   if (!order.providerPaymentId) throw new Error("订单尚未生成支付单，无法对账");
-  const response = await fetch(`${config.nowPaymentsApiBase}/payment/${encodeURIComponent(order.providerPaymentId)}`, {
-    headers: { "x-api-key": config.nowPaymentsApiKey }
+  const response = await fetch(`${access.apiBase}/payment/${encodeURIComponent(order.providerPaymentId)}`, {
+    headers: { "x-api-key": access.apiKey }
   });
   const payload = await response.json() as Record<string, unknown> & { message?: string };
   if (!response.ok) throw new Error(payload.message || `支付对账请求失败 (${response.status})`);
@@ -165,29 +184,19 @@ export async function reconcileNowPaymentsOrder(orderId: string, config: AppConf
 }
 
 export async function retryNowPaymentsOrder(orderId: string, config: AppConfig) {
-  if (!paymentsConfigured(config)) throw new Error("支付服务尚未配置");
+  const access = await resolveNowPaymentsAccess(config);
+  if (!access) throw new Error("支付服务尚未配置");
   const order = await prisma.paymentOrder.findUnique({ where: { id: orderId } });
   if (!order) throw new Error("支付订单不存在");
+  if (order.provider !== "nowpayments") throw new Error("该订单使用的支付渠道不支持重试创建，请让用户重新下单");
   if (order.providerPaymentId) throw new Error("订单已有支付单，请执行对账而不是重试创建");
   if (order.status !== PaymentOrderStatus.PENDING && order.status !== PaymentOrderStatus.FAILED) throw new Error("当前订单状态不能重试创建支付单");
   const plan = validatePaymentOrderPlan(order);
   try {
-    const response = await fetch(`${config.nowPaymentsApiBase}/invoice`, {
-      method: "POST",
-      headers: { "x-api-key": config.nowPaymentsApiKey!, "content-type": "application/json" },
-      body: JSON.stringify({
-        price_amount: Number(plan.amountUsd),
-        price_currency: "usd",
-        order_id: order.id,
-        order_description: `DarvisXBot ${plan.label}`,
-        ipn_callback_url: `${config.publicBaseUrl!.replace(/\/$/, "")}/api/payments/nowpayments/ipn`
-      })
-    });
-    const payload = await response.json() as { id?: string | number; invoice_url?: string; message?: string };
-    if (!response.ok || !payload.id) throw new Error(payload.message || `支付服务请求失败 (${response.status})`);
+    const intent = await createNowPaymentsInvoice(access, { id: order.id, amountUsd: plan.amountUsd, planLabel: plan.label, userId: order.userId });
     return prisma.paymentOrder.update({
       where: { id: order.id },
-      data: { status: PaymentOrderStatus.WAITING, providerPaymentId: String(payload.id), payUrl: payload.invoice_url ?? null, rawPayload: payload }
+      data: { status: PaymentOrderStatus.WAITING, providerPaymentId: intent.providerOrderId || null, payUrl: intent.paymentUrl || null, rawPayload: toJson(intent.raw ?? {}) }
     });
   } catch (error) {
     await prisma.paymentOrder.update({
@@ -223,27 +232,8 @@ async function applyNowPaymentsPayload(orderId: string, payload: Record<string, 
   }
 
   if (["finished", "confirmed"].includes(status)) {
-    return prisma.$transaction(async (tx) => {
-      const current = await tx.paymentOrder.findUnique({ where: { id: order.id } });
-      if (!current) throw new Error("支付订单不存在");
-      if (current.status === PaymentOrderStatus.FINISHED) return { order: current, subscription: await tx.botSubscription.findUnique({ where: { userId: current.userId } }) };
-      if (current.status === PaymentOrderStatus.REFUNDED) throw new Error("已退款订单不能重新确认");
-      const now = new Date();
-      const currentSubscription = await tx.botSubscription.findUnique({ where: { userId: current.userId } });
-      const startAt = currentSubscription?.status === BotSubscriptionStatus.ACTIVE && currentSubscription.expiresAt > now ? currentSubscription.expiresAt : now;
-      const expiresAt = new Date(startAt);
-      expiresAt.setUTCMonth(expiresAt.getUTCMonth() + plan.months);
-      const subscription = await tx.botSubscription.upsert({
-        where: { userId: current.userId },
-        create: { userId: current.userId, expiresAt, status: BotSubscriptionStatus.ACTIVE, source },
-        update: { expiresAt, status: BotSubscriptionStatus.ACTIVE, source }
-      });
-      const updated = await tx.paymentOrder.update({
-        where: { id: current.id },
-        data: { status: PaymentOrderStatus.FINISHED, paidAt: current.paidAt ?? now, rawPayload: toJson(payload), providerPaymentId: typeof payload.payment_id === "string" || typeof payload.payment_id === "number" ? String(payload.payment_id) : current.providerPaymentId }
-      });
-      return { order: updated, subscription };
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    const providerPaymentId = typeof payload.payment_id === "string" || typeof payload.payment_id === "number" ? String(payload.payment_id) : undefined;
+    return finalizePaidOrder(order.id, plan.months, source, toJson(payload), providerPaymentId);
   }
 
   const nextStatus = status === "failed"
@@ -256,6 +246,44 @@ async function applyNowPaymentsPayload(orderId: string, payload: Record<string, 
           ? PaymentOrderStatus.CONFIRMED
           : PaymentOrderStatus.WAITING;
   return { order: await prisma.paymentOrder.update({ where: { id: order.id }, data: { status: nextStatus, rawPayload: toJson(payload) } }), subscription: null };
+}
+
+export async function markPaymentOrderPaidByProvider(orderId: string, input: {
+  provider: string;
+  providerOrderId: string;
+  amountMinorUnits: number;
+  payload: Record<string, unknown>;
+}) {
+  const order = await prisma.paymentOrder.findUnique({ where: { id: orderId } });
+  if (!order) throw new Error("支付订单不存在");
+  const plan = validatePaymentOrderPlan(order);
+  if (input.amountMinorUnits !== minorUnitsFromUsd(plan.amountUsd)) throw new Error("订单金额不匹配");
+  if (order.provider && order.provider !== input.provider) throw new Error("支付渠道不匹配");
+  return finalizePaidOrder(order.id, plan.months, input.provider, toJson({ ...input.payload, provider: input.provider }), input.providerOrderId || undefined);
+}
+
+async function finalizePaidOrder(orderId: string, months: number, source: string, rawPayload: Prisma.InputJsonValue, providerPaymentId?: string) {
+  return prisma.$transaction(async (tx) => {
+    const current = await tx.paymentOrder.findUnique({ where: { id: orderId } });
+    if (!current) throw new Error("支付订单不存在");
+    if (current.status === PaymentOrderStatus.FINISHED) return { order: current, subscription: await tx.botSubscription.findUnique({ where: { userId: current.userId } }) };
+    if (current.status === PaymentOrderStatus.REFUNDED) throw new Error("已退款订单不能重新确认");
+    const now = new Date();
+    const currentSubscription = await tx.botSubscription.findUnique({ where: { userId: current.userId } });
+    const startAt = currentSubscription?.status === BotSubscriptionStatus.ACTIVE && currentSubscription.expiresAt > now ? currentSubscription.expiresAt : now;
+    const expiresAt = new Date(startAt);
+    expiresAt.setUTCMonth(expiresAt.getUTCMonth() + months);
+    const subscription = await tx.botSubscription.upsert({
+      where: { userId: current.userId },
+      create: { userId: current.userId, expiresAt, status: BotSubscriptionStatus.ACTIVE, source },
+      update: { expiresAt, status: BotSubscriptionStatus.ACTIVE, source }
+    });
+    const updated = await tx.paymentOrder.update({
+      where: { id: current.id },
+      data: { status: PaymentOrderStatus.FINISHED, paidAt: current.paidAt ?? now, rawPayload, providerPaymentId: providerPaymentId ?? current.providerPaymentId }
+    });
+    return { order: updated, subscription };
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 }
 
 function validatePaymentOrderPlan(order: { planKey: string; months: number; amountUsd: Prisma.Decimal }) {

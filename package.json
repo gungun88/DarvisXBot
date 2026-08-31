@@ -11,7 +11,7 @@
     "build:server": "tsc -p tsconfig.json",
     "build:admin": "vite build --config admin-ui/vite.config.ts",
     "start": "prisma migrate deploy && node dist/src/index.js",
-    "test": "tsx --test src/telegram/*.test.ts src/admin/*.test.ts",
+    "test": "tsx --test src/telegram/*.test.ts src/admin/*.test.ts src/payments/*.test.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
